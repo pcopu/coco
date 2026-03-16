@@ -1,0 +1,5 @@
+[submodule "example/openclaw_repo"]
+	path = example/openclaw_repo
+	url = https://github.com/openclaw/openclaw.git
+	ignore = all
+
