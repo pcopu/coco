@@ -80,17 +80,25 @@ class TestConfigValid:
         cfg = Config()
         assert cfg.browse_root == tmp_path.resolve()
 
-    def test_skills_paths_defaults_include_repo_and_config_dir(self):
+    def test_apps_paths_defaults_include_repo_and_config_dir(self):
         cfg = Config()
-        assert len(cfg.skills_paths) >= 1
-        assert cfg.config_dir / "skills" in cfg.skills_paths
+        assert len(cfg.apps_paths) >= 1
+        assert cfg.config_dir / "apps" in cfg.apps_paths
 
-    def test_skills_paths_env_override(self, monkeypatch, tmp_path):
-        custom_a = tmp_path / "skills-a"
-        custom_b = tmp_path / "skills-b"
+    def test_apps_paths_env_override(self, monkeypatch, tmp_path):
+        custom_a = tmp_path / "apps-a"
+        custom_b = tmp_path / "apps-b"
+        monkeypatch.setenv("COCO_APPS_PATHS", f"{custom_a},{custom_b}")
+        cfg = Config()
+        assert cfg.apps_paths == [custom_a.resolve(), custom_b.resolve()]
+
+    def test_apps_paths_legacy_env_override_still_supported(self, monkeypatch, tmp_path):
+        custom_a = tmp_path / "legacy-a"
+        custom_b = tmp_path / "legacy-b"
         monkeypatch.setenv("COCO_SKILLS_PATHS", f"{custom_a},{custom_b}")
         cfg = Config()
-        assert cfg.skills_paths == [custom_a.resolve(), custom_b.resolve()]
+        assert cfg.apps_paths == [custom_a.resolve(), custom_b.resolve()]
+        assert cfg.skills_paths == cfg.apps_paths
 
     def test_codex_skills_paths_default(self):
         cfg = Config()

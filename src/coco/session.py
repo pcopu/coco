@@ -1670,7 +1670,7 @@ class SessionManager:
 
     def discover_skill_catalog(self) -> dict[str, SkillDefinition]:
         """Discover available app-style skills from configured app roots."""
-        return discover_skills(config.skills_paths)
+        return discover_skills(config.apps_paths)
 
     def discover_codex_skill_catalog(self) -> dict[str, SkillDefinition]:
         """Discover available Codex skills from configured Codex roots."""

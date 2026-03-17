@@ -316,19 +316,22 @@ class Config:
                     resolved_path = self.browse_root
                 self.group_browse_roots[chat_id] = resolved_path
 
-        # Skill roots used by /skills and topic skill injection.
+        # Local app roots used by /apps and topic app injection.
         # Comma-separated absolute/relative paths can override defaults.
         # Example:
-        #   COCO_SKILLS_PATHS=/home/user/.coco/skills,/srv/coco/skills
-        skills_paths_raw = env_alias("COCO_SKILLS_PATHS")
-        if skills_paths_raw:
-            raw_paths = [item.strip() for item in skills_paths_raw.split(",") if item.strip()]
+        #   COCO_APPS_PATHS=/home/user/.coco/apps,/srv/coco/apps
+        # Legacy compatibility:
+        #   COCO_SKILLS_PATHS=/home/user/.coco/apps,/srv/coco/apps
+        apps_paths_raw = env_alias("COCO_APPS_PATHS") or env_alias("COCO_SKILLS_PATHS")
+        if apps_paths_raw:
+            raw_paths = [item.strip() for item in apps_paths_raw.split(",") if item.strip()]
         else:
             raw_paths = [
-                str(Path.cwd() / "skills"),
-                str(self.config_dir / "skills"),
+                str(Path.cwd() / "apps"),
+                str(self.config_dir / "apps"),
             ]
-        self.skills_paths = _resolve_path_list(raw_paths)
+        self.apps_paths = _resolve_path_list(raw_paths)
+        self.skills_paths = self.apps_paths
 
         # Codex skill roots surfaced by /skills.
         codex_skills_paths_raw = env_alias("COCO_CODEX_SKILLS_PATHS")
@@ -345,7 +348,7 @@ class Config:
             "provider=%s, transport=%s, runtime_mode=%s, "
             "sessions_path=%s, assistant_command=%s, "
             "allowed_group_ids=%s, browse_root=%s, group_browse_roots=%s, "
-            "skills_paths=%s, codex_skills_paths=%s, "
+            "apps_paths=%s, codex_skills_paths=%s, "
             "auth_env_file=%s, auth_meta_file=%s, machine_id=%s, machine_name=%s, "
             "rpc_listen=%s:%s, rpc_advertise_host=%s, controller_rpc=%s:%s, "
             "node_registry_file=%s",
@@ -360,7 +363,7 @@ class Config:
             sorted(self.allowed_group_ids),
             self.browse_root,
             {k: str(v) for k, v in self.group_browse_roots.items()},
-            [str(path) for path in self.skills_paths],
+            [str(path) for path in self.apps_paths],
             [str(path) for path in self.codex_skills_paths],
             str(self.auth_env_file) if self.auth_env_file else "",
             self.auth_meta_file,

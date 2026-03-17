@@ -4104,6 +4104,7 @@ def _build_skills_overview_text(
     enabled_skill_names: list[str],
     catalog: dict,
     roots: list[Path],
+    roots_label: str = "Skill roots",
 ) -> str:
     """Build per-topic app/skill overview text."""
     enabled_set = set(enabled_skill_names)
@@ -4141,7 +4142,7 @@ def _build_skills_overview_text(
             f"`/{command_name} disable <name>`",
             f"`/{command_name} clear`",
             "",
-            "Skill roots:",
+            f"{roots_label}:",
         ]
     )
     for root in roots:
@@ -4161,7 +4162,8 @@ def _build_apps_overview_payload(
         command_name="apps",
         enabled_skill_names=enabled_names,
         catalog=catalog,
-        roots=config.skills_paths,
+        roots=config.apps_paths,
+        roots_label="App roots",
     )
     text = (
         f"{text}\n\n"

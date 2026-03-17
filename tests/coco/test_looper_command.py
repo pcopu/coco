@@ -36,8 +36,8 @@ async def test_looper_start_parses_options_and_shows_example(monkeypatch):
     skill = SkillDefinition(
         name="looper",
         description="loop helper",
-        skill_md_path=Path("/tmp/skills/looper/SKILL.md"),
-        source_root=Path("/tmp/skills"),
+        skill_md_path=Path("/tmp/apps/looper/SKILL.md"),
+        source_root=Path("/tmp/apps"),
         folder_name="looper",
     )
 

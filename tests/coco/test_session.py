@@ -1513,15 +1513,15 @@ async def test_send_topic_text_to_window_injects_app_context_for_app_server(
     monkeypatch,
     tmp_path: Path,
 ):
-    skill_root = tmp_path / "skills"
-    skill_dir = skill_root / "demo"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
+    app_root = tmp_path / "apps"
+    app_dir = app_root / "demo"
+    app_dir.mkdir(parents=True)
+    (app_dir / "SKILL.md").write_text(
         "---\nname: demo\ndescription: Demo skill\n---\n# Demo\n",
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(session_mod.config, "skills_paths", [skill_root])
+    monkeypatch.setattr(session_mod.config, "apps_paths", [app_root])
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
     mgr.bind_thread(100, 5, "@1")
     mgr.set_thread_skills(100, 5, ["demo"])
@@ -1632,7 +1632,7 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(session_mod.config, "skills_paths", [app_root])
+    monkeypatch.setattr(session_mod.config, "apps_paths", [app_root])
     monkeypatch.setattr(session_mod.config, "codex_skills_paths", [codex_root])
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: False)
     mgr.bind_thread(100, 5, "@1")

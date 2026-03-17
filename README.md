@@ -1,5 +1,9 @@
 # CoCo
 
+<p align="center">
+  <img src="doc/assets/coco-mascot.svg" alt="CoCo mascot" width="320" />
+</p>
+
 [中文文档](README_CN.md)
 
 **Telegram operations overlay for OpenAI Codex.**
