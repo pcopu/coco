@@ -1,10 +1,8 @@
-# CoCo
+# CoCo: Orchestrate Codex across machines through Telegram.
 
 <p align="center">
-  <img src="doc/assets/coco-mascot.jpg" alt="CoCo mascot" width="360" />
+  <img src="doc/assets/coco-banner.png" alt="CoCo banner with mascot and top features" />
 </p>
-
-**Orchestrate Codex across machines through Telegram.**
 
 ## Install
 
