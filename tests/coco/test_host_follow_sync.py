@@ -524,6 +524,16 @@ async def test_post_init_starts_shadow_session_monitor_when_app_server_is_enable
     monkeypatch.setattr(bot.codex_app_server_client, "ensure_started", _noop)
     monkeypatch.setattr(bot, "status_poll_loop", lambda _bot: asyncio.sleep(0))
 
+    class _FakeControllerRpcServer:
+        async def start(self, *, host: str, port: int):
+            self.host = host
+            self.port = port
+
+        def bound_address(self):
+            return ("127.0.0.1", 8787)
+
+    monkeypatch.setattr(bot, "ControllerRpcServer", lambda **_kwargs: _FakeControllerRpcServer())
+
     def _create_task(coro):
         coro.close()
         return fake_task

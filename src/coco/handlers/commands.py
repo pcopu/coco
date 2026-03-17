@@ -1706,7 +1706,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_bot_globals()
-    """Show Codex update panel and optionally run upgrade + restart."""
+    """Show update panel and optionally run CoCo/Codex upgrade flows."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -1724,20 +1724,39 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_reply(update.message, text, reply_markup=keyboard)
         return
 
-    if raw_args in {"run", "upgrade"}:
+    tokens = raw_args.split()
+    if tokens and tokens[0] in {"run", "upgrade"}:
         if not can_trigger_upgrade:
             await safe_reply(update.message, "❌ Only admins can run updates.")
             return
+        action = tokens[1] if len(tokens) > 1 else "codex"
         chat_id = update.message.chat_id
         thread_id = _get_thread_id(update)
-        ok, result_text = await _run_codex_upgrade_and_restart(
-            chat_id=chat_id,
-            thread_id=thread_id,
-        )
+        if action in {"codex", "cli"}:
+            ok, result_text = await _run_codex_upgrade_and_restart(
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        elif action in {"coco", "bot", "self"}:
+            ok, result_text = await _run_coco_update_and_restart(
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        elif action in {"both", "all"}:
+            ok, result_text = await _run_both_updates_and_restart(
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        else:
+            ok = False
+            result_text = (
+                "Usage: `/update`, `/update status`, `/update run`, "
+                "`/update run coco`, or `/update run both`."
+            )
         await safe_reply(update.message, result_text)
         return
 
     await safe_reply(
         update.message,
-        "Usage: `/update`, `/update status`, or `/update run`.",
+        "Usage: `/update`, `/update status`, `/update run`, `/update run coco`, or `/update run both`.",
     )

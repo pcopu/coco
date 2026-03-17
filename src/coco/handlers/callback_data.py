@@ -7,7 +7,7 @@ Constants:
   - CB_HISTORY_*: History pagination
   - CB_DIR_*: Directory browser navigation
   - CB_MODEL_*: Model/reasoning selector menu
-  - CB_UPDATE_*: Codex update panel actions
+  - CB_UPDATE_*: CoCo/Codex update panel actions
   - CB_APPROVAL_*: Session approval mode menu
   - CB_APP_APPROVAL_*: App-server interactive approval requests
   - CB_ALLOWED_*: Allowed-user manager menu
@@ -41,6 +41,9 @@ CB_MODEL_REFRESH = "md:ref"
 # Update panel
 CB_UPDATE_REFRESH = "up:ref"
 CB_UPDATE_RUN = "up:run"
+CB_UPDATE_RUN_CODEX = "up:run:codex"
+CB_UPDATE_RUN_COCO = "up:run:coco"
+CB_UPDATE_RUN_BOTH = "up:run:both"
 
 # Session approvals
 CB_APPROVAL_SET = "ap:set:"  # ap:set:<mode>

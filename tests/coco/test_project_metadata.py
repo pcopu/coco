@@ -17,7 +17,10 @@ def test_pyproject_uses_coco_branding() -> None:
     coverage_sources = payload["tool"]["coverage"]["run"]["source"]
 
     assert project["name"] == "coco"
-    assert project["description"] == "Codex + Telegram project operator."
+    assert (
+        project["description"]
+        == "Telegram operations overlay for OpenAI Codex, derived from ccbot."
+    )
     assert scripts["coco"] == "coco.main:main"
     assert scripts["coco-admin"] == "coco.admin:main"
     assert sorted(scripts) == ["coco", "coco-admin"]

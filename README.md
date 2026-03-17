@@ -1,12 +1,35 @@
 # CoCo
 
 <p align="center">
-  <img src="doc/assets/coco-mascot.svg" alt="CoCo mascot" width="320" />
+  <img src="doc/assets/coco-mascot.jpg" alt="CoCo mascot" width="360" />
 </p>
 
-[中文文档](README_CN.md)
-
 **Telegram operations overlay for OpenAI Codex.**
+
+## Install
+
+Copy, paste, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pcopu/coco/main/install.sh | bash
+```
+
+Then start CoCo:
+
+```bash
+coco
+```
+
+If you prefer source installs:
+
+```bash
+git clone https://github.com/pcopu/coco.git
+cd coco
+uv sync
+uv run coco
+```
+
+[中文文档](README_CN.md)
 
 CoCo is a Codex-specific Telegram control plane. It binds Telegram topics to
 real Codex threads, preserves session continuity, and lets you manage coding
@@ -78,20 +101,6 @@ CoCo gives you:
 - a practical way to keep multiple projects moving without babysitting one terminal
 
 ## Quick Start
-
-### Install from source
-
-```bash
-git clone <repo-url> coco
-cd coco
-uv sync
-```
-
-### Run it
-
-```bash
-uv run coco
-```
 
 ### Required config
 

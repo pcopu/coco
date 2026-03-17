@@ -94,6 +94,9 @@ from .handlers.callback_data import (
     CB_MODEL_SET,
     CB_UPDATE_REFRESH,
     CB_UPDATE_RUN,
+    CB_UPDATE_RUN_BOTH,
+    CB_UPDATE_RUN_CODEX,
+    CB_UPDATE_RUN_COCO,
     CB_SESSION_FORK,
     CB_SESSION_PAGE,
     CB_SESSION_REFRESH,
@@ -190,6 +193,7 @@ session_monitor: SessionMonitor | None = None
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
 _controller_rpc_server: ControllerRpcServer | None = None
+_update_check_task: asyncio.Task | None = None
 
 # Track whether this turn already produced a dedicated final assistant text item.
 _turn_has_final_text: dict[str, bool] = {}
@@ -200,7 +204,14 @@ _pending_transient_app_server_errors: dict[str, tuple[str, str]] = {}
 # Prevent duplicate /restart handling races.
 _restart_requested = False
 
-# Codex update panel/runtime defaults.
+# Update panel/runtime defaults.
+_COCO_SELF_UPDATE_COMMAND_ENV = "COCO_SELF_UPDATE_COMMAND"
+_COCO_UPDATE_CHECK_INTERVAL_ENV = "COCO_UPDATE_CHECK_INTERVAL_SECONDS"
+_COCO_UPDATE_CHECK_INITIAL_DELAY_ENV = "COCO_UPDATE_CHECK_INITIAL_DELAY_SECONDS"
+_COCO_UPDATE_CHECK_ENABLED_ENV = "COCO_UPDATE_CHECK_ENABLED"
+_COCO_UPDATE_CHECK_TIMEOUT_SECONDS = 8
+_COCO_UPDATE_TIMEOUT_SECONDS = 20 * 60
+_UPDATE_NOTICE_STATE_FILE = coco_dir() / "update_notice.json"
 _CODEX_NPM_LATEST_URL = "https://registry.npmjs.org/@openai/codex/latest"
 _CODEX_UPGRADE_COMMAND_ENV = "COCO_CODEX_UPGRADE_COMMAND"
 _CODEX_VERSION_CHECK_TIMEOUT_SECONDS = 8
@@ -4403,6 +4414,23 @@ async def _restart_process_after_delay(delay_seconds: float = 0.25) -> None:
 
 
 @dataclass(frozen=True)
+class _CocoUpdateSnapshot:
+    """Snapshot of CoCo runtime repo status + update strategy."""
+
+    repo_root: str
+    current_branch: str
+    upstream_ref: str
+    current_commit: str
+    latest_commit: str
+    behind_count: int
+    ahead_count: int
+    dirty: bool
+    check_error: str
+    update_command: str
+    update_source: str
+
+
+@dataclass(frozen=True)
 class _CodexUpdateSnapshot:
     """Snapshot of local Codex version status + upgrade strategy."""
 
@@ -4460,6 +4488,7 @@ def _run_command_sync(
     argv: list[str],
     *,
     timeout_seconds: int,
+    cwd: str | Path | None = None,
 ) -> tuple[bool, str, str, str]:
     """Run one command synchronously and capture compact diagnostics."""
     try:
@@ -4470,6 +4499,7 @@ def _run_command_sync(
             text=True,
             check=False,
             timeout=timeout_seconds,
+            cwd=str(cwd) if cwd is not None else None,
         )
     except subprocess.TimeoutExpired as e:
         out = e.stdout or ""
@@ -4486,6 +4516,217 @@ def _run_command_sync(
             f"exit code {proc.returncode}",
         )
     return True, proc.stdout or "", proc.stderr or "", ""
+
+
+def _env_int(name: str, *, default: int) -> int:
+    """Parse one integer env var with a safe default."""
+    raw = env_alias(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    """Parse one bool-ish env var with a safe default."""
+    raw = env_alias(name)
+    if not raw:
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _short_commit(commit: str) -> str:
+    """Render a compact commit identifier."""
+    token = commit.strip()
+    if not token:
+        return "<unknown>"
+    return token[:7]
+
+
+def _split_upstream_ref(upstream_ref: str) -> tuple[str, str]:
+    """Split git upstream ref into remote name and branch name."""
+    value = upstream_ref.strip()
+    if not value or "/" not in value:
+        return "", ""
+    remote, branch = value.split("/", 1)
+    return remote.strip(), branch.strip()
+
+
+def _resolve_coco_repo_root_sync() -> tuple[str, str]:
+    """Resolve the CoCo git checkout root from the runtime source tree."""
+    candidate = Path(__file__).resolve().parents[2]
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "rev-parse", "--show-toplevel"],
+        timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+        cwd=candidate,
+    )
+    if not ok:
+        detail = _tail_text(stderr or stdout or err or "unknown git error")
+        return "", f"runtime is not a git checkout: {detail}"
+    return stdout.strip(), ""
+
+
+def _resolve_coco_update_command(repo_root: str, upstream_ref: str) -> tuple[str, str]:
+    """Resolve command shown to operators for CoCo self-update."""
+    custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
+    if custom:
+        return custom, "custom"
+    remote, branch = _split_upstream_ref(upstream_ref)
+    if not repo_root or not remote or not branch:
+        return "", "none"
+    command = f"git pull --ff-only {shlex.quote(remote)} {shlex.quote(branch)}"
+    if shutil.which("uv") and (Path(repo_root) / "pyproject.toml").is_file():
+        command = f"{command} && uv sync"
+    return command, "git"
+
+
+def _collect_coco_update_snapshot_sync(*, fetch_remote: bool) -> _CocoUpdateSnapshot:
+    """Collect local/current/latest CoCo repo update details."""
+    repo_root, repo_err = _resolve_coco_repo_root_sync()
+    errors: list[str] = []
+    if repo_err:
+        errors.append(repo_err)
+    if not repo_root:
+        update_command, update_source = _resolve_coco_update_command("", "")
+        return _CocoUpdateSnapshot(
+            repo_root="",
+            current_branch="",
+            upstream_ref="",
+            current_commit="",
+            latest_commit="",
+            behind_count=0,
+            ahead_count=0,
+            dirty=False,
+            check_error="\n".join(errors).strip(),
+            update_command=update_command,
+            update_source=update_source,
+        )
+
+    current_branch = ""
+    upstream_ref = ""
+    current_commit = ""
+    latest_commit = ""
+    behind_count = 0
+    ahead_count = 0
+    dirty = False
+
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+        cwd=repo_root,
+    )
+    if ok:
+        current_branch = stdout.strip()
+    else:
+        errors.append(f"branch check failed: {_tail_text(stderr or stdout or err or 'unknown error')}")
+
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "rev-parse", "HEAD"],
+        timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+        cwd=repo_root,
+    )
+    if ok:
+        current_commit = stdout.strip()
+    else:
+        errors.append(f"commit check failed: {_tail_text(stderr or stdout or err or 'unknown error')}")
+
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+        cwd=repo_root,
+    )
+    if ok:
+        upstream_ref = stdout.strip()
+    else:
+        errors.append("upstream branch is not configured")
+
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "status", "--porcelain"],
+        timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+        cwd=repo_root,
+    )
+    if ok:
+        dirty = bool(stdout.strip())
+    else:
+        errors.append(f"worktree check failed: {_tail_text(stderr or stdout or err or 'unknown error')}")
+
+    if fetch_remote and upstream_ref:
+        remote, branch = _split_upstream_ref(upstream_ref)
+        if remote and branch:
+            ok, stdout, stderr, err = _run_command_sync(
+                ["git", "fetch", "--quiet", remote, branch],
+                timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+                cwd=repo_root,
+            )
+            if not ok:
+                errors.append(f"fetch failed: {_tail_text(stderr or stdout or err or 'unknown error')}")
+
+    if upstream_ref:
+        ok, stdout, stderr, err = _run_command_sync(
+            ["git", "rev-parse", "@{upstream}"],
+            timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+            cwd=repo_root,
+        )
+        if ok:
+            latest_commit = stdout.strip()
+        else:
+            errors.append(f"upstream commit check failed: {_tail_text(stderr or stdout or err or 'unknown error')}")
+
+        ok, stdout, stderr, err = _run_command_sync(
+            ["git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
+            cwd=repo_root,
+        )
+        if ok:
+            parts = stdout.strip().split()
+            if len(parts) == 2:
+                try:
+                    ahead_count = int(parts[0])
+                    behind_count = int(parts[1])
+                except ValueError:
+                    errors.append(f"unexpected rev-list counts: {stdout.strip()}")
+        else:
+            errors.append(f"divergence check failed: {_tail_text(stderr or stdout or err or 'unknown error')}")
+
+    update_command, update_source = _resolve_coco_update_command(repo_root, upstream_ref)
+    return _CocoUpdateSnapshot(
+        repo_root=repo_root,
+        current_branch=current_branch,
+        upstream_ref=upstream_ref,
+        current_commit=current_commit,
+        latest_commit=latest_commit,
+        behind_count=behind_count,
+        ahead_count=ahead_count,
+        dirty=dirty,
+        check_error="\n".join(errors).strip(),
+        update_command=update_command,
+        update_source=update_source,
+    )
+
+
+async def _collect_coco_update_snapshot(*, fetch_remote: bool = True) -> _CocoUpdateSnapshot:
+    """Collect CoCo self-update status without blocking the event loop."""
+    return await asyncio.to_thread(
+        _collect_coco_update_snapshot_sync,
+        fetch_remote=fetch_remote,
+    )
+
+
+def _build_coco_update_state(snapshot: _CocoUpdateSnapshot) -> str:
+    """Render a human-readable CoCo update state label."""
+    if snapshot.behind_count > 0 and snapshot.ahead_count > 0:
+        return (
+            f"Needs attention: behind {snapshot.behind_count}, ahead {snapshot.ahead_count}."
+        )
+    if snapshot.behind_count > 0:
+        return f"Update available ({snapshot.behind_count} commit(s) behind)."
+    if snapshot.ahead_count > 0:
+        return f"Local branch is ahead by {snapshot.ahead_count} commit(s)."
+    if snapshot.current_commit and snapshot.latest_commit:
+        return "Up to date."
+    return "Version comparison unavailable."
 
 
 def _fetch_latest_codex_version_sync() -> tuple[str, str]:
@@ -4565,45 +4806,73 @@ async def _collect_codex_update_snapshot() -> _CodexUpdateSnapshot:
 
 
 def _build_update_panel_text(
-    snapshot: _CodexUpdateSnapshot,
+    coco_snapshot: _CocoUpdateSnapshot,
+    codex_snapshot: _CodexUpdateSnapshot,
     *,
     can_trigger_upgrade: bool,
 ) -> str:
-    """Build /update panel text."""
-    current = snapshot.current_version or "<unknown>"
-    latest = snapshot.latest_version or "<unknown>"
-    if snapshot.behind is True:
-        sync_state = "Behind latest release."
-    elif snapshot.behind is False:
-        sync_state = "Up to date."
+    """Build combined /update panel text."""
+    codex_current = codex_snapshot.current_version or "<unknown>"
+    codex_latest = codex_snapshot.latest_version or "<unknown>"
+    if codex_snapshot.behind is True:
+        codex_state = "Behind latest release."
+    elif codex_snapshot.behind is False:
+        codex_state = "Up to date."
     else:
-        sync_state = "Version comparison unavailable."
+        codex_state = "Version comparison unavailable."
 
     lines = [
-        "⬆️ *Codex Update*",
+        "⬆️ *Update Center*",
         "",
-        f"Binary: `{snapshot.codex_binary}`",
-        f"Current: `{current}`",
-        f"Latest: `{latest}`",
-        f"State: {sync_state}",
+        "*CoCo Update*",
+        f"Repo: `{coco_snapshot.repo_root or '<unknown>'}`",
+        f"Branch: `{coco_snapshot.current_branch or '<unknown>'}`",
+        f"Upstream: `{coco_snapshot.upstream_ref or '<unknown>'}`",
+        f"Current commit: `{_short_commit(coco_snapshot.current_commit)}`",
+        f"Latest commit: `{_short_commit(coco_snapshot.latest_commit)}`",
+        f"State: {_build_coco_update_state(coco_snapshot)}",
+        f"Worktree: {'dirty' if coco_snapshot.dirty else 'clean'}",
     ]
-    if snapshot.upgrade_command:
-        lines.append(f"Upgrade via `{snapshot.upgrade_source}`: `{snapshot.upgrade_command}`")
+    if coco_snapshot.update_command:
+        lines.append(
+            f"Apply via `{coco_snapshot.update_source}`: `{coco_snapshot.update_command}`"
+        )
+    else:
+        lines.append(
+            "Apply command: unavailable (set `COCO_SELF_UPDATE_COMMAND`)."
+        )
+
+    lines.extend(
+        [
+            "",
+            "*Codex Update*",
+            f"Binary: `{codex_snapshot.codex_binary}`",
+            f"Current: `{codex_current}`",
+            f"Latest: `{codex_latest}`",
+            f"State: {codex_state}",
+        ]
+    )
+    if codex_snapshot.upgrade_command:
+        lines.append(
+            f"Upgrade via `{codex_snapshot.upgrade_source}`: `{codex_snapshot.upgrade_command}`"
+        )
     else:
         lines.append(
             "Upgrade command: unavailable (set `COCO_CODEX_UPGRADE_COMMAND`)."
         )
 
-    if snapshot.check_error:
-        lines.extend(["", "Check notes:", snapshot.check_error])
+    if coco_snapshot.check_error:
+        lines.extend(["", "CoCo check notes:", coco_snapshot.check_error])
+    if codex_snapshot.check_error:
+        lines.extend(["", "Codex check notes:", codex_snapshot.check_error])
 
     lines.extend(
         [
             "",
             (
-                "Admins can trigger upgrade + restart from this panel."
+                "Admins can apply CoCo, Codex, or both from this panel."
                 if can_trigger_upgrade
-                else "Only admins can trigger upgrade + restart."
+                else "Only admins can apply updates from this panel."
             ),
         ]
     )
@@ -4616,14 +4885,130 @@ def _build_update_panel_keyboard(*, can_trigger_upgrade: bool) -> InlineKeyboard
     if can_trigger_upgrade:
         rows.append(
             [
-                InlineKeyboardButton(
-                    "Upgrade + Restart",
-                    callback_data=CB_UPDATE_RUN,
-                )
+                InlineKeyboardButton("Update CoCo", callback_data=CB_UPDATE_RUN_COCO),
+                InlineKeyboardButton("Update Codex", callback_data=CB_UPDATE_RUN_CODEX),
             ]
+        )
+        rows.append(
+            [InlineKeyboardButton("Update Both", callback_data=CB_UPDATE_RUN_BOTH)]
         )
     rows.append([InlineKeyboardButton("Refresh", callback_data=CB_UPDATE_REFRESH)])
     return InlineKeyboardMarkup(rows)
+
+
+def _update_notice_targets() -> list[tuple[int, int | None]]:
+    """Resolve admin private-chat recipients for automatic update notices."""
+    admin_ids = sorted(_get_allowed_admins())
+    if not admin_ids:
+        return []
+    return [(user_id, None) for user_id in admin_ids]
+
+
+def _load_update_notice_state() -> dict[str, str]:
+    """Load persisted CoCo update notice state."""
+    if not _UPDATE_NOTICE_STATE_FILE.is_file():
+        return {}
+    try:
+        payload = json.loads(_UPDATE_NOTICE_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug(
+            "Failed reading update notice file %s: %s",
+            _UPDATE_NOTICE_STATE_FILE,
+            e,
+        )
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "latest_commit": str(payload.get("latest_commit", "")).strip(),
+        "upstream_ref": str(payload.get("upstream_ref", "")).strip(),
+    }
+
+
+def _store_update_notice_state(snapshot: _CocoUpdateSnapshot) -> None:
+    """Persist latest CoCo update notice marker."""
+    try:
+        atomic_write_json(
+            _UPDATE_NOTICE_STATE_FILE,
+            {
+                "latest_commit": snapshot.latest_commit,
+                "upstream_ref": snapshot.upstream_ref,
+            },
+        )
+    except OSError as e:
+        logger.debug(
+            "Failed writing update notice file %s: %s",
+            _UPDATE_NOTICE_STATE_FILE,
+            e,
+        )
+
+
+def _build_coco_update_notice_text(snapshot: _CocoUpdateSnapshot) -> str:
+    """Build concise Telegram text for an available CoCo update."""
+    return "\n".join(
+        [
+            "⬆️ *CoCo Update Available*",
+            "",
+            f"Branch: `{snapshot.current_branch or '<unknown>'}`",
+            f"Upstream: `{snapshot.upstream_ref or '<unknown>'}`",
+            f"Current commit: `{_short_commit(snapshot.current_commit)}`",
+            f"Latest commit: `{_short_commit(snapshot.latest_commit)}`",
+            f"State: {_build_coco_update_state(snapshot)}",
+            "",
+            "Use the buttons below to apply the CoCo update, update Codex too, or refresh the full panel.",
+        ]
+    )
+
+
+async def _maybe_send_coco_update_notice(bot_obj: Bot, snapshot: _CocoUpdateSnapshot) -> bool:
+    """Notify admins when a new CoCo update becomes available."""
+    if snapshot.behind_count <= 0 or not snapshot.latest_commit:
+        return False
+    targets = _update_notice_targets()
+    if not targets:
+        return False
+    state = _load_update_notice_state()
+    if (
+        state.get("latest_commit") == snapshot.latest_commit
+        and state.get("upstream_ref") == snapshot.upstream_ref
+    ):
+        return False
+
+    text = _build_coco_update_notice_text(snapshot)
+    keyboard = _build_update_panel_keyboard(can_trigger_upgrade=True)
+    for chat_id, thread_id in targets:
+        await safe_send(
+            bot_obj,
+            chat_id,
+            text,
+            message_thread_id=thread_id,
+            reply_markup=keyboard,
+        )
+    _store_update_notice_state(snapshot)
+    return True
+
+
+async def _coco_update_check_loop(bot_obj: Bot) -> None:
+    """Periodically check for CoCo repo updates and notify admins."""
+    initial_delay = max(
+        0,
+        _env_int(_COCO_UPDATE_CHECK_INITIAL_DELAY_ENV, default=60),
+    )
+    interval = max(
+        300,
+        _env_int(_COCO_UPDATE_CHECK_INTERVAL_ENV, default=6 * 60 * 60),
+    )
+    if initial_delay:
+        await asyncio.sleep(initial_delay)
+    while True:
+        try:
+            snapshot = await _collect_coco_update_snapshot(fetch_remote=True)
+            await _maybe_send_coco_update_notice(bot_obj, snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("CoCo update check failed")
+        await asyncio.sleep(interval)
 
 
 async def _build_update_panel_payload(
@@ -4631,9 +5016,13 @@ async def _build_update_panel_payload(
     can_trigger_upgrade: bool,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build /update panel text + keyboard payload."""
-    snapshot = await _collect_codex_update_snapshot()
+    coco_snapshot, codex_snapshot = await asyncio.gather(
+        _collect_coco_update_snapshot(),
+        _collect_codex_update_snapshot(),
+    )
     text = _build_update_panel_text(
-        snapshot,
+        coco_snapshot,
+        codex_snapshot,
         can_trigger_upgrade=can_trigger_upgrade,
     )
     keyboard = _build_update_panel_keyboard(
@@ -4642,16 +5031,8 @@ async def _build_update_panel_payload(
     return text, keyboard
 
 
-async def _run_codex_upgrade_and_restart(
-    *,
-    chat_id: int,
-    thread_id: int | None,
-) -> tuple[bool, str]:
-    """Run Codex upgrade command, then restart CoCo on success."""
-    global _restart_requested
-    if _restart_requested:
-        return False, "Restart already in progress."
-
+async def _run_codex_upgrade() -> tuple[bool, str]:
+    """Run the Codex upgrade command without restarting CoCo."""
     before = await _collect_codex_update_snapshot()
     if not before.upgrade_command:
         return (
@@ -4681,22 +5062,146 @@ async def _run_codex_upgrade_and_restart(
         detail = after.check_error or "post-upgrade Codex version check failed"
         return False, f"Upgrade completed but Codex is unhealthy: {_tail_text(detail)}"
 
-    _set_restart_notice_target(chat_id, thread_id)
-    _restart_requested = True
-    asyncio.create_task(_restart_process_after_delay())
-
     before_version = before.current_version or "<unknown>"
     after_version = after.current_version
     if before_version == after_version:
         return (
             True,
-            f"Codex upgrade completed (version unchanged at `{after_version}`). "
-            "Restarting CoCo now.",
+            f"Codex upgrade completed (version unchanged at `{after_version}`).",
         )
     return (
         True,
-        f"Codex upgraded: `{before_version}` -> `{after_version}`. Restarting CoCo now.",
+        f"Codex upgraded: `{before_version}` -> `{after_version}`.",
     )
+
+
+async def _run_coco_update() -> tuple[bool, str]:
+    """Run the CoCo self-update command without restarting CoCo."""
+    before = await _collect_coco_update_snapshot(fetch_remote=True)
+    if not before.repo_root:
+        detail = before.check_error or "runtime is not a git checkout"
+        return False, f"CoCo update unavailable: {_tail_text(detail)}"
+    if before.dirty:
+        return False, "CoCo update blocked: worktree has local changes."
+    if before.ahead_count > 0:
+        return False, (
+            "CoCo update blocked: local branch is ahead of upstream. "
+            "Push or reconcile local commits first."
+        )
+    if not before.upstream_ref:
+        return False, "CoCo update unavailable: upstream branch is not configured."
+
+    custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
+    if custom:
+        ok, stdout, stderr, err = await asyncio.to_thread(
+            _run_command_sync,
+            ["bash", "-lc", custom],
+            timeout_seconds=_COCO_UPDATE_TIMEOUT_SECONDS,
+            cwd=before.repo_root,
+        )
+        if not ok:
+            detail = _tail_text(stderr or stdout or err or "unknown error")
+            return False, f"CoCo update failed ({err or 'error'}): {detail}"
+    else:
+        remote, branch = _split_upstream_ref(before.upstream_ref)
+        if not remote or not branch:
+            return False, "CoCo update unavailable: upstream branch is not configured."
+        ok, stdout, stderr, err = await asyncio.to_thread(
+            _run_command_sync,
+            ["git", "pull", "--ff-only", remote, branch],
+            timeout_seconds=_COCO_UPDATE_TIMEOUT_SECONDS,
+            cwd=before.repo_root,
+        )
+        if not ok:
+            detail = _tail_text(stderr or stdout or err or "unknown error")
+            return False, f"CoCo update failed ({err or 'error'}): {detail}"
+        if shutil.which("uv") and (Path(before.repo_root) / "pyproject.toml").is_file():
+            ok, stdout, stderr, err = await asyncio.to_thread(
+                _run_command_sync,
+                ["uv", "sync"],
+                timeout_seconds=_COCO_UPDATE_TIMEOUT_SECONDS,
+                cwd=before.repo_root,
+            )
+            if not ok:
+                detail = _tail_text(stderr or stdout or err or "unknown error")
+                return False, f"CoCo dependency sync failed ({err or 'error'}): {detail}"
+
+    after = await _collect_coco_update_snapshot(fetch_remote=False)
+    if not after.current_commit:
+        detail = after.check_error or "post-update repo check failed"
+        return False, f"CoCo update completed but repo check failed: {_tail_text(detail)}"
+    if after.behind_count > 0:
+        return False, (
+            "CoCo update command completed but the repo is still behind upstream."
+        )
+
+    before_commit = _short_commit(before.current_commit)
+    after_commit = _short_commit(after.current_commit)
+    if before.current_commit == after.current_commit:
+        return True, f"CoCo update completed (commit unchanged at `{after_commit}`)."
+    return True, f"CoCo updated: `{before_commit}` -> `{after_commit}`."
+
+
+def _queue_restart(chat_id: int, thread_id: int | None) -> bool:
+    """Queue a CoCo restart if one is not already pending."""
+    global _restart_requested
+    if _restart_requested:
+        return False
+    _set_restart_notice_target(chat_id, thread_id)
+    _restart_requested = True
+    asyncio.create_task(_restart_process_after_delay())
+    return True
+
+
+async def _run_codex_upgrade_and_restart(
+    *,
+    chat_id: int,
+    thread_id: int | None,
+) -> tuple[bool, str]:
+    """Run Codex upgrade, then restart CoCo on success."""
+    if _restart_requested:
+        return False, "Restart already in progress."
+    ok, text = await _run_codex_upgrade()
+    if not ok:
+        return False, text
+    if not _queue_restart(chat_id, thread_id):
+        return False, "Restart already in progress."
+    return True, f"{text} Restarting CoCo now."
+
+
+async def _run_coco_update_and_restart(
+    *,
+    chat_id: int,
+    thread_id: int | None,
+) -> tuple[bool, str]:
+    """Run CoCo self-update, then restart CoCo on success."""
+    if _restart_requested:
+        return False, "Restart already in progress."
+    ok, text = await _run_coco_update()
+    if not ok:
+        return False, text
+    if not _queue_restart(chat_id, thread_id):
+        return False, "Restart already in progress."
+    return True, f"{text} Restarting CoCo now."
+
+
+async def _run_both_updates_and_restart(
+    *,
+    chat_id: int,
+    thread_id: int | None,
+) -> tuple[bool, str]:
+    """Run CoCo self-update and Codex upgrade, then restart once."""
+    if _restart_requested:
+        return False, "Restart already in progress."
+    coco_ok, coco_text = await _run_coco_update()
+    if not coco_ok:
+        return False, coco_text
+    codex_ok, codex_text = await _run_codex_upgrade()
+    if not codex_ok:
+        return False, f"{coco_text}\n\n{codex_text}"
+    if not _queue_restart(chat_id, thread_id):
+        return False, "Restart already in progress."
+    return True, f"{coco_text}\n{codex_text}\nRestarting CoCo now."
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7928,8 +8433,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(query, text, reply_markup=keyboard)
         await query.answer("Refreshed")
 
-    # Update panel: run Codex upgrade + restart
-    elif data == CB_UPDATE_RUN:
+    # Update panel: run CoCo and/or Codex update + restart
+    elif data in {
+        CB_UPDATE_RUN,
+        CB_UPDATE_RUN_CODEX,
+        CB_UPDATE_RUN_COCO,
+        CB_UPDATE_RUN_BOTH,
+    }:
         if not _is_admin_user(user.id):
             await query.answer("Only admins can run updates.", show_alert=True)
             return
@@ -7939,16 +8449,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if message_chat_id is None:
             await query.answer("Unable to resolve chat for restart.", show_alert=True)
             return
-        await safe_edit(query, "⏳ Running Codex upgrade...")
-        ok, text = await _run_codex_upgrade_and_restart(
-            chat_id=int(message_chat_id),
-            thread_id=cb_thread_id,
-        )
+        if data == CB_UPDATE_RUN_COCO:
+            await safe_edit(query, "⏳ Running CoCo update...")
+            ok, text = await _run_coco_update_and_restart(
+                chat_id=int(message_chat_id),
+                thread_id=cb_thread_id,
+            )
+        elif data == CB_UPDATE_RUN_BOTH:
+            await safe_edit(query, "⏳ Running CoCo + Codex updates...")
+            ok, text = await _run_both_updates_and_restart(
+                chat_id=int(message_chat_id),
+                thread_id=cb_thread_id,
+            )
+        else:
+            await safe_edit(query, "⏳ Running Codex upgrade...")
+            ok, text = await _run_codex_upgrade_and_restart(
+                chat_id=int(message_chat_id),
+                thread_id=cb_thread_id,
+            )
         await safe_edit(query, text)
         if ok:
-            await query.answer("Upgrade queued")
+            await query.answer("Update queued")
         else:
-            await query.answer("Upgrade failed", show_alert=True)
+            await query.answer("Update failed", show_alert=True)
 
     # App-server approval: admin selects accept/decline decision.
     elif data.startswith(CB_APP_APPROVAL_DECIDE):
@@ -10731,7 +11254,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("status", "Show current Codex status panel"),
         BotCommand("model", "Show Codex model options/reasoning levels"),
-        BotCommand("update", "Check Codex updates and trigger safe upgrade"),
+        BotCommand("update", "Check CoCo/Codex updates and trigger safe upgrade"),
     ]
     # Add assistant slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -10878,6 +11401,13 @@ async def post_init(application: Application) -> None:
     else:
         logger.info("Session monitor started")
 
+    if _env_bool(_COCO_UPDATE_CHECK_ENABLED_ENV, default=True):
+        global _update_check_task
+        _update_check_task = asyncio.create_task(
+            _coco_update_check_loop(application.bot)
+        )
+        logger.info("CoCo update check task started")
+
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
@@ -10958,7 +11488,16 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task, _controller_rpc_server
+    global _status_poll_task, _controller_rpc_server, _update_check_task
+
+    if _update_check_task:
+        _update_check_task.cancel()
+        try:
+            await _update_check_task
+        except asyncio.CancelledError:
+            pass
+        _update_check_task = None
+        logger.info("CoCo update check task stopped")
 
     # Stop status polling
     if _status_poll_task:
