@@ -2,10 +2,11 @@
 
 [English](README.md)
 
-**面向 OpenAI Codex 的 Telegram 运维覆盖层。**
+**面向 OpenAI Codex 的 Telegram 控制 Bot。**
 
-CoCo 是一个 Codex 专用的 Telegram 控制台。它把 Telegram 话题绑定到真实
-Codex 线程，让你在离开终端时也能继续查看、排队、审批、恢复和切换项目。
+CoCo 是一个面向真实 Codex 会话的 Telegram 控制 Bot。它把 Telegram 话题
+绑定到真实 Codex 线程，让你在离开终端时也能继续查看、排队、审批、恢复、
+切换并驱动项目工作，而不是另起一个割裂的机器人上下文。
 
 CoCo 源自 `ccbot`，但当前仓库已经重写成更聚焦的 Codex overlay：默认采用
 app-server 传输、话题绑定工作流，以及 `~/.coco` 运行约定。

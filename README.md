@@ -4,7 +4,7 @@
   <img src="doc/assets/coco-mascot.jpg" alt="CoCo mascot" width="360" />
 </p>
 
-**Telegram operations overlay for OpenAI Codex.**
+**Orchestrate Codex across machines through Telegram.**
 
 ## Install
 
@@ -31,9 +31,10 @@ uv run coco
 
 [中文文档](README_CN.md)
 
-CoCo is a Codex-specific Telegram control plane. It binds Telegram topics to
-real Codex threads, preserves session continuity, and lets you manage coding
-work away from the terminal without inventing a parallel bot memory model.
+CoCo is a Telegram-native control bot for real Codex sessions. It binds
+Telegram topics to actual Codex threads, preserves session continuity, and lets
+you run, monitor, resume, and steer work away from the terminal without
+inventing a fake parallel agent.
 
 CoCo started from `ccbot`, then was rewritten into a cleaner Codex-only
 overlay with app-server transport, topic-bound workflows, and CoCo-specific
