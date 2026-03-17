@@ -162,3 +162,44 @@ def test_load_allowed_groups_ignores_permission_error(monkeypatch):
     monkeypatch.setattr(admin.Path, "is_file", _is_file)
 
     assert admin._load_allowed_groups(target) == set()
+
+
+def test_bootstrap_writes_service_env_and_auth_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin.os, "geteuid", lambda: 0)
+    auth_dir = tmp_path / "auth"
+    service_env = tmp_path / "coco.env"
+
+    code = admin.main(
+        [
+            "--auth-dir",
+            str(auth_dir),
+            "--service-env-file",
+            str(service_env),
+            "--no-immutable",
+            "bootstrap",
+            "--bot-token",
+            "123:ABC",
+            "--admin-user",
+            "7",
+            "--admin-name",
+            "Owner",
+            "--group-id",
+            "-100123",
+        ]
+    )
+
+    assert code == 0
+
+    auth_env = auth_dir / "auth.env"
+    auth_meta = auth_dir / "allowed_users_meta.json"
+    auth_env_text = auth_env.read_text(encoding="utf-8")
+    service_env_text = service_env.read_text(encoding="utf-8")
+    auth_meta_payload = json.loads(auth_meta.read_text(encoding="utf-8"))
+
+    assert "ALLOWED_USERS=7" in auth_env_text
+    assert "TELEGRAM_BOT_TOKEN=123:ABC" in service_env_text
+    assert "ALLOWED_GROUP_IDS=-100123" in service_env_text
+    assert f"COCO_AUTH_ENV_FILE={auth_env}" in service_env_text
+    assert f"COCO_AUTH_META_FILE={auth_meta}" in service_env_text
+    assert auth_meta_payload["admins"] == [7]
+    assert auth_meta_payload["scopes"]["7"] == admin.SCOPE_CREATE_SESSIONS

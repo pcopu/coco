@@ -20,6 +20,85 @@ Then start CoCo:
 coco
 ```
 
+## Fastest Secure Setup
+
+Do **not** add the CoCo bot to a group before the allowlist is on the machine.
+The secure default is: collect the IDs first, write the config locally, then
+invite the bot only after CoCo is locked to the right admin user and
+supergroup.
+
+### 1. Create the Telegram bot in BotFather
+
+In Telegram, talk to [@BotFather](https://t.me/BotFather):
+
+1. Run `/newbot` and copy the bot token.
+2. Run `/setprivacy` and choose **Disable** so CoCo can read normal topic messages.
+3. Open **Bot Settings** and enable **Threaded Mode**.
+
+### 2. Create the target supergroup and turn on topics
+
+1. Create the supergroup where CoCo will operate.
+2. In the group settings, enable **Topics**.
+
+### 3. Collect the IDs before CoCo ever joins the group
+
+1. DM [@userinfobot](https://t.me/userinfobot) and copy your numeric Telegram user ID.
+2. Add [@RawDataBot](https://t.me/RawDataBot) to the target supergroup temporarily.
+3. Send one message in the supergroup.
+4. Copy the `chat.id` value from RawDataBot's reply. It should start with `-100`.
+5. Remove RawDataBot from the supergroup.
+
+### 4. Bootstrap CoCo on the machine
+
+Run this on the machine where CoCo will run:
+
+```bash
+coco init \
+  --bot-token 123456:ABCDEF_your_bot_token \
+  --admin-user 123456789 \
+  --group-id -1001234567890
+```
+
+Notes:
+
+- Repeat `--group-id` to pre-approve multiple supergroups.
+- `coco init` writes `~/.coco/.env` and `~/.coco/allowed_users_meta.json`.
+- By default it requires `--group-id` so you do not accidentally start with an open group policy.
+
+### 5. Start CoCo and add it to the approved supergroup
+
+```bash
+coco
+```
+
+Then:
+
+1. Add your CoCo bot to the approved supergroup.
+2. Promote it to admin.
+3. Open a topic and send `/start` or `/folder`.
+
+## Hardened Setup
+
+If you want the token, allowlist, and approved groups in root-managed files
+instead of `~/.coco/.env`, use the hardened bootstrap path:
+
+```bash
+sudo "$(command -v coco-admin)" bootstrap \
+  --bot-token 123456:ABCDEF_your_bot_token \
+  --admin-user 123456789 \
+  --group-id -1001234567890
+```
+
+That writes:
+
+- auth users to `/etc/coco/auth/auth.env`
+- allowlist metadata to `/etc/coco/auth/allowed_users_meta.json`
+- runtime env to `/etc/coco/coco.env`
+
+After that, restart your CoCo service or launch `coco` with that env loaded.
+
+## Source Install
+
 If you prefer source installs:
 
 ```bash
@@ -103,13 +182,14 @@ CoCo gives you:
 
 ## Quick Start
 
-### Required config
+### Manual config fallback
 
-Create `~/.coco/.env`:
+If you do not want to use `coco init`, create `~/.coco/.env` yourself:
 
 ```ini
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 ALLOWED_USERS=your_telegram_user_id
+ALLOWED_GROUP_IDS=-100your_supergroup_id
 ```
 
 ## Additional Docs

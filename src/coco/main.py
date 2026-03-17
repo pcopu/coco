@@ -7,6 +7,14 @@ import sys
 
 def main() -> None:
     """Main entry point."""
+    argv = list(sys.argv[1:])
+    if argv and argv[0] in {"init", "setup"}:
+        bootstrap = import_module("coco.bootstrap")
+        code = bootstrap.main(argv[1:])
+        if code:
+            sys.exit(code)
+        return
+
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.WARNING,
@@ -20,12 +28,20 @@ def main() -> None:
         config_dir = utils_module.coco_dir()
         env_path = config_dir / ".env"
         print(f"Error: {e}\n")
-        print(f"Create {env_path} with the following content:\n")
+        print("Quick start:\n")
+        print(
+            "  coco init --bot-token <bot_token> --admin-user <telegram_user_id> "
+            "--group-id <-100supergroup_id>"
+        )
+        print()
+        print(f"Or create {env_path} manually with the following content:\n")
         print("  TELEGRAM_BOT_TOKEN=your_bot_token_here")
         print("  ALLOWED_USERS=your_telegram_user_id")
+        print("  ALLOWED_GROUP_IDS=-100your_supergroup_id")
         print()
         print("Get your bot token from @BotFather on Telegram.")
         print("Get your user ID from @userinfobot on Telegram.")
+        print("Get your supergroup ID from @RawDataBot before adding CoCo to the group.")
         sys.exit(1)
 
     logging.getLogger("coco").setLevel(logging.DEBUG)

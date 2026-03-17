@@ -15,6 +15,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from .bootstrap import build_admin_meta_payload, resolve_group_ids
 from .utils import env_alias
 
 SCOPE_SINGLE_SESSION = "single_session"
@@ -662,6 +663,66 @@ def _cmd_approve_group(paths: AuthPaths, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bootstrap(paths: AuthPaths, args: argparse.Namespace) -> int:
+    resolved_groups = resolve_group_ids(
+        list(args.group_id),
+        allow_all_groups=bool(args.allow_all_groups),
+    )
+    allowed_users = {args.admin_user}
+    meta_payload = build_admin_meta_payload(
+        admin_user=args.admin_user,
+        admin_name=args.admin_name,
+    )
+
+    _ensure_secure_dir(paths.auth_dir)
+    _write_protected_file(
+        paths.auth_env_file,
+        lambda path: _upsert_env_key(path, "ALLOWED_USERS", str(args.admin_user)),
+        use_immutable=not args.no_immutable,
+    )
+    _write_protected_file(
+        paths.auth_meta_file,
+        lambda path: _write_json(path, meta_payload),
+        use_immutable=not args.no_immutable,
+    )
+
+    group_csv = ",".join(str(gid) for gid in resolved_groups)
+    _write_protected_file(
+        paths.service_env_file,
+        lambda path: _upsert_env_key(path, "TELEGRAM_BOT_TOKEN", args.bot_token.strip()),
+        use_immutable=not args.no_immutable,
+    )
+    _write_protected_file(
+        paths.service_env_file,
+        lambda path: _upsert_env_key(path, "COCO_AUTH_ENV_FILE", str(paths.auth_env_file)),
+        use_immutable=not args.no_immutable,
+    )
+    _write_protected_file(
+        paths.service_env_file,
+        lambda path: _upsert_env_key(path, "COCO_AUTH_META_FILE", str(paths.auth_meta_file)),
+        use_immutable=not args.no_immutable,
+    )
+    _write_protected_file(
+        paths.service_env_file,
+        lambda path: _upsert_env_key(path, "ALLOWED_GROUP_IDS", group_csv),
+        use_immutable=not args.no_immutable,
+    )
+    if args.browse_root.strip():
+        _write_protected_file(
+            paths.service_env_file,
+            lambda path: _upsert_env_key(path, "BROWSE_ROOT", args.browse_root.strip()),
+            use_immutable=not args.no_immutable,
+        )
+
+    print(f"service_env_file: {paths.service_env_file}")
+    print(f"auth_env_file: {paths.auth_env_file}")
+    print(f"auth_meta_file: {paths.auth_meta_file}")
+    print(f"allowed_users: {','.join(str(uid) for uid in sorted(allowed_users))}")
+    print(f"allowed_group_ids: {group_csv or '(open)'}")
+    print("next: restart the CoCo service or run `coco` with this env loaded")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coco-admin",
@@ -760,6 +821,44 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     approve_group.add_argument("token", help="One-time approval token from Telegram DM.")
 
+    bootstrap = subparsers.add_parser(
+        "bootstrap",
+        help="Write bot token, admin allowlist, and allowed groups in one shot.",
+    )
+    bootstrap.add_argument(
+        "--bot-token",
+        required=True,
+        help="Telegram bot token from BotFather.",
+    )
+    bootstrap.add_argument(
+        "--admin-user",
+        required=True,
+        type=int,
+        help="Telegram user ID to grant admin access.",
+    )
+    bootstrap.add_argument(
+        "--admin-name",
+        default="",
+        help="Optional display name for the bootstrap admin user.",
+    )
+    bootstrap.add_argument(
+        "--group-id",
+        action="append",
+        type=int,
+        default=[],
+        help="Allowed Telegram supergroup ID. Repeat for multiple groups.",
+    )
+    bootstrap.add_argument(
+        "--allow-all-groups",
+        action="store_true",
+        help="Leave group allowlisting open. Not recommended.",
+    )
+    bootstrap.add_argument(
+        "--browse-root",
+        default="",
+        help="Optional browse root to persist in the service env file.",
+    )
+
     return parser
 
 
@@ -789,6 +888,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_remove_group(paths, args)
         if args.command == "approve-group":
             return _cmd_approve_group(paths, args)
+        if args.command == "bootstrap":
+            return _cmd_bootstrap(paths, args)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         return 1

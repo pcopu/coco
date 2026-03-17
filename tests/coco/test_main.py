@@ -122,3 +122,25 @@ def test_main_uses_coco_dir_in_bootstrap_error_path(monkeypatch, capsys, tmp_pat
 
     out = capsys.readouterr().out
     assert str(tmp_path / ".env") in out
+
+
+def test_main_dispatches_init_command_before_runtime_import(monkeypatch):
+    bootstrap_calls: list[list[str]] = []
+
+    bootstrap_module = ModuleType("coco.bootstrap")
+    bootstrap_module.main = lambda argv=None: bootstrap_calls.append(list(argv or [])) or 0
+
+    config_module = ModuleType("coco.config")
+
+    def _fail_config(name: str):
+        raise AssertionError(f"config import should not happen for init: {name}")
+
+    config_module.__getattr__ = _fail_config  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "coco.bootstrap", bootstrap_module)
+    monkeypatch.setitem(sys.modules, "coco.config", config_module)
+    monkeypatch.setattr(main_mod.sys, "argv", ["coco", "init", "--bot-token", "123:ABC"])
+
+    main_mod.main()
+
+    assert bootstrap_calls == [["--bot-token", "123:ABC"]]
