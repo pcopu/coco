@@ -4,6 +4,26 @@
   <img src="doc/assets/coco-banner.png" alt="CoCo banner with mascot and top features" />
 </p>
 
+<p align="center">
+  <strong>Telegram-native control bot for real OpenAI Codex sessions.</strong>
+</p>
+
+<p align="center">
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-1f6feb?style=flat-square" />
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-3fb950?style=flat-square" />
+  <img alt="Transport app-server" src="https://img.shields.io/badge/transport-app--server-f08c3a?style=flat-square" />
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#fastest-secure-setup">Setup</a> ·
+  <a href="#what-it-actually-does">How It Works</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="#primary-commands">Commands</a> ·
+  <a href="#additional-docs">Docs</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
 ## Install
 
 Copy, paste, run:
@@ -189,6 +209,34 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 ALLOWED_USERS=your_telegram_user_id
 ALLOWED_GROUP_IDS=-100your_supergroup_id
 ```
+
+## FAQ
+
+### Is CoCo a separate AI assistant?
+
+No. CoCo is the Telegram control layer for real Codex sessions. It binds
+Telegram topics to actual Codex threads instead of inventing a second memory
+system.
+
+### Do I need to add the bot to a group before setup?
+
+No. The safer flow is to create the bot, collect your user/group IDs, run
+`coco init`, and only then add the bot to the approved supergroup.
+
+### Does CoCo work across multiple machines?
+
+Yes. One controller can stay Telegram-facing while agent machines sit behind
+Tailscale. Folder picking, resume, status, and offline notices all work across
+that model.
+
+### Can I update CoCo and Codex separately?
+
+Yes. `/update` supports CoCo-only, Codex-only, or combined updates.
+
+### Where does state live?
+
+By default under `~/.coco`, with Codex session state continuing to live in
+`~/.codex/sessions`.
 
 ## Additional Docs
 
