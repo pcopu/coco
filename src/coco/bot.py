@@ -61,6 +61,7 @@ from .handlers.callback_data import (
     CB_ALLOWED_REFRESH,
     CB_ALLOWED_REMOVE,
     CB_ALLOWED_REMOVE_MENU,
+    CB_APPS_AUTORESEARCH_OUTCOME,
     CB_APPS_BACK,
     CB_APPS_CONFIGURE,
     CB_APPS_LOOPER_INSTRUCTIONS,
@@ -126,6 +127,10 @@ from .handlers.directory_browser import (
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
+from .handlers.autoresearch import (
+    get_autoresearch_state,
+    set_autoresearch_outcome,
+)
 from .handlers.looper import (
     LOOPER_DEFAULT_INTERVAL_SECONDS,
     LOOPER_MAX_INTERVAL_SECONDS,
@@ -241,6 +246,7 @@ WORKTREE_FOLD_CANDIDATES_KEY = "_worktree_fold_candidates"
 WORKTREE_FOLD_SELECTED_KEY = "_worktree_fold_selected"
 
 # /apps looper panel state in user_data[STATE_KEY]
+STATE_APPS_AUTORESEARCH_OUTCOME = "apps_autoresearch_outcome"
 STATE_APPS_LOOPER_PLAN_PATH = "apps_looper_plan_path"
 STATE_APPS_LOOPER_KEYWORD = "apps_looper_keyword"
 STATE_APPS_LOOPER_INSTRUCTIONS = "apps_looper_instructions"
@@ -2488,6 +2494,7 @@ def _clear_apps_flow_state(user_data: dict | None) -> None:
     if user_data is None:
         return
     if user_data.get(STATE_KEY) in {
+        STATE_APPS_AUTORESEARCH_OUTCOME,
         STATE_APPS_LOOPER_PLAN_PATH,
         STATE_APPS_LOOPER_KEYWORD,
         STATE_APPS_LOOPER_INSTRUCTIONS,
@@ -2582,6 +2589,7 @@ def _looper_panel_limit_choices() -> list[tuple[str, int]]:
 
 
 _APP_ICON_DEFAULTS: dict[str, str] = {
+    "autoresearch": "🔎",
     "looper": "🔁",
     "coco-delivery": "🚚",
 }
@@ -2597,7 +2605,7 @@ def _app_icon_for_skill(skill) -> str:
 
 def _app_supports_config(app_name: str) -> bool:
     """Return whether one app has an interactive Configure panel."""
-    return app_name == "looper"
+    return app_name in {"autoresearch", "looper"}
 
 
 def _build_app_actions_text(
@@ -4253,6 +4261,65 @@ def _build_app_actions_payload_for_topic(
         supports_config=_app_supports_config(canonical),
     )
     return True, text, keyboard, canonical
+
+
+def _build_autoresearch_panel_text(*, state) -> str:
+    """Build interactive autoresearch panel text for /apps."""
+    outcome = ""
+    last_delivered = ""
+    if state is not None:
+        outcome = str(state.outcome).strip()
+        last_delivered = str(state.last_delivered_for_date).strip()
+
+    lines = [
+        "🔎 *Auto Research App*",
+        "",
+        (
+            f"Desired outcome: `{outcome}`"
+            if outcome
+            else "Desired outcome: `(not set)`"
+        ),
+        "Schedule: `daily research overnight, delivery after 9am server-local time`",
+    ]
+    if last_delivered:
+        lines.append(f"Last delivered for: `{last_delivered}`")
+    lines.extend(
+        [
+            "",
+            "Set the outcome you want Coco to optimize for in this topic.",
+            "Examples: `Close more inbound leads`, `Reduce flaky deploys`, `Ship cleaner PRs faster`.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_autoresearch_panel_keyboard() -> InlineKeyboardMarkup:
+    """Build interactive autoresearch panel keyboard."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                "🎯 Set Outcome",
+                callback_data=CB_APPS_AUTORESEARCH_OUTCOME,
+            )
+        ],
+        [InlineKeyboardButton("⬅ Back to Apps", callback_data=CB_APPS_BACK)],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _build_autoresearch_panel_payload_for_topic(
+    *,
+    user_id: int,
+    thread_id: int,
+    user_data: dict | None,
+    chat_id: int | None = None,
+) -> tuple[bool, str, InlineKeyboardMarkup | None, str]:
+    """Build autoresearch panel payload for one topic."""
+    _ = chat_id
+    state = get_autoresearch_state(user_id=user_id, thread_id=thread_id)
+    if isinstance(user_data, dict):
+        user_data[APPS_PENDING_THREAD_KEY] = thread_id
+    return True, _build_autoresearch_panel_text(state=state), _build_autoresearch_panel_keyboard(), ""
 
 
 async def _build_looper_panel_payload_for_topic(
@@ -6002,12 +6069,14 @@ async def _show_app_server_status(
 
     rate_payload: dict[str, object] = {}
     rate_error = ""
-    try:
-        result = await codex_app_server_client.read_rate_limits()
-        if isinstance(result, dict):
-            rate_payload = result
-    except Exception as e:
-        rate_error = str(e)
+    turn_active = bool(active_turn)
+    if not turn_active:
+        try:
+            result = await codex_app_server_client.read_rate_limits()
+            if isinstance(result, dict):
+                rate_payload = result
+        except Exception as e:
+            rate_error = str(e)
 
     snapshot = rate_payload.get("rateLimits")
     if not isinstance(snapshot, dict):
@@ -7087,6 +7156,42 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "Add/remove flow was reset.\n"
                 "Use `/allowed request_add ...`, `/allowed request_remove ...`, and `/allowed approve <token>`.",
             )
+            return
+
+    # /apps autoresearch panel text capture.
+    if context.user_data and context.user_data.get(STATE_KEY) == STATE_APPS_AUTORESEARCH_OUTCOME:
+        pending_tid = context.user_data.get(APPS_PENDING_THREAD_KEY)
+        if pending_tid is None or pending_tid != thread_id:
+            _clear_apps_flow_state(context.user_data)
+        else:
+            outcome = text.strip()
+            if not outcome:
+                await safe_reply(
+                    message,
+                    "Outcome cannot be empty. Send a short sentence describing what you want.",
+                )
+                return
+            set_autoresearch_outcome(
+                user_id=user_id,
+                thread_id=thread_id,
+                outcome=outcome,
+            )
+            context.user_data[STATE_KEY] = ""
+            await safe_reply(message, "✅ Auto research outcome updated.")
+            ok, panel_text, panel_keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+                user_id=user_id,
+                thread_id=thread_id,
+                user_data=context.user_data,
+                chat_id=chat_id,
+            )
+            if ok:
+                await safe_reply(
+                    message,
+                    panel_text,
+                    reply_markup=panel_keyboard,
+                )
+            else:
+                await safe_reply(message, panel_text)
             return
 
     # /apps looper panel text capture.
@@ -8338,6 +8443,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
         session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
+        previous_model, previous_effort = session_manager.get_topic_model_selection(
+            user.id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         selected_slug = data[len(CB_MODEL_SET) :]
         catalog = _resolve_topic_model_catalog(
             user_id=user.id,
@@ -8363,6 +8473,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             model_slug=selected_slug,
             reasoning_effort=adjusted_effort or current_effort,
         )
+        changed_model, changed_effort = (
+            previous_model != selected_slug,
+            (adjusted_effort or current_effort) != previous_effort,
+        )
+        if changed_model or changed_effort:
+            model_window_id = session_manager.resolve_window_for_thread(
+                user.id,
+                cb_thread_id,
+                chat_id=cb_chat_id,
+            )
+            if model_window_id:
+                session_manager.set_window_codex_thread_id(model_window_id, "")
         updated_catalog = _resolve_topic_model_catalog(
             user_id=user.id,
             thread_id=cb_thread_id,
@@ -8384,6 +8506,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
         session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
+        previous_model, previous_effort = session_manager.get_topic_model_selection(
+            user.id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         selected_effort = data[len(CB_MODEL_EFFORT_SET) :]
         catalog = _resolve_topic_model_catalog(
             user_id=user.id,
@@ -8412,6 +8539,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             model_slug=current_slug,
             reasoning_effort=selected_effort,
         )
+        if selected_effort != previous_effort:
+            effort_window_id = session_manager.resolve_window_for_thread(
+                user.id,
+                cb_thread_id,
+                chat_id=cb_chat_id,
+            )
+            if effort_window_id:
+                session_manager.set_window_codex_thread_id(effort_window_id, "")
         updated_catalog = _resolve_topic_model_catalog(
             user_id=user.id,
             thread_id=cb_thread_id,
@@ -9237,6 +9372,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not canonical:
             await query.answer("Unknown app.", show_alert=True)
             return
+        if canonical == "autoresearch":
+            ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+                user_id=user.id,
+                thread_id=cb_thread_id,
+                user_data=context.user_data,
+                chat_id=cb_chat_id,
+            )
+            await safe_edit(query, text, reply_markup=keyboard if ok else None)
+            if ok:
+                await query.answer("Auto research config")
+            else:
+                await query.answer("Auto research unavailable", show_alert=True)
+            return
         if canonical != "looper":
             await query.answer("No configurable settings for this app yet.", show_alert=True)
             return
@@ -9251,6 +9399,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Looper config")
         else:
             await query.answer("Looper unavailable", show_alert=True)
+
+    # Apps menu: autoresearch outcome prompt
+    elif data == CB_APPS_AUTORESEARCH_OUTCOME:
+        if cb_thread_id is None:
+            await query.answer("Use this inside a named topic.", show_alert=True)
+            return
+        ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            user_data=context.user_data,
+            chat_id=cb_chat_id,
+        )
+        await safe_edit(query, text, reply_markup=keyboard if ok else None)
+        if not ok:
+            await query.answer("Auto research unavailable", show_alert=True)
+            return
+        if context.user_data is None:
+            await query.answer("State unavailable.", show_alert=True)
+            return
+        context.user_data[STATE_KEY] = STATE_APPS_AUTORESEARCH_OUTCOME
+        context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+        await query.answer(
+            "Send the outcome you want this research to optimize for.",
+            show_alert=True,
+        )
 
     # Apps menu: open Looper panel
     elif data == CB_APPS_LOOPER_OPEN:

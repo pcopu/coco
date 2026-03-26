@@ -53,21 +53,25 @@ def _make_skill(name: str, *, icon: str = "") -> SkillDefinition:
 
 def test_apps_keyboard_uses_icon_and_routes_by_config_support():
     catalog = {
+        "autoresearch": _make_skill("autoresearch", icon="🔎"),
         "demo": _make_skill("demo", icon="📦"),
         "looper": _make_skill("looper", icon="🔁"),
     }
     keyboard = bot._build_apps_panel_keyboard(enabled_names=[], catalog=catalog)
     rows = keyboard.inline_keyboard
-    assert rows[0][0].text == "📦 demo"
-    assert rows[0][0].callback_data == f"{CB_APPS_TOGGLE}demo"
-    assert rows[1][0].text == "🔁 looper"
-    assert rows[1][0].callback_data == f"{CB_APPS_OPEN}looper"
+    assert rows[0][0].text == "🔎 autoresearch"
+    assert rows[0][0].callback_data == f"{CB_APPS_OPEN}autoresearch"
+    assert rows[1][0].text == "📦 demo"
+    assert rows[1][0].callback_data == f"{CB_APPS_TOGGLE}demo"
+    assert rows[2][0].text == "🔁 looper"
+    assert rows[2][0].callback_data == f"{CB_APPS_OPEN}looper"
 
     enabled_keyboard = bot._build_apps_panel_keyboard(
         enabled_names=["demo"],
         catalog=catalog,
     )
-    assert enabled_keyboard.inline_keyboard[0][0].text == "✅ demo"
+    enabled_labels = [row[0].text for row in enabled_keyboard.inline_keyboard[:-1]]
+    assert "✅ demo" in enabled_labels
 
 
 @pytest.mark.asyncio
@@ -132,6 +136,42 @@ async def test_apps_open_callback_shows_action_sheet(monkeypatch):
     assert edits == [("looper actions", keyboard)]
     assert query.answers
     assert query.answers[-1] == ("App actions", False)
+
+
+@pytest.mark.asyncio
+async def test_apps_configure_callback_shows_autoresearch_panel(monkeypatch):
+    update, query = _make_callback_update(f"{bot.CB_APPS_CONFIGURE}autoresearch")
+    edits: list[tuple[str, object]] = []
+    keyboard = InlineKeyboardMarkup([])
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def _build_autoresearch_panel_payload_for_topic(**_kwargs):
+        return True, "autoresearch panel", keyboard, ""
+
+    monkeypatch.setattr(
+        bot,
+        "_build_autoresearch_panel_payload_for_topic",
+        _build_autoresearch_panel_payload_for_topic,
+    )
+
+    async def _safe_edit(_query, text: str, **kwargs):
+        edits.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert edits == [("autoresearch panel", keyboard)]
+    assert query.answers
+    assert query.answers[-1] == ("Auto research config", False)
 
 
 @pytest.mark.asyncio

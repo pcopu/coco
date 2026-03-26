@@ -76,6 +76,7 @@ CB_APPS_OPEN = "am:open:"  # am:open:<app_name>
 CB_APPS_RUN = "am:run:"  # am:run:<app_name>
 CB_APPS_CONFIGURE = "am:cfg:"  # am:cfg:<app_name>
 CB_APPS_TOGGLE = "am:tg:"  # am:tg:<app_name>
+CB_APPS_AUTORESEARCH_OUTCOME = "am:ar:out"
 CB_APPS_LOOPER_OPEN = "am:loop:open"
 CB_APPS_LOOPER_PLAN = "am:loop:plan:"  # am:loop:plan:<index>
 CB_APPS_LOOPER_PLAN_MANUAL = "am:loop:plan:manual"

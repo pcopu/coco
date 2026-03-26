@@ -19,7 +19,9 @@ from .message_queue import (
     clear_status_msg_info,
     clear_tool_msg_ids_for_topic,
 )
+from .autoresearch import clear_autoresearch_state
 from .looper import clear_looper_state
+from .personality import clear_personality_state
 from .run_watchdog import clear_run_watch_state
 
 
@@ -51,6 +53,8 @@ async def clear_topic_state(
     await clear_queued_topic_dock(bot, user_id, thread_id)
     clear_run_watch_state(user_id, thread_id)
     clear_looper_state(user_id, thread_id)
+    clear_autoresearch_state(user_id, thread_id)
+    clear_personality_state(user_id, thread_id)
 
     # Clear tool message ID tracking
     clear_tool_msg_ids_for_topic(user_id, thread_id)

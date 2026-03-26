@@ -190,6 +190,105 @@ async def test_model_callback_updates_topic_binding_not_global_config(monkeypatc
     assert "Topic model: `gpt-5.4`" in edits[-1]
 
 
+@pytest.mark.asyncio
+async def test_model_callback_resets_thread_on_model_change(monkeypatch):
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    mgr = SessionManager()
+    mgr.bind_topic_to_codex_thread(
+        user_id=1147817421,
+        thread_id=77,
+        chat_id=-100123,
+        codex_thread_id="thread-legacy",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.set_topic_model_selection(
+        1147817421,
+        77,
+        chat_id=-100123,
+        model_slug="gpt-5.4",
+        reasoning_effort="high",
+    )
+
+    catalog = {
+        "current_model": "global-default",
+        "current_effort": "medium",
+        "models": [
+            {
+                "slug": "gpt-5.3-codex-spark",
+                "default_effort": "xhigh",
+                "levels": ["medium", "high", "xhigh"],
+            },
+            {
+                "slug": "gpt-5.4",
+                "default_effort": "high",
+                "levels": ["high"],
+            },
+        ],
+        "reasoning_options": ["medium", "high", "xhigh"],
+    }
+
+    class _FakeQuery:
+        def __init__(self) -> None:
+            self.data = f"{CB_MODEL_SET}gpt-5.3-codex-spark"
+            self.message = type(
+                "Msg",
+                (),
+                {
+                    "message_thread_id": 77,
+                    "chat": type("Chat", (), {"type": "supergroup", "id": -100123})(),
+                    "chat_id": -100123,
+                },
+            )()
+            self.answers: list[tuple[str | None, bool]] = []
+
+        async def answer(self, text: str | None = None, show_alert: bool = False):
+            self.answers.append((text, show_alert))
+
+    query = _FakeQuery()
+    update = type(
+        "Update",
+        (),
+        {
+            "callback_query": query,
+            "effective_user": type("User", (), {"id": 1147817421})(),
+            "effective_chat": query.message.chat,
+            "effective_message": query.message,
+        },
+    )()
+    context = type("Context", (), {"user_data": {}})()
+    edits: list[str] = []
+
+    monkeypatch.setattr(bot, "session_manager", mgr)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_load_codex_model_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        bot,
+        "_set_codex_config_value",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not write global config")),
+    )
+
+    async def _safe_edit(_query, text: str, **_kwargs):
+        edits.append(text)
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    assert mgr.get_window_codex_thread_id("@1") == "thread-legacy"
+
+    await bot.callback_handler(update, context)
+
+    assert mgr.get_window_codex_thread_id("@1") == ""
+    binding = mgr.resolve_topic_binding(1147817421, 77, chat_id=-100123)
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.3-codex-spark"
+    assert binding.reasoning_effort == "high"
+    assert edits
+    assert "Topic model: `gpt-5.3-codex-spark`" in edits[-1]
+
+
 def test_build_model_keyboard_has_select_buttons():
     catalog = {
         "current_model": "gpt-5.3-codex",

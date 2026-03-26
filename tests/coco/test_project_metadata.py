@@ -30,7 +30,7 @@ def test_pyproject_uses_coco_branding() -> None:
 
 def test_readme_uses_coco_title() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert readme.startswith("# CoCo\n")
+    assert readme.startswith("# CoCo: Orchestrate Codex across machines through Telegram.\n")
     assert "uv run coco" in readme
     assert "sudo coco-admin show" in readme
     assert "doc/multi-machine-setup.md" in readme

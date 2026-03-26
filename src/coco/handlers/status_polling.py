@@ -36,6 +36,7 @@ from .looper import (
     prune_looper_topics,
     stop_looper_if_expired,
 )
+from . import autoresearch, personality
 from .message_queue import get_message_queue
 from .message_sender import safe_send
 from .run_watchdog import (
@@ -545,6 +546,96 @@ async def _emit_due_looper_prompt(
     )
 
 
+async def _emit_due_personality_delivery(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    chat_id: int | None = None,
+) -> None:
+    """Send one due morning personality digest when enabled for the topic."""
+    _ = window_id
+    if thread_id is None:
+        return
+
+    enabled = session_manager.resolve_thread_skills(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    if "personality" not in {skill.name for skill in enabled}:
+        return
+
+    resolved_chat_id = (
+        session_manager.resolve_chat_id(user_id, thread_id)
+        if chat_id is None
+        else session_manager.resolve_chat_id(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+    )
+    digest_text = personality.claim_due_personality_delivery(
+        user_id=user_id,
+        chat_id=resolved_chat_id,
+        thread_id=thread_id,
+    )
+    if not digest_text:
+        return
+    await safe_send(
+        bot,
+        resolved_chat_id,
+        digest_text,
+        message_thread_id=thread_id,
+    )
+
+
+async def _emit_due_autoresearch_delivery(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    chat_id: int | None = None,
+) -> None:
+    """Send one due morning auto research digest when enabled for the topic."""
+    _ = window_id
+    if thread_id is None:
+        return
+
+    enabled = session_manager.resolve_thread_skills(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    if "autoresearch" not in {skill.name for skill in enabled}:
+        return
+
+    resolved_chat_id = (
+        session_manager.resolve_chat_id(user_id, thread_id)
+        if chat_id is None
+        else session_manager.resolve_chat_id(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+    )
+    digest_text = autoresearch.claim_due_autoresearch_delivery(
+        user_id=user_id,
+        chat_id=resolved_chat_id,
+        thread_id=thread_id,
+    )
+    if not digest_text:
+        return
+    await safe_send(
+        bot,
+        resolved_chat_id,
+        digest_text,
+        message_thread_id=thread_id,
+    )
+
+
 async def update_status_message(
     bot: Bot,
     user_id: int,
@@ -590,6 +681,8 @@ async def status_poll_loop(bot: Bot) -> None:
             }
             prune_run_watch_topics(active_topics)
             prune_looper_topics(active_topics)
+            autoresearch.prune_autoresearch_topics(active_topics)
+            personality.prune_personality_topics(active_topics)
 
             # Periodic topic existence probe
             if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
@@ -660,6 +753,18 @@ async def status_poll_loop(bot: Bot) -> None:
                             thread_id=thread_id,
                             window_id=wid,
                         )
+                        await _emit_due_personality_delivery(
+                            bot,
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            window_id=wid,
+                        )
+                        await _emit_due_autoresearch_delivery(
+                            bot,
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            window_id=wid,
+                        )
                     else:
                         await _emit_due_run_watchdog_checks(
                             bot,
@@ -669,6 +774,20 @@ async def status_poll_loop(bot: Bot) -> None:
                             chat_id=chat_id,
                         )
                         await _emit_due_looper_prompt(
+                            bot,
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            window_id=wid,
+                            chat_id=chat_id,
+                        )
+                        await _emit_due_personality_delivery(
+                            bot,
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            window_id=wid,
+                            chat_id=chat_id,
+                        )
+                        await _emit_due_autoresearch_delivery(
                             bot,
                             user_id=user_id,
                             thread_id=thread_id,

@@ -234,8 +234,18 @@ async def test_status_poll_loop_app_server_only_runs_watchdog_without_legacy(mon
         _ = user_id, thread_id
         events.append(f"looper:{window_id}")
 
+    async def _emit_personality(_bot, *, user_id: int, thread_id: int | None, window_id: str):
+        _ = user_id, thread_id
+        events.append(f"personality:{window_id}")
+
+    async def _emit_autoresearch(_bot, *, user_id: int, thread_id: int | None, window_id: str):
+        _ = user_id, thread_id
+        events.append(f"autoresearch:{window_id}")
+
     monkeypatch.setattr(status_polling, "_emit_due_run_watchdog_checks", _emit_watchdog)
     monkeypatch.setattr(status_polling, "_emit_due_looper_prompt", _emit_looper)
+    monkeypatch.setattr(status_polling, "_emit_due_personality_delivery", _emit_personality)
+    monkeypatch.setattr(status_polling, "_emit_due_autoresearch_delivery", _emit_autoresearch)
 
     async def _cancel_sleep(_seconds: float):
         raise asyncio.CancelledError
@@ -252,6 +262,8 @@ async def test_status_poll_loop_app_server_only_runs_watchdog_without_legacy(mon
     assert "probe" not in events
     assert "watchdog:@900000" in events
     assert "looper:@900000" in events
+    assert "personality:@900000" in events
+    assert "autoresearch:@900000" in events
 
 
 @pytest.mark.asyncio
@@ -297,8 +309,16 @@ async def test_status_poll_loop_topic_deleted_in_app_server_only_skips_legacy_ki
     async def _emit_looper(*_args, **_kwargs):
         return None
 
+    async def _emit_personality(*_args, **_kwargs):
+        return None
+
+    async def _emit_autoresearch(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(status_polling, "_emit_due_run_watchdog_checks", _emit_watchdog)
     monkeypatch.setattr(status_polling, "_emit_due_looper_prompt", _emit_looper)
+    monkeypatch.setattr(status_polling, "_emit_due_personality_delivery", _emit_personality)
+    monkeypatch.setattr(status_polling, "_emit_due_autoresearch_delivery", _emit_autoresearch)
 
     async def _cancel_sleep(_seconds: float):
         raise asyncio.CancelledError

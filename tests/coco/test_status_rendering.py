@@ -188,3 +188,105 @@ async def test_show_app_server_status_renders_ascii_progress_panel(monkeypatch):
     assert "94% left" in rendered
     assert "84% left" in rendered
     assert "[===================.]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_show_app_server_status_uses_cached_snapshot_while_turn_active(monkeypatch):
+    captured: list[str] = []
+    read_calls: list[str] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_get_thread_id", lambda _update: 10)
+    monkeypatch.setattr(bot, "_group_chat_id", lambda _chat: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda *_args, **_kwargs: "@1",
+    )
+    monkeypatch.setattr(bot.session_manager, "get_display_name", lambda _wid: "coco-codex")
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_thread_id",
+        lambda _wid: "thread-1",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _wid: "turn-1",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_machine_id",
+        lambda _wid: "local-node",
+    )
+    monkeypatch.setattr(
+        bot.node_registry,
+        "get_node",
+        lambda _machine_id: NodeRecord(
+            machine_id="local-node",
+            display_name="Local Node",
+            tailnet_name="local-node.ts.net",
+            status="online",
+            last_seen_ts=1_778_026_242,
+            browse_roots=[],
+            capabilities=["controller", "monitor"],
+            agent_version="1.0.0",
+            transport="local",
+            is_local=True,
+            controller_capable=True,
+            controller_active=True,
+            preferred_controller=True,
+        ),
+    )
+
+    async def _read_rate_limits():
+        read_calls.append("called")
+        return {"rateLimits": {"planType": "enterprise"}}
+
+    monkeypatch.setattr(bot.codex_app_server_client, "read_rate_limits", _read_rate_limits)
+    monkeypatch.setattr(
+        bot.codex_app_server_client,
+        "get_rate_limits_snapshot",
+        lambda: {
+            "planType": "pro",
+            "primary": {
+                "usedPercent": 6,
+                "resetsAt": 1_778_026_242,
+                "windowDurationMins": 300,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        bot.codex_app_server_client,
+        "get_thread_token_usage",
+        lambda _thread_id: {
+            "total": {
+                "totalTokens": 1000,
+                "inputTokens": 900,
+                "outputTokens": 100,
+                "reasoningOutputTokens": 25,
+            }
+        },
+    )
+
+    async def _safe_reply(_message, text, **_kwargs):
+        captured.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=SimpleNamespace(),
+        message=SimpleNamespace(),
+    )
+
+    shown = await bot._show_app_server_status(update)
+
+    assert shown is True
+    assert read_calls == []
+    assert len(captured) == 1
+    rendered = captured[0]
+    assert "active    turn-1" in rendered
+    assert "plan      pro" in rendered
+    assert "Primary   94% left" in rendered
+    assert "tokens    total 1.0K" in rendered
