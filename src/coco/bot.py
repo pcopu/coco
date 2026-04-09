@@ -5073,7 +5073,7 @@ def _update_notice_targets() -> list[tuple[int, int | None]]:
 
 
 def _load_update_notice_state() -> dict[str, str]:
-    """Load persisted CoCo update notice state."""
+    """Load persisted update notice state."""
     if not _UPDATE_NOTICE_STATE_FILE.is_file():
         return {}
     try:
@@ -5090,25 +5090,35 @@ def _load_update_notice_state() -> dict[str, str]:
     return {
         "latest_commit": str(payload.get("latest_commit", "")).strip(),
         "upstream_ref": str(payload.get("upstream_ref", "")).strip(),
+        "latest_codex_version": str(payload.get("latest_codex_version", "")).strip(),
     }
 
 
-def _store_update_notice_state(snapshot: _CocoUpdateSnapshot) -> None:
-    """Persist latest CoCo update notice marker."""
+def _write_update_notice_state(state: dict[str, str]) -> None:
+    """Persist update notice marker state."""
     try:
-        atomic_write_json(
-            _UPDATE_NOTICE_STATE_FILE,
-            {
-                "latest_commit": snapshot.latest_commit,
-                "upstream_ref": snapshot.upstream_ref,
-            },
-        )
+        atomic_write_json(_UPDATE_NOTICE_STATE_FILE, state)
     except OSError as e:
         logger.debug(
             "Failed writing update notice file %s: %s",
             _UPDATE_NOTICE_STATE_FILE,
             e,
         )
+
+
+def _store_coco_update_notice_state(snapshot: _CocoUpdateSnapshot) -> None:
+    """Persist latest CoCo update notice marker."""
+    state = _load_update_notice_state()
+    state["latest_commit"] = snapshot.latest_commit
+    state["upstream_ref"] = snapshot.upstream_ref
+    _write_update_notice_state(state)
+
+
+def _store_codex_update_notice_state(snapshot: _CodexUpdateSnapshot) -> None:
+    """Persist latest Codex update notice marker."""
+    state = _load_update_notice_state()
+    state["latest_codex_version"] = snapshot.latest_version
+    _write_update_notice_state(state)
 
 
 def _build_coco_update_notice_text(snapshot: _CocoUpdateSnapshot) -> str:
@@ -5124,6 +5134,24 @@ def _build_coco_update_notice_text(snapshot: _CocoUpdateSnapshot) -> str:
             f"State: {_build_coco_update_state(snapshot)}",
             "",
             "Use the buttons below to apply the CoCo update, update Codex too, or refresh the full panel.",
+        ]
+    )
+
+
+def _build_codex_update_notice_text(snapshot: _CodexUpdateSnapshot) -> str:
+    """Build concise Telegram text for an available Codex update."""
+    current_version = snapshot.current_version or "<unknown>"
+    latest_version = snapshot.latest_version or "<unknown>"
+    return "\n".join(
+        [
+            "⬆️ *Codex Update Available*",
+            "",
+            f"Binary: `{snapshot.codex_binary or '<unknown>'}`",
+            f"Current: `{current_version}`",
+            f"Latest: `{latest_version}`",
+            "State: Behind latest release.",
+            "",
+            "Use the buttons below to update Codex, update CoCo too, or refresh the full panel.",
         ]
     )
 
@@ -5152,12 +5180,40 @@ async def _maybe_send_coco_update_notice(bot_obj: Bot, snapshot: _CocoUpdateSnap
             message_thread_id=thread_id,
             reply_markup=keyboard,
         )
-    _store_update_notice_state(snapshot)
+    _store_coco_update_notice_state(snapshot)
+    return True
+
+
+async def _maybe_send_codex_update_notice(
+    bot_obj: Bot,
+    snapshot: _CodexUpdateSnapshot,
+) -> bool:
+    """Notify admins when a new Codex update becomes available."""
+    if snapshot.behind is not True or not snapshot.latest_version:
+        return False
+    targets = _update_notice_targets()
+    if not targets:
+        return False
+    state = _load_update_notice_state()
+    if state.get("latest_codex_version") == snapshot.latest_version:
+        return False
+
+    text = _build_codex_update_notice_text(snapshot)
+    keyboard = _build_update_panel_keyboard(can_trigger_upgrade=True)
+    for chat_id, thread_id in targets:
+        await safe_send(
+            bot_obj,
+            chat_id,
+            text,
+            message_thread_id=thread_id,
+            reply_markup=keyboard,
+        )
+    _store_codex_update_notice_state(snapshot)
     return True
 
 
 async def _coco_update_check_loop(bot_obj: Bot) -> None:
-    """Periodically check for CoCo repo updates and notify admins."""
+    """Periodically check for CoCo and Codex updates and notify admins."""
     initial_delay = max(
         0,
         _env_int(_COCO_UPDATE_CHECK_INITIAL_DELAY_ENV, default=60),
@@ -5170,12 +5226,16 @@ async def _coco_update_check_loop(bot_obj: Bot) -> None:
         await asyncio.sleep(initial_delay)
     while True:
         try:
-            snapshot = await _collect_coco_update_snapshot(fetch_remote=True)
-            await _maybe_send_coco_update_notice(bot_obj, snapshot)
+            coco_snapshot, codex_snapshot = await asyncio.gather(
+                _collect_coco_update_snapshot(fetch_remote=True),
+                _collect_codex_update_snapshot(),
+            )
+            await _maybe_send_coco_update_notice(bot_obj, coco_snapshot)
+            await _maybe_send_codex_update_notice(bot_obj, codex_snapshot)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("CoCo update check failed")
+            logger.exception("Update check failed")
         await asyncio.sleep(interval)
 
 

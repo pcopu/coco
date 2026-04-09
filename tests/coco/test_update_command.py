@@ -126,6 +126,79 @@ async def test_maybe_send_coco_update_notice_dedupes_by_target_commit(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_maybe_send_codex_update_notice_dedupes_by_latest_version(
+    monkeypatch, tmp_path
+):
+    snapshot = bot._CodexUpdateSnapshot(
+        codex_binary="codex",
+        current_version="1.0.0",
+        latest_version="1.1.0",
+        behind=True,
+        check_error="",
+        upgrade_command="uv tool upgrade codex",
+        upgrade_source="uv",
+    )
+    sent: list[tuple[int, str, int | None, object | None]] = []
+
+    monkeypatch.setattr(bot, "_UPDATE_NOTICE_STATE_FILE", tmp_path / "update_notice.json")
+    monkeypatch.setattr(bot, "_update_notice_targets", lambda: [(7, None)])
+
+    async def _safe_send(
+        _bot,
+        chat_id: int,
+        text: str,
+        message_thread_id: int | None = None,
+        **kwargs,
+    ):
+        sent.append((chat_id, text, message_thread_id, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    await bot._maybe_send_codex_update_notice(object(), snapshot)
+    await bot._maybe_send_codex_update_notice(object(), snapshot)
+
+    assert len(sent) == 1
+    assert sent[0][0] == 7
+    assert "Codex Update Available" in sent[0][1]
+    assert "`1.0.0`" in sent[0][1]
+    assert "`1.1.0`" in sent[0][1]
+    assert isinstance(sent[0][3], InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_maybe_send_codex_update_notice_skips_when_not_behind(monkeypatch, tmp_path):
+    snapshot = bot._CodexUpdateSnapshot(
+        codex_binary="codex",
+        current_version="1.1.0",
+        latest_version="1.1.0",
+        behind=False,
+        check_error="",
+        upgrade_command="uv tool upgrade codex",
+        upgrade_source="uv",
+    )
+    sent: list[tuple[int, str, int | None, object | None]] = []
+
+    monkeypatch.setattr(bot, "_UPDATE_NOTICE_STATE_FILE", tmp_path / "update_notice.json")
+    monkeypatch.setattr(bot, "_update_notice_targets", lambda: [(7, None)])
+
+    async def _safe_send(
+        _bot,
+        chat_id: int,
+        text: str,
+        message_thread_id: int | None = None,
+        **kwargs,
+    ):
+        sent.append((chat_id, text, message_thread_id, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    result = await bot._maybe_send_codex_update_notice(object(), snapshot)
+
+    assert result is False
+    assert sent == []
+
+
+@pytest.mark.asyncio
 async def test_update_command_shows_inline_panel(monkeypatch):
     update = _make_update("/update")
     replies: list[tuple[str, object | None]] = []
