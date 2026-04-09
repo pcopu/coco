@@ -193,6 +193,35 @@ class TestTopicBindingsV2:
         assert binding.reasoning_effort == "high"
         assert mgr.get_topic_model_selection(100, 1) == ("gpt-5.4", "high")
 
+    def test_topic_service_tier_selection_roundtrip(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+
+        changed = mgr.set_topic_service_tier_selection(
+            100,
+            1,
+            service_tier="fast",
+        )
+
+        binding = mgr.resolve_topic_binding(100, 1)
+        assert changed is True
+        assert binding is not None
+        assert binding.service_tier == "fast"
+        assert mgr.get_topic_service_tier_selection(100, 1) == "fast"
+
+    def test_machine_transcription_profile_selection_roundtrip(
+        self, mgr: SessionManager
+    ) -> None:
+        changed = mgr.set_machine_transcription_profile_selection(
+            "local-node",
+            transcription_profile="compatible",
+        )
+
+        assert changed is True
+        assert (
+            mgr.get_machine_transcription_profile_selection("local-node")
+            == "compatible"
+        )
+
     def test_bind_topic_to_codex_thread_preserves_topic_model_selection(
         self, mgr: SessionManager
     ) -> None:
@@ -524,6 +553,10 @@ class TestRuntimeCapabilityHint:
         assert ".pdf" in hint
         assert ".txt" in hint
         assert ".md" in hint
+        assert ".png" in hint
+        assert ".jpg" in hint
+        assert ".jpeg" in hint
+        assert ".webp" in hint
 
 
 class TestGroupChatId:
@@ -902,8 +935,9 @@ async def test_ensure_codex_thread_uses_app_default_when_window_override_missing
         approval_policy: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        service_tier: str | None = None,
     ):
-        _ = cwd, model, effort
+        _ = cwd, model, effort, service_tier
         started.append(approval_policy)
         return {"thread": {"id": "thread-1"}}
 
@@ -923,6 +957,41 @@ async def test_ensure_codex_thread_uses_app_default_when_window_override_missing
 
 
 @pytest.mark.asyncio
+async def test_ensure_codex_thread_passes_topic_service_tier(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    mgr.bind_thread(100, 1, "@1", window_name="proj")
+    mgr.set_topic_service_tier_selection(100, 1, service_tier="fast")
+    started: list[tuple[str | None, str | None]] = []
+
+    async def _thread_start(
+        *,
+        cwd: str | None = None,
+        approval_policy: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ):
+        _ = cwd, approval_policy, model, effort
+        started.append((approval_policy, service_tier))
+        return {"thread": {"id": "thread-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.thread_start",
+        _thread_start,
+    )
+
+    thread_id, _policy = await mgr._ensure_codex_thread_for_window(
+        window_id="@1",
+        cwd="/tmp/demo",
+    )
+
+    assert thread_id == "thread-1"
+    assert started == [("on-request", "fast")]
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_via_app_server_prepends_runtime_capability_hint(
     mgr: SessionManager,
     monkeypatch,
@@ -936,9 +1005,10 @@ async def test_send_inputs_via_app_server_prepends_runtime_capability_hint(
         thread_id: str,
         inputs: list[dict[str, object]],
         approval_policy: str | None = None,
+        service_tier: str | None = None,
         timeout: float = 90.0,
     ):
-        _ = thread_id, approval_policy, timeout
+        _ = thread_id, approval_policy, service_tier, timeout
         captured_inputs.extend(inputs)
         return {"turn": {"id": "turn-1"}}
 
@@ -970,6 +1040,57 @@ async def test_send_inputs_via_app_server_prepends_runtime_capability_hint(
     assert "Filesystem write access: enabled" in str(captured_inputs[0]["text"])
     assert "Approval policy: never" in str(captured_inputs[0]["text"])
     assert captured_inputs[1] == {"type": "text", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_via_app_server_passes_topic_service_tier(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    captured_service_tiers: list[str | None] = []
+    mgr.bind_thread(100, 1, "@1", window_name="demo")
+    mgr.set_topic_service_tier_selection(100, 1, service_tier="flex")
+    mgr.set_window_codex_thread_id("@1", "thread-1")
+    mgr.set_window_approval_mode("@1", "never")
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        timeout: float = 90.0,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ):
+        _ = thread_id, inputs, approval_policy, timeout, model, effort
+        captured_service_tiers.append(service_tier)
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert captured_service_tiers == ["flex"]
 
 
 @pytest.mark.asyncio

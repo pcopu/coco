@@ -59,6 +59,8 @@ TOPIC_BINDING_TRANSPORT_CODEX_THREAD = "codex_thread"
 TOPIC_SYNC_MODE_TELEGRAM_LIVE = "telegram_live"
 TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL = "host_follow_final"
 EXPECTED_TRANSCRIPT_USER_ECHO_MAX_AGE_SECONDS = 120.0
+CODEX_SERVICE_TIERS = frozenset({"fast", "flex"})
+TRANSCRIPTION_PROFILES = frozenset({"compatible", "auto"})
 
 
 @dataclass
@@ -173,6 +175,7 @@ class TopicBinding:
     machine_display_name: str = ""
     model_slug: str = ""
     reasoning_effort: str = ""
+    service_tier: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -200,6 +203,8 @@ class TopicBinding:
             d["model_slug"] = self.model_slug
         if self.reasoning_effort:
             d["reasoning_effort"] = self.reasoning_effort
+        if self.service_tier:
+            d["service_tier"] = self.service_tier
         return d
 
     @classmethod
@@ -224,6 +229,14 @@ class TopicBinding:
         machine_display_name = str(data.get("machine_display_name", "")).strip()
         model_slug = str(data.get("model_slug", "")).strip()
         reasoning_effort = str(data.get("reasoning_effort", "")).strip()
+        raw_service_tier = data.get("service_tier", "")
+        service_tier = (
+            str(raw_service_tier).strip().lower()
+            if isinstance(raw_service_tier, str)
+            else ""
+        )
+        if service_tier not in CODEX_SERVICE_TIERS:
+            service_tier = ""
         if transport not in {
             TOPIC_BINDING_TRANSPORT_WINDOW,
             TOPIC_BINDING_TRANSPORT_CODEX_THREAD,
@@ -246,6 +259,7 @@ class TopicBinding:
             machine_display_name=machine_display_name,
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
         )
 
 
@@ -296,6 +310,8 @@ class SessionManager:
     group_chat_ids: dict[str, int] = field(default_factory=dict)
     # App-wide approval mode default used when window override is unset.
     default_approval_mode: str = ""
+    # machine_id -> server-wide transcription profile selection
+    machine_transcription_profiles: dict[str, str] = field(default_factory=dict)
     # Per-window send/steer lock. Prevents concurrent turn mutations in one window.
     _window_send_locks: dict[str, asyncio.Lock] = field(
         default_factory=dict,
@@ -359,6 +375,8 @@ class SessionManager:
         }
         if self.default_approval_mode:
             state["default_approval_mode"] = self.default_approval_mode
+        if self.machine_transcription_profiles:
+            state["machine_transcription_profiles"] = self.machine_transcription_profiles
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
 
@@ -433,6 +451,7 @@ class SessionManager:
                     machine_display_name=binding.machine_display_name,
                     model_slug=binding.model_slug,
                     reasoning_effort=binding.reasoning_effort,
+                    service_tier=binding.service_tier,
                 )
             if per_user:
                 combined[user_id] = per_user
@@ -623,6 +642,21 @@ class SessionManager:
                     if isinstance(raw_default_mode, str)
                     else ""
                 )
+                raw_machine_transcription_profiles = state.get(
+                    "machine_transcription_profiles",
+                    {},
+                )
+                if not isinstance(raw_machine_transcription_profiles, dict):
+                    raw_machine_transcription_profiles = {}
+                self.machine_transcription_profiles = {}
+                for raw_machine_id, raw_profile in raw_machine_transcription_profiles.items():
+                    machine_id = str(raw_machine_id).strip()
+                    if not machine_id or not isinstance(raw_profile, str):
+                        continue
+                    normalized_profile = raw_profile.strip().lower()
+                    if normalized_profile not in TRANSCRIPTION_PROFILES:
+                        continue
+                    self.machine_transcription_profiles[machine_id] = normalized_profile
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -664,6 +698,7 @@ class SessionManager:
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 self.default_approval_mode = ""
+                self.machine_transcription_profiles = {}
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -1834,6 +1869,11 @@ class SessionManager:
                     thread_id,
                     chat_id=chat_id,
                 )
+                service_tier = self.get_topic_service_tier_selection(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
                 remote_result = await agent_rpc_client.send_inputs(
                     machine_id,
                     window_id=window_id,
@@ -1845,6 +1885,7 @@ class SessionManager:
                     approval_mode=state.approval_mode.strip(),
                     model_slug=model_slug,
                     reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
                 )
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
@@ -1897,6 +1938,11 @@ class SessionManager:
                     thread_id,
                     chat_id=chat_id,
                 )
+                service_tier = self.get_topic_service_tier_selection(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
                 remote_result = await agent_rpc_client.send_inputs(
                     machine_id,
                     window_id=window_id,
@@ -1908,6 +1954,7 @@ class SessionManager:
                     approval_mode=state.approval_mode.strip(),
                     model_slug=model_slug,
                     reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
                 )
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
@@ -2018,6 +2065,23 @@ class SessionManager:
         reasoning_effort = raw_effort.strip() if isinstance(raw_effort, str) else ""
         return model_slug, reasoning_effort
 
+    def get_topic_service_tier_selection(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> str:
+        """Return the persisted per-topic service tier selection."""
+        binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if binding is None:
+            return ""
+        raw_service_tier = getattr(binding, "service_tier", "")
+        if not isinstance(raw_service_tier, str):
+            return ""
+        normalized = raw_service_tier.strip().lower()
+        return normalized if normalized in CODEX_SERVICE_TIERS else ""
+
     def get_window_topic_model_selection(self, window_id: str) -> tuple[str, str]:
         """Return one persisted model selection for a window-bound topic."""
         normalized_window_id = window_id.strip()
@@ -2029,6 +2093,18 @@ class SessionManager:
             return binding.model_slug.strip(), binding.reasoning_effort.strip()
         return "", ""
 
+    def get_window_topic_service_tier_selection(self, window_id: str) -> str:
+        """Return one persisted service tier selection for a window-bound topic."""
+        normalized_window_id = window_id.strip()
+        if not normalized_window_id:
+            return ""
+        for _user_id, _chat_id, _thread_id, binding in self.iter_topic_bindings():
+            if binding.window_id.strip() != normalized_window_id:
+                continue
+            raw_service_tier = binding.service_tier.strip().lower()
+            return raw_service_tier if raw_service_tier in CODEX_SERVICE_TIERS else ""
+        return ""
+
     def get_window_machine_id(self, window_id: str) -> str:
         """Return the bound machine id for a window-bound topic."""
         normalized_window_id = window_id.strip()
@@ -2039,6 +2115,17 @@ class SessionManager:
                 continue
             return binding.machine_id.strip()
         return ""
+
+    def get_machine_transcription_profile_selection(self, machine_id: str = "") -> str:
+        """Return the server-wide transcription profile for one machine."""
+        normalized_machine_id = machine_id.strip()
+        if not normalized_machine_id:
+            return ""
+        raw_profile = self.machine_transcription_profiles.get(normalized_machine_id, "")
+        if not isinstance(raw_profile, str):
+            return ""
+        normalized_profile = raw_profile.strip().lower()
+        return normalized_profile if normalized_profile in TRANSCRIPTION_PROFILES else ""
 
     def iter_topics_for_machine(
         self,
@@ -2075,6 +2162,52 @@ class SessionManager:
             return False
         binding.model_slug = normalized_model
         binding.reasoning_effort = normalized_effort
+        self._save_state()
+        return True
+
+    def set_topic_service_tier_selection(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+        service_tier: str = "",
+    ) -> bool:
+        """Persist the per-topic service tier selection."""
+        binding = self.ensure_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if binding is None:
+            return False
+        normalized_service_tier = service_tier.strip().lower()
+        if normalized_service_tier not in CODEX_SERVICE_TIERS:
+            normalized_service_tier = ""
+        if binding.service_tier == normalized_service_tier:
+            return False
+        binding.service_tier = normalized_service_tier
+        self._save_state()
+        return True
+
+    def set_machine_transcription_profile_selection(
+        self,
+        machine_id: str,
+        *,
+        transcription_profile: str = "",
+    ) -> bool:
+        """Persist the server-wide transcription profile for one machine."""
+        normalized_machine_id = machine_id.strip()
+        if not normalized_machine_id:
+            return False
+        normalized_profile = transcription_profile.strip().lower()
+        if normalized_profile not in TRANSCRIPTION_PROFILES:
+            normalized_profile = ""
+        current_profile = self.get_machine_transcription_profile_selection(
+            normalized_machine_id
+        )
+        if current_profile == normalized_profile:
+            return False
+        if normalized_profile:
+            self.machine_transcription_profiles[normalized_machine_id] = normalized_profile
+        else:
+            self.machine_transcription_profiles.pop(normalized_machine_id, None)
         self._save_state()
         return True
 
@@ -2121,6 +2254,7 @@ class SessionManager:
         )
         resolved_model_slug = existing.model_slug if existing else ""
         resolved_reasoning_effort = existing.reasoning_effort if existing else ""
+        resolved_service_tier = existing.service_tier if existing else ""
         binding = TopicBinding(
             transport=TOPIC_BINDING_TRANSPORT_CODEX_THREAD,
             chat_id=resolved_chat_id,
@@ -2134,6 +2268,7 @@ class SessionManager:
             machine_display_name=resolved_machine_display_name,
             model_slug=resolved_model_slug,
             reasoning_effort=resolved_reasoning_effort,
+            service_tier=resolved_service_tier,
         )
         self._set_topic_binding(
             user_id=user_id,
@@ -2191,6 +2326,7 @@ class SessionManager:
             machine_display_name=binding.machine_display_name,
             model_slug=binding.model_slug,
             reasoning_effort=binding.reasoning_effort,
+            service_tier=binding.service_tier,
         )
         if resolved.window_id:
             fallback = self._topic_binding_from_window(resolved.window_id)
@@ -2299,6 +2435,7 @@ class SessionManager:
             ),
             model_slug=existing.model_slug if existing else "",
             reasoning_effort=existing.reasoning_effort if existing else "",
+            service_tier=existing.service_tier if existing else "",
         )
         self._set_topic_binding(
             user_id=user_id,
@@ -2667,7 +2804,8 @@ class SessionManager:
             "Telegram attachments: to upload a workspace file for the user, "
             'append a standalone line exactly like '
             '<telegram-attachment path="relative/path.pdf" /> '
-            "after your normal answer. Supported types: .pdf, .txt, .md. "
+            "after your normal answer. Supported types: .pdf, .txt, .md, "
+            ".png, .jpg, .jpeg, .webp, .gif, .bmp, .tif, .tiff. "
             "Use only files inside the workspace. The tag line is hidden from the user.\n"
             "Treat this as the current runtime capability for this turn, "
             "not as a user request."
@@ -2757,6 +2895,7 @@ class SessionManager:
         thread_id: str,
         inputs: list[dict[str, Any]],
         approval_policy: str,
+        service_tier: str = "",
     ) -> dict[str, Any]:
         """Start a turn with one guarded retry for transient timeout cases."""
         attempts = APP_SERVER_TURN_START_MAX_ATTEMPTS
@@ -2767,6 +2906,7 @@ class SessionManager:
                     thread_id=thread_id,
                     inputs=inputs,
                     approval_policy=approval_policy,
+                    service_tier=service_tier.strip() or None,
                     timeout=APP_SERVER_TURN_START_TIMEOUT_SECONDS,
                 )
             except Exception as e:
@@ -2801,6 +2941,7 @@ class SessionManager:
         cwd: str,
         model: str = "",
         effort: str = "",
+        service_tier: str = "",
     ) -> tuple[str, str]:
         """Ensure a window has a Codex app-server thread id.
 
@@ -2814,6 +2955,9 @@ class SessionManager:
         approval_policy = self._normalize_approval_policy(raw_mode)
         if not approval_policy:
             approval_policy = self._infer_default_approval_policy_from_command() or "on-request"
+        normalized_service_tier = service_tier.strip().lower()
+        if normalized_service_tier not in CODEX_SERVICE_TIERS:
+            normalized_service_tier = self.get_window_topic_service_tier_selection(window_id)
 
         if thread_id:
             return thread_id, approval_policy
@@ -2823,6 +2967,7 @@ class SessionManager:
             approval_policy=approval_policy,
             model=model.strip() or None,
             effort=effort.strip() or None,
+            service_tier=normalized_service_tier or None,
         )
         thread = started.get("thread") if isinstance(started, dict) else None
         new_thread_id = thread.get("id") if isinstance(thread, dict) else None
@@ -2949,6 +3094,7 @@ class SessionManager:
         stale_thread_id: str,
         model_slug: str = "",
         reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> tuple[bool, str]:
         """Clear stale thread id and retry one send using a fresh thread."""
         if stale_thread_id:
@@ -3004,6 +3150,8 @@ class SessionManager:
             send_kwargs["model_slug"] = model_slug
         if reasoning_effort:
             send_kwargs["reasoning_effort"] = reasoning_effort
+        if service_tier:
+            send_kwargs["service_tier"] = service_tier
         ok, msg = await self._send_inputs_via_codex_app_server(
             window_id=window_id,
             inputs=inputs,
@@ -3046,6 +3194,7 @@ class SessionManager:
         thread_id: str,
         model_slug: str = "",
         reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> tuple[bool, str]:
         """Clear stale active turn and retry once via turn/start."""
         if thread_id:
@@ -3073,6 +3222,8 @@ class SessionManager:
             send_kwargs["model_slug"] = model_slug
         if reasoning_effort:
             send_kwargs["reasoning_effort"] = reasoning_effort
+        if service_tier:
+            send_kwargs["service_tier"] = service_tier
         ok, msg = await self._send_inputs_via_codex_app_server(
             window_id=window_id,
             inputs=inputs,
@@ -3115,14 +3266,19 @@ class SessionManager:
         cwd: str,
         model_slug: str = "",
         reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> tuple[bool, str]:
         if not model_slug and not reasoning_effort:
             model_slug, reasoning_effort = self.get_window_topic_model_selection(window_id)
+        if not service_tier:
+            service_tier = self.get_window_topic_service_tier_selection(window_id)
         ensure_kwargs: dict[str, str] = {}
         if model_slug:
             ensure_kwargs["model"] = model_slug
         if reasoning_effort:
             ensure_kwargs["effort"] = reasoning_effort
+        if service_tier:
+            ensure_kwargs["service_tier"] = service_tier
         thread_id, approval_policy = await self._ensure_codex_thread_for_window(
             window_id=window_id,
             cwd=cwd,
@@ -3169,6 +3325,7 @@ class SessionManager:
                 thread_id=thread_id,
                 inputs=turn_inputs,
                 approval_policy=approval_policy,
+                service_tier=service_tier,
             )
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -3196,6 +3353,7 @@ class SessionManager:
         steer: bool = False,
         model_slug: str = "",
         reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> tuple[bool, str]:
         """Send structured user inputs to a window via Codex app-server."""
         display = self.get_display_name(window_id)
@@ -3226,6 +3384,8 @@ class SessionManager:
                         send_kwargs["model_slug"] = model_slug
                     if reasoning_effort:
                         send_kwargs["reasoning_effort"] = reasoning_effort
+                    if service_tier:
+                        send_kwargs["service_tier"] = service_tier
                     return await self._send_inputs_via_codex_app_server(
                         window_id=window_id,
                         inputs=inputs,

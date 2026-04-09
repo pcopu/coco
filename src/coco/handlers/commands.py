@@ -24,6 +24,8 @@ _COMMAND_HANDLER_NAMES = {
     "resume_command",
     "status_command",
     "model_command",
+    "fast_command",
+    "transcription_command",
     "update_command",
 }
 
@@ -1701,6 +1703,107 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         update.message,
         _build_model_info_text(catalog),
         reply_markup=_build_model_keyboard(catalog),
+    )
+
+
+async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _sync_bot_globals()
+    """Show/change per-topic Codex fast mode using service tier overrides."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not await _ensure_chat_allowed(update):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ Use `/fast` inside a named topic.")
+        return
+
+    chat_id = _scoped_chat_id(update)
+    if chat_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+    session_manager.ensure_topic_binding(user.id, thread_id, chat_id=chat_id)
+
+    selected_tier = session_manager.get_topic_service_tier_selection(
+        user.id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    current_tier = selected_tier or _load_codex_default_service_tier()
+    current_fast_mode = current_tier == "fast"
+    raw_args = _extract_command_args(update.message.text or "").strip().lower()
+    usage = "Usage: `/fast` or `/fast on|off|toggle`"
+
+    if not raw_args:
+        state_label = "ON" if current_fast_mode else "OFF"
+        await safe_reply(
+            update.message,
+            (
+                f"Fast mode: `{state_label}`\n"
+                f"Future turns in this topic use the `{current_tier}` service tier.\n\n"
+                f"{usage}"
+            ),
+        )
+        return
+
+    action = raw_args.split(maxsplit=1)[0].strip().lower()
+    if action in {"on", "fast", "enable"}:
+        desired_tier = "fast"
+    elif action in {"off", "disable"}:
+        desired_tier = "flex"
+    elif action in {"toggle", "flip"}:
+        desired_tier = "flex" if current_fast_mode else "fast"
+    else:
+        await safe_reply(update.message, f"❌ Unknown mode `{action}`.\n{usage}")
+        return
+
+    session_manager.set_topic_service_tier_selection(
+        user.id,
+        thread_id,
+        chat_id=chat_id,
+        service_tier=desired_tier,
+    )
+    state_label = "ON" if desired_tier == "fast" else "OFF"
+    await safe_reply(
+        update.message,
+        (
+            f"✅ Fast mode is now `{state_label}`.\n"
+            f"Future turns in this topic will use the `{desired_tier}` service tier."
+        ),
+    )
+
+
+async def transcription_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _sync_bot_globals()
+    """Show fixed local transcription mode."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not await _ensure_chat_allowed(update):
+        return
+    if not update.message:
+        return
+
+    raw_args = _extract_command_args(update.message.text or "").strip().lower()
+    runtime = resolve_transcription_runtime("compatible")
+
+    if raw_args:
+        await safe_reply(
+            update.message,
+            "Local transcription is fixed to `COMPATIBLE` on this server. No other modes are available.",
+        )
+        return
+
+    await safe_reply(
+        update.message,
+        (
+            "Server transcription mode: `COMPATIBLE`\n"
+            "Audio transcription always uses the portable local CPU path.\n"
+            f"Resolved here: `{runtime.device} / {runtime.compute_type} / {runtime.model_name}`"
+        ),
     )
 
 

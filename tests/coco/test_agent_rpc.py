@@ -57,12 +57,21 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
 
     captured: dict[str, object] = {}
 
-    async def _fake_send_inputs_to_window(window_id, inputs, *, steer=False, model_slug="", reasoning_effort=""):
+    async def _fake_send_inputs_to_window(
+        window_id,
+        inputs,
+        *,
+        steer=False,
+        model_slug="",
+        reasoning_effort="",
+        service_tier="",
+    ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
         captured["steer"] = steer
         captured["model_slug"] = model_slug
         captured["reasoning_effort"] = reasoning_effort
+        captured["service_tier"] = service_tier
         current = session_manager.get_window_state(window_id)
         current.codex_thread_id = "thread-1"
         current.codex_active_turn_id = "turn-1"
@@ -94,10 +103,12 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
             steer=False,
             model_slug="gpt-5.4",
             reasoning_effort="high",
+            service_tier="fast",
         )
         assert captured["window_id"] == "@remote"
         assert captured["model_slug"] == "gpt-5.4"
         assert captured["reasoning_effort"] == "high"
+        assert captured["service_tier"] == "fast"
         assert payload["thread_id"] == "thread-1"
         assert payload["turn_id"] == "turn-1"
     finally:

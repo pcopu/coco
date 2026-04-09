@@ -50,8 +50,9 @@ supergroup.
 In Telegram, talk to [@BotFather](https://t.me/BotFather):
 
 1. Run `/newbot` and copy the bot token.
-2. Run `/setprivacy` and choose **Disable** so CoCo can read normal topic messages.
+2. Run `/setprivacy` and choose **Disable** so CoCo can read normal topic messages during setup and in any group where you want free-form topic chat.
 3. Open **Bot Settings** and enable **Threaded Mode**.
+4. After setup is complete, go back to `/setprivacy` and choose **Enable** if you want the stricter default where CoCo only sees commands, replies, and `@mentions`. Leave privacy **Disable** only if you want CoCo to keep reading normal topic messages.
 
 ### 2. Create the target supergroup and turn on topics
 

@@ -21,14 +21,24 @@ logger = logging.getLogger(__name__)
 SESSION_PANEL_LIST_REQUEST_LIMIT = 50
 SESSION_PANEL_LIST_LIMIT = 100
 ALLOWED_TELEGRAM_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
-TELEGRAM_DOCUMENT_MAX_BYTES = 45 * 1024 * 1024
+ALLOWED_TELEGRAM_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+TELEGRAM_ATTACHMENT_MAX_BYTES = 45 * 1024 * 1024
 
 
-def _resolve_document_attachment(
+def _resolve_attachment_path(
     *,
     workspace_dir: str,
     raw_path: str,
-) -> tuple[str, bytes] | None:
+) -> Path | None:
     if not workspace_dir or not raw_path:
         return None
 
@@ -50,6 +60,20 @@ def _resolve_document_attachment(
         resolved.relative_to(workspace_root)
     except ValueError:
         return None
+    return resolved
+
+
+def _resolve_document_attachment(
+    *,
+    workspace_dir: str,
+    raw_path: str,
+) -> tuple[str, bytes] | None:
+    resolved = _resolve_attachment_path(
+        workspace_dir=workspace_dir,
+        raw_path=raw_path,
+    )
+    if resolved is None:
+        return None
 
     if resolved.suffix.lower() not in ALLOWED_TELEGRAM_DOCUMENT_EXTENSIONS:
         return None
@@ -59,10 +83,38 @@ def _resolve_document_attachment(
         size = resolved.stat().st_size
     except OSError:
         return None
-    if size > TELEGRAM_DOCUMENT_MAX_BYTES:
+    if size > TELEGRAM_ATTACHMENT_MAX_BYTES:
         return None
     try:
         return resolved.name, resolved.read_bytes()
+    except OSError:
+        return None
+
+
+def _resolve_image_attachment(
+    *,
+    workspace_dir: str,
+    raw_path: str,
+) -> tuple[str, bytes] | None:
+    resolved = _resolve_attachment_path(
+        workspace_dir=workspace_dir,
+        raw_path=raw_path,
+    )
+    if resolved is None:
+        return None
+    media_type = ALLOWED_TELEGRAM_IMAGE_TYPES.get(resolved.suffix.lower())
+    if not media_type:
+        return None
+    if not resolved.is_file():
+        return None
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        return None
+    if size > TELEGRAM_ATTACHMENT_MAX_BYTES:
+        return None
+    try:
+        return media_type, resolved.read_bytes()
     except OSError:
         return None
 
@@ -171,6 +223,7 @@ class AgentRpcServer:
         self._server.register("agent/ensure_thread", self._ensure_thread)
         self._server.register("agent/fork_thread", self._fork_thread)
         self._server.register("agent/rollback_thread", self._rollback_thread)
+        self._server.register("agent/read_attachments", self._read_attachments)
         self._server.register("agent/read_documents", self._read_documents)
         self._server.register("agent/resume_latest", self._resume_latest)
         self._server.register("agent/resume_thread", self._resume_thread)
@@ -257,6 +310,7 @@ class AgentRpcServer:
         approval_mode = str(params.get("approval_mode", "")).strip()
         model_slug = str(params.get("model_slug", "")).strip()
         reasoning_effort = str(params.get("reasoning_effort", "")).strip()
+        service_tier = str(params.get("service_tier", "")).strip().lower()
         _configure_remote_window(
             window_id=window_id,
             cwd=cwd,
@@ -269,6 +323,8 @@ class AgentRpcServer:
             ensure_kwargs["model"] = model_slug
         if reasoning_effort:
             ensure_kwargs["effort"] = reasoning_effort
+        if service_tier:
+            ensure_kwargs["service_tier"] = service_tier
         thread_id, _approval = await session_manager._ensure_codex_thread_for_window(
             window_id=window_id,
             cwd=cwd,
@@ -337,29 +393,47 @@ class AgentRpcServer:
             session_manager.set_window_codex_active_turn_id(window_id, rolled_turn_id)
         return {"thread_id": rolled_thread_id, "turn_id": rolled_turn_id}
 
-    async def _read_documents(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def _read_attachments(self, params: dict[str, Any]) -> dict[str, Any]:
         workspace_dir = str(params.get("workspace_dir", "")).strip()
         raw_paths = params.get("paths", [])
         if not isinstance(raw_paths, list):
             raise ClusterRpcError("paths must be a list")
         documents: list[dict[str, str]] = []
+        images: list[dict[str, str]] = []
         for raw_path in raw_paths:
             if not isinstance(raw_path, str):
                 continue
-            resolved = _resolve_document_attachment(
+            image_resolved = _resolve_image_attachment(
                 workspace_dir=workspace_dir,
                 raw_path=raw_path,
             )
-            if resolved is None:
+            if image_resolved is not None:
+                media_type, raw_bytes = image_resolved
+                images.append(
+                    {
+                        "media_type": media_type,
+                        "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    }
+                )
                 continue
-            name, raw_bytes = resolved
+            document_resolved = _resolve_document_attachment(
+                workspace_dir=workspace_dir,
+                raw_path=raw_path,
+            )
+            if document_resolved is None:
+                continue
+            name, raw_bytes = document_resolved
             documents.append(
                 {
                     "name": name,
                     "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
                 }
             )
-        return {"documents": documents}
+        return {"documents": documents, "images": images}
+
+    async def _read_documents(self, params: dict[str, Any]) -> dict[str, Any]:
+        result = await self._read_attachments(params)
+        return {"documents": result.get("documents", [])}
 
     async def _resume_thread(self, params: dict[str, Any]) -> dict[str, Any]:
         window_id = str(params.get("window_id", "")).strip()
@@ -401,6 +475,7 @@ class AgentRpcServer:
         codex_thread_id = str(params.get("thread_id", "")).strip()
         model_slug = str(params.get("model_slug", "")).strip()
         reasoning_effort = str(params.get("reasoning_effort", "")).strip()
+        service_tier = str(params.get("service_tier", "")).strip().lower()
         steer = bool(params.get("steer", False))
         inputs = params.get("inputs", [])
         if not isinstance(inputs, list):
@@ -418,6 +493,7 @@ class AgentRpcServer:
             steer=steer,
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
         )
         state = session_manager.get_window_state(window_id)
         return {
@@ -649,6 +725,61 @@ class AgentRpcClient:
                 continue
         return resolved
 
+    async def read_attachments(
+        self,
+        machine_id: str,
+        *,
+        workspace_dir: str,
+        paths: list[str],
+    ) -> dict[str, list[tuple[str, bytes]]]:
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/read_attachments",
+            params={
+                "workspace_dir": workspace_dir,
+                "paths": paths,
+            },
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid read attachments response")
+
+        resolved_documents: list[tuple[str, bytes]] = []
+        documents = result.get("documents", [])
+        if isinstance(documents, list):
+            for item in documents:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                data_b64 = item.get("data_b64")
+                if not isinstance(name, str) or not isinstance(data_b64, str):
+                    continue
+                try:
+                    resolved_documents.append((name, base64.b64decode(data_b64)))
+                except Exception:
+                    continue
+
+        resolved_images: list[tuple[str, bytes]] = []
+        images = result.get("images", [])
+        if isinstance(images, list):
+            for item in images:
+                if not isinstance(item, dict):
+                    continue
+                media_type = item.get("media_type")
+                data_b64 = item.get("data_b64")
+                if not isinstance(media_type, str) or not isinstance(data_b64, str):
+                    continue
+                try:
+                    resolved_images.append((media_type, base64.b64decode(data_b64)))
+                except Exception:
+                    continue
+
+        return {
+            "documents": resolved_documents,
+            "images": resolved_images,
+        }
+
     async def ensure_thread(
         self,
         machine_id: str,
@@ -659,6 +790,7 @@ class AgentRpcClient:
         approval_mode: str = "",
         model_slug: str = "",
         reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> dict[str, Any]:
         host, port = self._resolve_endpoint(machine_id)
         result = await self._client.call(
@@ -672,6 +804,7 @@ class AgentRpcClient:
                 "approval_mode": approval_mode,
                 "model_slug": model_slug,
                 "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
             },
         )
         if not isinstance(result, dict):
@@ -718,6 +851,7 @@ class AgentRpcClient:
         approval_mode: str = "",
         model_slug: str = "",
         reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> dict[str, Any]:
         host, port = self._resolve_endpoint(machine_id)
         result = await self._client.call(
@@ -734,6 +868,7 @@ class AgentRpcClient:
                 "approval_mode": approval_mode,
                 "model_slug": model_slug,
                 "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
             },
         )
         if not isinstance(result, dict):

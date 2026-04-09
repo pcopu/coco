@@ -44,6 +44,15 @@ def _strip_sentinels(text: str) -> str:
 
 # Disable link previews in all messages to reduce visual noise
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
+_IMAGE_EXTENSION_BY_MEDIA_TYPE = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+}
 
 
 def _thread_id_from_kwargs(kwargs: dict[str, Any]) -> int | None:
@@ -155,7 +164,20 @@ async def send_photo(
     except RetryAfter:
         raise
     except Exception as e:
-        logger.error("Failed to send photo to %d: %s", chat_id, e)
+        logger.warning("Photo send failed for %d; falling back to documents: %s", chat_id, e)
+        try:
+            for index, (media_type, raw_bytes) in enumerate(image_data, start=1):
+                extension = _IMAGE_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(raw_bytes),
+                    filename=f"image-{index}{extension}",
+                    **kwargs,
+                )
+        except RetryAfter:
+            raise
+        except Exception as doc_exc:
+            logger.error("Failed to send image fallback document to %d: %s", chat_id, doc_exc)
 
 
 async def send_documents(

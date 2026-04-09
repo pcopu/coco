@@ -596,6 +596,7 @@ class CodexAppServerClient:
         approval_policy: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if cwd:
@@ -606,6 +607,8 @@ class CodexAppServerClient:
             params["model"] = model
         if effort:
             params["reasoningEffort"] = effort
+        if service_tier:
+            params["serviceTier"] = service_tier
         result = await self.request("thread/start", params, timeout=120.0)
         return result if isinstance(result, dict) else {}
 
@@ -614,10 +617,13 @@ class CodexAppServerClient:
         *,
         thread_id: str,
         turn_id: str | None = None,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"threadId": thread_id}
         if turn_id:
             params["turnId"] = turn_id
+        if service_tier:
+            params["serviceTier"] = service_tier
         result = await self.request("thread/fork", params, timeout=120.0)
         return result if isinstance(result, dict) else {}
 
@@ -625,8 +631,11 @@ class CodexAppServerClient:
         self,
         *,
         thread_id: str,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         params = {"threadId": thread_id}
+        if service_tier:
+            params["serviceTier"] = service_tier
         result = await self.request("thread/resume", params, timeout=120.0)
         return result if isinstance(result, dict) else {}
 
@@ -672,6 +681,7 @@ class CodexAppServerClient:
         thread_id: str,
         inputs: list[dict[str, Any]],
         approval_policy: str | None = None,
+        service_tier: str | None = None,
         timeout: float = 90.0,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -680,6 +690,8 @@ class CodexAppServerClient:
         }
         if approval_policy:
             params["approvalPolicy"] = approval_policy
+        if service_tier:
+            params["serviceTier"] = service_tier
         result = await self.request("turn/start", params, timeout=timeout)
         if isinstance(result, dict):
             turn = result.get("turn")

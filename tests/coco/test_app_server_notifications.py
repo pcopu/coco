@@ -352,6 +352,61 @@ async def test_turn_completed_failed_clears_progress_and_dispatches_queue(monkey
 
 
 @pytest.mark.asyncio
+async def test_turn_completed_completed_dispatches_queued_input(monkeypatch):
+    set_turn_calls: list[tuple[str, str]] = []
+    finalized: list[tuple[int, str, int | None]] = []
+    cleared: list[tuple[int, int | None]] = []
+    dispatched: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda thread_id, turn_id: set_turn_calls.append((thread_id, turn_id)),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+        finalized.append((user_id, window_id, thread_id, compact))
+
+    async def _enqueue_clear(_bot, user_id, thread_id=None):
+        cleared.append((user_id, thread_id))
+
+    async def _dispatch_next(**kwargs):
+        dispatched.append(kwargs)
+
+    async def _enqueue_content(**_kwargs):
+        raise AssertionError("fallback content should not be sent when final text exists")
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_finalize)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _enqueue_clear)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch_next)
+
+    bot._turn_has_final_text["th-completed-q"] = True
+    await bot._handle_codex_app_server_notification(
+        "turn/completed",
+        {
+            "threadId": "th-completed-q",
+            "turn": {"status": "completed"},
+        },
+        bot=object(),
+    )
+
+    assert set_turn_calls == [("th-completed-q", "")]
+    assert finalized == [(10, "@1", 111, True)]
+    assert cleared == []
+    assert len(dispatched) == 1
+    assert dispatched[0]["thread_id"] == 111
+    assert dispatched[0]["window_id"] == "@1"
+
+
+@pytest.mark.asyncio
 async def test_turn_completed_failed_retries_pending_text_after_transient_stream_error(
     monkeypatch,
 ):

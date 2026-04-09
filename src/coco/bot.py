@@ -187,6 +187,14 @@ from .session_monitor import NewMessage, SessionMonitor
 from .skills import resolve_skill_identifier
 from .telemetry import emit_telemetry
 from .telegram_memory import log_incoming_message
+from .transcription import (
+    TranscriptionError,
+    begin_transcription_bootstrap,
+    complete_transcription_bootstrap,
+    get_default_transcription_profile,
+    resolve_transcription_runtime,
+    transcribe_audio_file,
+)
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json, coco_dir, env_alias
 
@@ -3345,6 +3353,11 @@ async def _create_worktree_from_topic(
         thread_id,
         chat_id=chat_id,
     )
+    source_service_tier = session_manager.get_topic_service_tier_selection(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
     success = True
     message = f"Created app-server session `{created_wname}`"
     try:
@@ -3353,6 +3366,8 @@ async def _create_worktree_from_topic(
             ensure_kwargs["model"] = source_model
         if source_effort:
             ensure_kwargs["effort"] = source_effort
+        if source_service_tier:
+            ensure_kwargs["service_tier"] = source_service_tier
         codex_thread_id, _approval = await session_manager._ensure_codex_thread_for_window(
             window_id=created_wid,
             cwd=str(wt_path),
@@ -3403,6 +3418,13 @@ async def _create_worktree_from_topic(
                 chat_id=resolved_chat_id,
                 model_slug=source_model,
                 reasoning_effort=source_effort,
+            )
+        if source_service_tier:
+            session_manager.set_topic_service_tier_selection(
+                user_id,
+                new_thread_id,
+                chat_id=resolved_chat_id,
+                service_tier=source_service_tier,
             )
     else:
         session_manager.bind_thread(
@@ -3685,15 +3707,25 @@ _TELEGRAM_ATTACHMENT_TAG_RE = re.compile(
     r'(?mi)^[ \t]*<telegram-attachment\s+path=(["\'])(?P<path>.+?)\1\s*/>[ \t]*$'
 )
 _ALLOWED_TELEGRAM_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
-_TELEGRAM_DOCUMENT_MAX_BYTES = 45 * 1024 * 1024
+_ALLOWED_TELEGRAM_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+_TELEGRAM_ATTACHMENT_MAX_BYTES = 45 * 1024 * 1024
 
 
-def _resolve_telegram_document_attachment(
+def _resolve_telegram_attachment_path(
     *,
     workspace_dir: str,
     raw_path: str,
-) -> tuple[str, bytes] | None:
-    """Resolve one explicit Telegram attachment path inside the workspace."""
+) -> Path | None:
+    """Resolve one Telegram attachment path inside the workspace."""
     if not workspace_dir or not raw_path:
         return None
 
@@ -3720,7 +3752,21 @@ def _resolve_telegram_document_attachment(
             workspace_root,
         )
         return None
+    return resolved
 
+
+def _resolve_telegram_document_attachment(
+    *,
+    workspace_dir: str,
+    raw_path: str,
+) -> tuple[str, bytes] | None:
+    """Resolve one explicit Telegram attachment path inside the workspace."""
+    resolved = _resolve_telegram_attachment_path(
+        workspace_dir=workspace_dir,
+        raw_path=raw_path,
+    )
+    if resolved is None:
+        return None
     if resolved.suffix.lower() not in _ALLOWED_TELEGRAM_DOCUMENT_EXTENSIONS:
         logger.warning("Rejected Telegram attachment with unsupported type: %s", resolved)
         return None
@@ -3732,7 +3778,7 @@ def _resolve_telegram_document_attachment(
         size = resolved.stat().st_size
     except OSError:
         return None
-    if size > _TELEGRAM_DOCUMENT_MAX_BYTES:
+    if size > _TELEGRAM_ATTACHMENT_MAX_BYTES:
         logger.warning(
             "Rejected Telegram attachment exceeding size limit: %s (%d bytes)",
             resolved,
@@ -3747,45 +3793,90 @@ def _resolve_telegram_document_attachment(
         return None
 
 
-def _extract_telegram_document_attachments(
+def _resolve_telegram_image_attachment(
+    *,
+    workspace_dir: str,
+    raw_path: str,
+) -> tuple[str, bytes] | None:
+    """Resolve one explicit Telegram image attachment inside the workspace."""
+    resolved = _resolve_telegram_attachment_path(
+        workspace_dir=workspace_dir,
+        raw_path=raw_path,
+    )
+    if resolved is None:
+        return None
+    media_type = _ALLOWED_TELEGRAM_IMAGE_TYPES.get(resolved.suffix.lower())
+    if not media_type:
+        return None
+    if not resolved.is_file():
+        logger.warning("Rejected Telegram attachment missing file: %s", resolved)
+        return None
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        return None
+    if size > _TELEGRAM_ATTACHMENT_MAX_BYTES:
+        logger.warning(
+            "Rejected Telegram attachment exceeding size limit: %s (%d bytes)",
+            resolved,
+            size,
+        )
+        return None
+    try:
+        return media_type, resolved.read_bytes()
+    except OSError:
+        logger.warning("Failed reading Telegram attachment file: %s", resolved)
+        return None
+
+
+def _extract_telegram_attachments(
     text: str,
     *,
     workspace_dir: str | None,
-) -> tuple[str, list[tuple[str, bytes]] | None]:
-    """Strip explicit Telegram attachment tags and load allowed documents."""
+) -> tuple[str, list[tuple[str, bytes]] | None, list[tuple[str, bytes]] | None]:
+    """Strip explicit Telegram attachment tags and load allowed images/documents."""
     if not text:
-        return text, None
+        return text, None, None
 
-    attachments: list[tuple[str, bytes]] = []
+    image_attachments: list[tuple[str, bytes]] = []
+    document_attachments: list[tuple[str, bytes]] = []
 
     def _replace(match: re.Match[str]) -> str:
         if workspace_dir:
+            raw_path = match.group("path").strip()
+            image_resolved = _resolve_telegram_image_attachment(
+                workspace_dir=workspace_dir,
+                raw_path=raw_path,
+            )
+            if image_resolved is not None:
+                image_attachments.append(image_resolved)
+                return ""
             resolved = _resolve_telegram_document_attachment(
                 workspace_dir=workspace_dir,
-                raw_path=match.group("path").strip(),
+                raw_path=raw_path,
             )
             if resolved is not None:
-                attachments.append(resolved)
+                document_attachments.append(resolved)
         return ""
 
     stripped = _TELEGRAM_ATTACHMENT_TAG_RE.sub(_replace, text)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-    return stripped, attachments or None
+    return stripped, image_attachments or None, document_attachments or None
 
 
-async def _extract_telegram_document_attachments_for_window(
+async def _extract_telegram_attachments_for_window(
     text: str,
     *,
     workspace_dir: str | None,
     window_id: str,
-) -> tuple[str, list[tuple[str, bytes]] | None]:
+) -> tuple[str, list[tuple[str, bytes]] | None, list[tuple[str, bytes]] | None]:
     """Strip explicit Telegram attachment tags for local or remote workspaces."""
     if not text:
-        return text, None
+        return text, None, None
     machine_id = session_manager.get_window_machine_id(window_id)
     local_machine_id, _local_machine_name = _local_machine_identity()
     if not machine_id or machine_id == local_machine_id:
-        return _extract_telegram_document_attachments(
+        return _extract_telegram_attachments(
             text,
             workspace_dir=workspace_dir,
         )
@@ -3802,7 +3893,7 @@ async def _extract_telegram_document_attachments_for_window(
     from .agent_rpc import agent_rpc_client
 
     try:
-        attachments = await agent_rpc_client.read_documents(
+        attachments = await agent_rpc_client.read_attachments(
             machine_id,
             workspace_dir=workspace_dir,
             paths=raw_paths,
@@ -3814,8 +3905,18 @@ async def _extract_telegram_document_attachments_for_window(
             workspace_dir,
             exc,
         )
-        attachments = []
-    return stripped, attachments or None
+        attachments = {"images": [], "documents": []}
+    image_attachments = attachments.get("images")
+    document_attachments = attachments.get("documents")
+    return (
+        stripped,
+        image_attachments if isinstance(image_attachments, list) and image_attachments else None,
+        (
+            document_attachments
+            if isinstance(document_attachments, list) and document_attachments
+            else None
+        ),
+    )
 
 
 def _message_has_telegram_attachments(msg: NewMessage) -> bool:
@@ -5777,8 +5878,14 @@ async def _bind_selected_folder_to_topic(
     """Create a folder binding, optionally by resuming an existing Codex thread."""
     selected_model = ""
     selected_effort = ""
+    selected_service_tier = ""
     if pending_thread_id is not None:
         selected_model, selected_effort = session_manager.get_topic_model_selection(
+            user_id,
+            pending_thread_id,
+            chat_id=chat_id,
+        )
+        selected_service_tier = session_manager.get_topic_service_tier_selection(
             user_id,
             pending_thread_id,
             chat_id=chat_id,
@@ -5821,6 +5928,7 @@ async def _bind_selected_folder_to_topic(
                     approval_mode=state.approval_mode.strip(),
                     model_slug=selected_model,
                     reasoning_effort=selected_effort,
+                    service_tier=selected_service_tier,
                 )
                 codex_thread_id = str(result.get("thread_id", "")).strip()
                 if not codex_thread_id:
@@ -5846,6 +5954,8 @@ async def _bind_selected_folder_to_topic(
                     ensure_kwargs["model"] = selected_model
                 if selected_effort:
                     ensure_kwargs["effort"] = selected_effort
+                if selected_service_tier:
+                    ensure_kwargs["service_tier"] = selected_service_tier
                 codex_thread_id, _approval = await session_manager._ensure_codex_thread_for_window(
                     window_id=created_wid,
                     cwd=selected_path,
@@ -6219,6 +6329,23 @@ def _pick_model_greeting() -> str:
     return random.choice(MODEL_GREETING_MESSAGES)
 
 
+def _load_codex_default_service_tier() -> str:
+    """Load the default service tier from local Codex config."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if config_path.is_file():
+        try:
+            with config_path.open("rb") as f:
+                cfg = tomllib.load(f)
+            raw_service_tier = cfg.get("service_tier", "")
+            if isinstance(raw_service_tier, str):
+                normalized = raw_service_tier.strip().lower()
+                if normalized in {"fast", "flex"}:
+                    return normalized
+        except Exception as e:
+            logger.debug("Failed reading Codex config %s: %s", config_path, e)
+    return "flex"
+
+
 def _load_codex_model_catalog() -> dict[str, object]:
     """Load current model config + model catalog from local Codex files."""
     config_path = Path.home() / ".codex" / "config.toml"
@@ -6577,6 +6704,16 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await command_handlers.model_command(update, context)
 
 
+async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from .handlers import commands as command_handlers
+    await command_handlers.fast_command(update, context)
+
+
+async def transcription_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from .handlers import commands as command_handlers
+    await command_handlers.transcription_command(update, context)
+
+
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from .handlers import commands as command_handlers
     await command_handlers.update_command(update, context)
@@ -6706,7 +6843,7 @@ async def unsupported_content_handler(
     update: Update,
     _context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Reply to non-text messages (images, stickers, voice, etc.)."""
+    """Reply to unsupported non-text messages."""
     if not update.message:
         return
     if not _is_chat_allowed(update.effective_chat):
@@ -6718,13 +6855,17 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text messages are supported. Images, stickers, voice, and other media cannot be forwarded to the assistant.",
+        "⚠ This media type is not supported yet. Send text, photos, voice notes, or audio files.",
     )
 
 
 # --- Image directory for incoming photos ---
 _IMAGES_DIR = coco_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Audio directory for incoming voice/audio media ---
+_AUDIO_DIR = coco_dir() / "audio"
+_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-topic lock for Codex image resume submissions: (user_id, thread_id) -> lock
 _photo_resume_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -6736,6 +6877,37 @@ def _pick_image_prompt(caption: str | None) -> str:
     if text:
         return text
     return "Please analyze this image."
+
+
+def _pick_audio_suffix(media: object) -> str:
+    """Infer a useful local file extension for Telegram audio media."""
+    file_name = str(getattr(media, "file_name", "") or "").strip()
+    if file_name:
+        suffix = Path(file_name).suffix.strip().lower()
+        if suffix:
+            return suffix
+
+    mime_type = str(getattr(media, "mime_type", "") or "").strip().lower()
+    mime_map = {
+        "audio/flac": ".flac",
+        "audio/mp3": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/mpeg": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/opus": ".opus",
+        "audio/wav": ".wav",
+        "audio/webm": ".webm",
+    }
+    return mime_map.get(mime_type, ".ogg")
+
+
+def _build_audio_prompt(*, transcript: str, caption: str | None) -> str:
+    """Combine optional Telegram caption text with the transcript."""
+    caption_text = (caption or "").strip()
+    transcript_text = transcript.strip()
+    if caption_text:
+        return f"{caption_text}\n\n{transcript_text}"
+    return transcript_text
 
 
 def _resolve_codex_exec_binary() -> str | None:
@@ -7073,6 +7245,274 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         expect_response=True,
     )
     await _set_eyes_reaction(update.message)
+
+
+async def _forward_topic_text_message(
+    *,
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    text: str,
+) -> None:
+    """Forward one text prompt through the normal topic/session path."""
+    if thread_id is None:
+        await safe_reply(
+            message,
+            "❌ Please use a named topic. Create a new topic to start a session.",
+        )
+        return
+
+    wid = session_manager.get_window_for_thread(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    if wid is None:
+        if not _can_user_create_sessions(user_id):
+            await safe_reply(
+                message,
+                "❌ You only have single-session access in this bot.\n"
+                "Ask an admin to add you to an existing session/topic.",
+            )
+            return
+
+        logger.info(
+            "Unbound topic: directory browser (user=%d, thread=%d)",
+            user_id,
+            thread_id,
+        )
+        machine_choices = _sorted_machine_choices()
+        if len(machine_choices) > 1:
+            msg_text, keyboard = await _open_machine_picker(
+                context_user_data=context.user_data,
+                thread_id=thread_id,
+                chat_id=chat_id,
+            )
+            if context.user_data is not None:
+                context.user_data["_pending_thread_text"] = text
+        else:
+            local_machine_id, local_machine_name = _local_machine_identity()
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+                context.user_data[BROWSE_MACHINE_KEY] = local_machine_id
+                context.user_data[BROWSE_MACHINE_NAME_KEY] = local_machine_name
+                context.user_data["_pending_thread_id"] = thread_id
+                context.user_data["_pending_thread_text"] = text
+            msg_text, keyboard, subdirs = await _build_directory_browser_for_context(
+                context.user_data,
+                chat_id=chat_id,
+            )
+            if context.user_data is not None:
+                context.user_data[BROWSE_PAGE_KEY] = 0
+                context.user_data[BROWSE_DIRS_KEY] = subdirs
+        await safe_reply(message, msg_text, reply_markup=keyboard)
+        return
+
+    binding = session_manager.resolve_topic_binding(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    if binding is None or (not binding.codex_thread_id and not binding.cwd):
+        display = session_manager.get_display_name(wid)
+        logger.info(
+            "Incomplete binding for %s (user=%d, thread=%d); unbinding",
+            display,
+            user_id,
+            thread_id,
+        )
+        session_manager.unbind_thread(user_id, thread_id, chat_id=chat_id)
+        clear_queued_topic_inputs(user_id, thread_id)
+        await clear_queued_topic_dock(context.bot, user_id, thread_id)
+        await safe_reply(
+            message,
+            "❌ Session binding is incomplete. Send a message to start a new session.",
+        )
+        return
+
+    if session_manager.get_window_mention_only(wid):
+        bot_username = _resolve_bot_username(context)
+        if not _text_mentions_bot_username(text, bot_username):
+            logger.debug(
+                "Mention-only mode: skipped non-mention message (user=%d, thread=%d, window=%s)",
+                user_id,
+                thread_id,
+                wid,
+            )
+            return
+
+    if session_manager.is_window_external_turn_active(wid):
+        source_chat_id = getattr(message, "chat_id", None)
+        chat = getattr(message, "chat", None)
+        if source_chat_id is None and chat is not None:
+            source_chat_id = getattr(chat, "id", None)
+        enqueue_queued_topic_input(
+            user_id,
+            thread_id,
+            text,
+            source_chat_id,
+            message.message_id,
+        )
+        await _set_hourglass_reaction(message)
+        await sync_queued_topic_dock(
+            context.bot,
+            user_id,
+            thread_id,
+            window_id=wid,
+        )
+        return
+
+    is_steer_message = await _is_window_in_progress(user_id, thread_id, wid)
+
+    await message.chat.send_action(ChatAction.TYPING)
+    if is_steer_message:
+        logger.info(
+            "Steer message accepted (user=%d, thread=%d, window=%s)",
+            user_id,
+            thread_id,
+            wid,
+        )
+    else:
+        await enqueue_status_update(context.bot, user_id, wid, None, thread_id=thread_id)
+        await enqueue_progress_clear(context.bot, user_id, thread_id=thread_id)
+
+    success, send_msg = await session_manager.send_topic_text_to_window(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        window_id=wid,
+        text=text,
+    )
+    if not success:
+        await safe_reply(message, f"❌ {send_msg}")
+        return
+    if is_steer_message:
+        note_run_activity(
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=wid,
+            source="steer_input",
+        )
+    else:
+        await enqueue_progress_start(
+            context.bot,
+            user_id,
+            window_id=wid,
+            thread_id=thread_id,
+        )
+        note_run_started(
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=wid,
+            source="user_input",
+            pending_text=text,
+            expect_response=True,
+        )
+    await _set_eyes_reaction(message)
+
+
+async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram voice/audio messages with local transcription."""
+    chat = update.effective_chat
+    if not _is_chat_allowed(chat):
+        if update.message:
+            await safe_reply(update.message, "❌ This group is not allowed to use this bot.")
+        return
+
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    media = getattr(message, "voice", None) or getattr(message, "audio", None)
+    if media is None:
+        return
+
+    thread_id = _get_thread_id(update)
+    chat_id = _group_chat_id(chat)
+    if chat_id is not None and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+    selected_profile = get_default_transcription_profile()
+
+    tg_file = await media.get_file()
+    file_path = _AUDIO_DIR / f"{int(time.time())}_{media.file_unique_id}{_pick_audio_suffix(media)}"
+    await tg_file.download_to_drive(file_path)
+
+    await message.chat.send_action(ChatAction.TYPING)
+    bootstrap_handle = begin_transcription_bootstrap(profile=selected_profile)
+    if bootstrap_handle is not None:
+        await safe_reply(
+            message,
+            "⏳ Downloading the local transcription model for first use. This can take a minute.",
+        )
+
+    try:
+        transcript = await asyncio.to_thread(
+            transcribe_audio_file,
+            file_path,
+            profile=selected_profile,
+        )
+    except TranscriptionError as exc:
+        complete_transcription_bootstrap(bootstrap_handle, success=False)
+        logger.warning(
+            "Audio transcription failed (user=%d thread=%s): %s",
+            user.id,
+            thread_id,
+            exc,
+        )
+        await safe_reply(message, f"❌ Audio transcription failed: {exc}")
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Failed to delete temporary audio file %s", file_path)
+        return
+    except Exception as exc:
+        complete_transcription_bootstrap(bootstrap_handle, success=False)
+        logger.exception(
+            "Unexpected audio transcription error (user=%d thread=%s): %s",
+            user.id,
+            thread_id,
+            exc,
+        )
+        await safe_reply(message, f"❌ Audio transcription failed: {exc}")
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Failed to delete temporary audio file %s", file_path)
+        return
+
+    try:
+        file_path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Failed to delete temporary audio file %s", file_path)
+
+    await safe_reply(message, transcript)
+
+    if complete_transcription_bootstrap(bootstrap_handle, success=True):
+        await safe_reply(
+            message,
+            "✅ Local transcription is ready. The model finished downloading and the first transcription is complete.",
+        )
+
+    prompt = _build_audio_prompt(
+        transcript=transcript,
+        caption=getattr(message, "caption", None),
+    )
+    await _forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        text=prompt,
+    )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -7485,161 +7925,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
 
-    # Must be in a named topic
-    if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(
-        user_id,
-        thread_id,
-        chat_id=chat_id,
-    )
-    if wid is None:
-        if not _can_user_create_sessions(user_id):
-            await safe_reply(
-                message,
-                "❌ You only have single-session access in this bot.\n"
-                "Ask an admin to add you to an existing session/topic.",
-            )
-            return
-
-        logger.info(
-            "Unbound topic: directory browser (user=%d, thread=%d)",
-            user_id,
-            thread_id,
-        )
-        machine_choices = _sorted_machine_choices()
-        if len(machine_choices) > 1:
-            msg_text, keyboard = await _open_machine_picker(
-                context_user_data=context.user_data,
-                thread_id=thread_id,
-                chat_id=chat_id,
-            )
-            if context.user_data is not None:
-                context.user_data["_pending_thread_text"] = text
-        else:
-            local_machine_id, local_machine_name = _local_machine_identity()
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-                context.user_data[BROWSE_MACHINE_KEY] = local_machine_id
-                context.user_data[BROWSE_MACHINE_NAME_KEY] = local_machine_name
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-            msg_text, keyboard, subdirs = await _build_directory_browser_for_context(
-                context.user_data,
-                chat_id=chat_id,
-            )
-            if context.user_data is not None:
-                context.user_data[BROWSE_PAGE_KEY] = 0
-                context.user_data[BROWSE_DIRS_KEY] = subdirs
-        await safe_reply(message, msg_text, reply_markup=keyboard)
-        return
-
-    # Bound topic — forward to bound window
-    binding = session_manager.resolve_topic_binding(
-        user_id,
-        thread_id,
-        chat_id=chat_id,
-    )
-    if binding is None or (not binding.codex_thread_id and not binding.cwd):
-        display = session_manager.get_display_name(wid)
-        logger.info(
-            "Incomplete binding for %s (user=%d, thread=%d); unbinding",
-            display,
-            user_id,
-            thread_id,
-        )
-        session_manager.unbind_thread(user_id, thread_id, chat_id=chat_id)
-        clear_queued_topic_inputs(user_id, thread_id)
-        await clear_queued_topic_dock(context.bot, user_id, thread_id)
-        await safe_reply(
-            message,
-            "❌ Session binding is incomplete. Send a message to start a new session.",
-        )
-        return
-
-    if session_manager.get_window_mention_only(wid):
-        bot_username = _resolve_bot_username(context)
-        if not _text_mentions_bot_username(text, bot_username):
-            logger.debug(
-                "Mention-only mode: skipped non-mention message (user=%d, thread=%d, window=%s)",
-                user_id,
-                thread_id,
-                wid,
-            )
-            return
-
-    if session_manager.is_window_external_turn_active(wid):
-        source_chat_id = getattr(message, "chat_id", None)
-        if source_chat_id is None and chat is not None:
-            source_chat_id = getattr(chat, "id", None)
-        enqueue_queued_topic_input(
-            user_id,
-            thread_id,
-            text,
-            source_chat_id,
-            message.message_id,
-        )
-        await _set_hourglass_reaction(message)
-        await sync_queued_topic_dock(
-            context.bot,
-            user_id,
-            thread_id,
-            window_id=wid,
-        )
-        return
-
-    is_steer_message = await _is_window_in_progress(user_id, thread_id, wid)
-
-    await message.chat.send_action(ChatAction.TYPING)
-    if is_steer_message:
-        logger.info(
-            "Steer message accepted (user=%d, thread=%d, window=%s)",
-            user_id,
-            thread_id,
-            wid,
-        )
-    else:
-        await enqueue_status_update(context.bot, user_id, wid, None, thread_id=thread_id)
-        await enqueue_progress_clear(context.bot, user_id, thread_id=thread_id)
-
-    success, send_msg = await session_manager.send_topic_text_to_window(
+    await _forward_topic_text_message(
+        message=message,
+        context=context,
         user_id=user_id,
         thread_id=thread_id,
         chat_id=chat_id,
-        window_id=wid,
         text=text,
     )
-    if not success:
-        await safe_reply(update.message, f"❌ {send_msg}")
-        return
-    if is_steer_message:
-        note_run_activity(
-            user_id=user_id,
-            thread_id=thread_id,
-            window_id=wid,
-            source="steer_input",
-        )
-    else:
-        await enqueue_progress_start(
-            context.bot,
-            user_id,
-            window_id=wid,
-            thread_id=thread_id,
-        )
-        note_run_started(
-            user_id=user_id,
-            thread_id=thread_id,
-            window_id=wid,
-            source="user_input",
-            pending_text=text,
-            expect_response=True,
-        )
-    await _set_eyes_reaction(message)
 
 
 async def channel_post_text_handler(
@@ -11089,7 +11382,9 @@ async def _handle_codex_app_server_notification(
                 status=status,
                 error_message=combined_error,
             )
-        dispatch_after_completion = status in {"failed", "interrupted"}
+        # Any terminal turn completion should allow queued `/q` input to advance.
+        # Restricting this to failed/interrupted leaves successful turns parked.
+        dispatch_after_completion = True
         clear_progress_on_completion = status in {
             "failed",
             "interrupted",
@@ -11285,6 +11580,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             )
 
         delivery_text = msg.text
+        attachment_image_data: list[tuple[str, bytes]] | None = None
         document_data: list[tuple[str, bytes]] | None = None
         if msg.role == "assistant" and msg.is_complete and msg.content_type == "text":
             workspace_dir = _resolve_workspace_dir_for_window(
@@ -11293,11 +11589,25 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 chat_id=chat_id,
                 window_id=wid,
             )
-            delivery_text, document_data = await _extract_telegram_document_attachments_for_window(
+            (
+                delivery_text,
+                attachment_image_data,
+                document_data,
+            ) = await _extract_telegram_attachments_for_window(
                 msg.text,
                 workspace_dir=workspace_dir,
                 window_id=wid,
             )
+
+        combined_image_data: list[tuple[str, bytes]] | None = None
+        if msg.image_data or attachment_image_data:
+            combined_image_data = []
+            if msg.image_data:
+                combined_image_data.extend(msg.image_data)
+            if attachment_image_data:
+                combined_image_data.extend(attachment_image_data)
+            if not combined_image_data:
+                combined_image_data = None
 
         parts = (
             build_response_parts(
@@ -11366,7 +11676,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     content_type=msg.content_type,
                     text=delivery_text,
                     thread_id=thread_id,
-                    image_data=msg.image_data,
+                    image_data=combined_image_data,
                     document_data=document_data,
                 )
                 if looper_completed_state is not None:
@@ -11427,6 +11737,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("status", "Show current Codex status panel"),
         BotCommand("model", "Show Codex model options/reasoning levels"),
+        BotCommand("transcription", "Show/change server transcription mode"),
         BotCommand("update", "Check CoCo/Codex updates and trigger safe upgrade"),
     ]
     # Add assistant slash commands
@@ -11726,6 +12037,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("model", model_command))
+    application.add_handler(CommandHandler("fast", fast_command))
+    application.add_handler(CommandHandler("transcription", transcription_command))
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
@@ -11746,6 +12059,8 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to assistant
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # Voice/audio: download, transcribe locally, and forward transcript
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_handler))
     # Catch-all: non-text content (stickers, voice, etc.)
     application.add_handler(
         MessageHandler(

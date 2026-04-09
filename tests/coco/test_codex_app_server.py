@@ -158,8 +158,8 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
 
     monkeypatch.setattr(client, "request", _request)
 
-    forked = await client.thread_fork(thread_id="th_main", turn_id="turn_1")
-    resumed = await client.thread_resume(thread_id="th_resumed")
+    forked = await client.thread_fork(thread_id="th_main", turn_id="turn_1", service_tier="fast")
+    resumed = await client.thread_resume(thread_id="th_resumed", service_tier="flex")
     listed = await client.thread_list(limit=10)
     read = await client.thread_read(thread_id="th_main")
     rolled = await client.thread_rollback(thread_id="th_main", num_turns=2)
@@ -171,12 +171,12 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
     assert rolled["threadId"] == "th_main"
     assert calls[0] == (
         "thread/fork",
-        {"threadId": "th_main", "turnId": "turn_1"},
+        {"threadId": "th_main", "turnId": "turn_1", "serviceTier": "fast"},
         120.0,
     )
     assert calls[1] == (
         "thread/resume",
-        {"threadId": "th_resumed"},
+        {"threadId": "th_resumed", "serviceTier": "flex"},
         120.0,
     )
     assert calls[2] == (

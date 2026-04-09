@@ -62,3 +62,32 @@ async def test_safe_edit_logs_outgoing_edit(monkeypatch):
     assert captured[0]["thread_id"] == 11
     assert captured[0]["message_id"] == 808
     assert captured[0]["text"] == "updated output"
+
+
+@pytest.mark.asyncio
+async def test_send_photo_falls_back_to_document_for_webp(monkeypatch):
+    photo_attempts: list[dict[str, object]] = []
+    document_sends: list[dict[str, object]] = []
+
+    class _Bot:
+        async def send_photo(self, **kwargs):
+            photo_attempts.append(kwargs)
+            raise RuntimeError("unsupported photo format")
+
+        async def send_document(self, **kwargs):
+            document_sends.append(kwargs)
+            return SimpleNamespace(message_id=444)
+
+    await message_sender.send_photo(
+        _Bot(),
+        chat_id=-1009,
+        image_data=[("image/webp", b"WEBPDATA")],
+        message_thread_id=77,
+    )
+
+    assert len(photo_attempts) == 1
+    assert len(document_sends) == 1
+    assert document_sends[0]["chat_id"] == -1009
+    assert document_sends[0]["message_thread_id"] == 77
+    assert document_sends[0]["filename"] == "image-1.webp"
+    assert document_sends[0]["document"].getvalue() == b"WEBPDATA"
