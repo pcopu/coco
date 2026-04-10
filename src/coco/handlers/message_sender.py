@@ -53,6 +53,13 @@ _IMAGE_EXTENSION_BY_MEDIA_TYPE = {
     "image/bmp": ".bmp",
     "image/tiff": ".tiff",
 }
+_VIDEO_EXTENSION_BY_MEDIA_TYPE = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-msvideo": ".avi",
+    "video/mpeg": ".mpeg",
+}
 
 
 def _thread_id_from_kwargs(kwargs: dict[str, Any]) -> int | None:
@@ -178,6 +185,39 @@ async def send_photo(
             raise
         except Exception as doc_exc:
             logger.error("Failed to send image fallback document to %d: %s", chat_id, doc_exc)
+
+
+async def send_video(
+    bot: Bot,
+    chat_id: int,
+    media_type: str,
+    raw_bytes: bytes,
+    **kwargs: Any,
+) -> None:
+    """Send one video to chat with document fallback."""
+    try:
+        await bot.send_video(
+            chat_id=chat_id,
+            video=io.BytesIO(raw_bytes),
+            **kwargs,
+        )
+    except RetryAfter:
+        raise
+    except Exception as exc:
+        logger.warning("Video send failed for %d; falling back to document: %s", chat_id, exc)
+        extension = _VIDEO_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
+        try:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=io.BytesIO(raw_bytes),
+                filename=f"video{extension}",
+                **kwargs,
+            )
+        except RetryAfter:
+            raise
+        except Exception as doc_exc:
+            logger.error("Failed to send video fallback document to %d: %s", chat_id, doc_exc)
+            raise doc_exc
 
 
 async def send_documents(

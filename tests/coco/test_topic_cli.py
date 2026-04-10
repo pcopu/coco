@@ -391,6 +391,101 @@ def test_topic_cli_send_text_with_image_url_dispatches_to_bound_topic(monkeypatc
             "text": "hello from cron",
             "image_url": "https://example.com/image.jpg",
             "image_file": "",
+            "video_url": "",
+            "video_file": "",
         }
     ]
     assert "Sent message to topic." in out
+
+
+def test_topic_cli_send_text_with_video_url_dispatches_to_bound_topic(monkeypatch, capsys):
+    calls: list[dict[str, object]] = []
+    binding = TopicBinding(chat_id=-100123, thread_id=77, window_id="@77")
+
+    monkeypatch.setattr(
+        topic_cli.app_cli,
+        "_resolve_topic_target",
+        lambda **_kwargs: topic_cli.app_cli.TopicTarget(
+            user_id=1147817421,
+            chat_id=-100123,
+            thread_id=77,
+            binding=binding,
+        ),
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "_send_message_to_current_topic",
+        lambda **kwargs: calls.append(kwargs) or (True, ""),
+    )
+
+    code = topic_cli.main(
+        [
+            "send",
+            "--text",
+            "hello from cron",
+            "--video-url",
+            "https://example.com/clip.mp4",
+            "--user-id",
+            "1147817421",
+            "--chat-id",
+            "-100123",
+            "--thread-id",
+            "77",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert calls == [
+        {
+            "target": topic_cli.app_cli.TopicTarget(
+                user_id=1147817421,
+                chat_id=-100123,
+                thread_id=77,
+                binding=binding,
+            ),
+            "text": "hello from cron",
+            "image_url": "",
+            "image_file": "",
+            "video_url": "https://example.com/clip.mp4",
+            "video_file": "",
+        }
+    ]
+    assert "Sent message to topic." in out
+
+
+def test_topic_cli_send_rejects_mixed_image_and_video(monkeypatch, capsys):
+    binding = TopicBinding(chat_id=-100123, thread_id=77, window_id="@77")
+
+    monkeypatch.setattr(
+        topic_cli.app_cli,
+        "_resolve_topic_target",
+        lambda **_kwargs: topic_cli.app_cli.TopicTarget(
+            user_id=1147817421,
+            chat_id=-100123,
+            thread_id=77,
+            binding=binding,
+        ),
+    )
+
+    code = topic_cli.main(
+        [
+            "send",
+            "--text",
+            "hello from cron",
+            "--image-url",
+            "https://example.com/image.jpg",
+            "--video-url",
+            "https://example.com/clip.mp4",
+            "--user-id",
+            "1147817421",
+            "--chat-id",
+            "-100123",
+            "--thread-id",
+            "77",
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "Provide at most one media source" in err

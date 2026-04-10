@@ -31,11 +31,13 @@ def _extract_json_flag(argv: list[str]) -> tuple[list[str], bool]:
     return remaining, json_mode
 
 
-def _parse_send_args(args: list[str]) -> tuple[str, str, str]:
+def _parse_send_args(args: list[str]) -> tuple[str, str, str, str, str]:
     text_value = ""
     text_file = ""
     image_url = ""
     image_file = ""
+    video_url = ""
+    video_file = ""
     idx = 0
     while idx < len(args):
         token = args[idx]
@@ -67,23 +69,42 @@ def _parse_send_args(args: list[str]) -> tuple[str, str, str]:
             image_file = args[idx]
         elif token.startswith("--image-file="):
             image_file = token.partition("=")[2]
+        elif token == "--video-url":
+            idx += 1
+            if idx >= len(args):
+                raise RuntimeError("Missing value for --video-url")
+            video_url = args[idx]
+        elif token.startswith("--video-url="):
+            video_url = token.partition("=")[2]
+        elif token == "--video-file":
+            idx += 1
+            if idx >= len(args):
+                raise RuntimeError("Missing value for --video-file")
+            video_file = args[idx]
+        elif token.startswith("--video-file="):
+            video_file = token.partition("=")[2]
         else:
             raise RuntimeError(
-                "Usage: `coco topic send --text \"...\" [--image-url URL|--image-file PATH]` "
-                "or `--text-file /path/file.md [--image-url URL|--image-file PATH]`"
+                "Usage: `coco topic send --text \"...\" [--image-url URL|--image-file PATH|--video-url URL|--video-file PATH]` "
+                "or `--text-file /path/file.md [--image-url URL|--image-file PATH|--video-url URL|--video-file PATH]`"
             )
         idx += 1
 
     if bool(text_value) == bool(text_file):
         raise RuntimeError("Provide exactly one of --text or --text-file.")
-    if image_url and image_file:
-        raise RuntimeError("Provide at most one of --image-url or --image-file.")
+    media_source_count = sum(
+        1 for value in (image_url, image_file, video_url, video_file) if value
+    )
+    if media_source_count > 1:
+        raise RuntimeError(
+            "Provide at most one media source: --image-url, --image-file, --video-url, or --video-file."
+        )
     if text_file:
         try:
             text_value = Path(text_file).read_text(encoding="utf-8")
         except OSError as exc:
             raise RuntimeError(f"Failed reading text file: {exc}") from exc
-    return text_value, image_url, image_file
+    return text_value, image_url, image_file, video_url, video_file
 
 
 def _command_examples() -> dict[str, str]:
@@ -337,8 +358,10 @@ async def _send_message_to_current_topic_async(
     text: str,
     image_url: str = "",
     image_file: str = "",
+    video_url: str = "",
+    video_file: str = "",
 ) -> tuple[bool, str]:
-    if not image_url and not image_file:
+    if not image_url and not image_file and not video_url and not video_file:
         return await _send_text_to_current_topic_async(
             target=target,
             text=text,
@@ -352,6 +375,8 @@ async def _send_message_to_current_topic_async(
             text=text,
             image_url=image_url,
             image_file=image_file,
+            video_url=video_url,
+            video_file=video_file,
         )
 
 
@@ -374,8 +399,10 @@ def _send_message_to_current_topic(
     text: str,
     image_url: str = "",
     image_file: str = "",
+    video_url: str = "",
+    video_file: str = "",
 ) -> tuple[bool, str]:
-    if not image_url and not image_file:
+    if not image_url and not image_file and not video_url and not video_file:
         return _send_text_to_current_topic(
             target=target,
             text=text,
@@ -386,6 +413,8 @@ def _send_message_to_current_topic(
             text=text,
             image_url=image_url,
             image_file=image_file,
+            video_url=video_url,
+            video_file=video_file,
         )
     )
 
@@ -404,12 +433,14 @@ def main(argv: list[str] | None = None) -> int:
             subcommand = args[0].strip().lower()
             if subcommand != "send":
                 raise RuntimeError("Usage: `coco topic [--json]` or `coco topic send --text ...`")
-            text, image_url, image_file = _parse_send_args(args[1:])
+            text, image_url, image_file, video_url, video_file = _parse_send_args(args[1:])
             ok, error_text = _send_message_to_current_topic(
                 target=target,
                 text=text,
                 image_url=image_url,
                 image_file=image_file,
+                video_url=video_url,
+                video_file=video_file,
             )
             if not ok:
                 print(f"Error: {error_text}", file=sys.stderr)
