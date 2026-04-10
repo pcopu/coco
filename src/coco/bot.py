@@ -6616,7 +6616,7 @@ def _build_model_info_text(catalog: dict[str, object] | None = None) -> str:
         f"Topic model: `{current_model}`",
         f"Topic reasoning: `{current_effort}`",
         "",
-        "Stored per topic. Fresh threads use this. Resumed threads inherit their own model.",
+        "Stored per topic. Future turns in this topic use this without resetting the bound session.",
     ]
 
     if isinstance(cache_error, str) and cache_error:
@@ -8911,11 +8911,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
         session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
-        previous_model, previous_effort = session_manager.get_topic_model_selection(
-            user.id,
-            cb_thread_id,
-            chat_id=cb_chat_id,
-        )
         selected_slug = data[len(CB_MODEL_SET) :]
         catalog = _resolve_topic_model_catalog(
             user_id=user.id,
@@ -8941,18 +8936,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             model_slug=selected_slug,
             reasoning_effort=adjusted_effort or current_effort,
         )
-        changed_model, changed_effort = (
-            previous_model != selected_slug,
-            (adjusted_effort or current_effort) != previous_effort,
-        )
-        if changed_model or changed_effort:
-            model_window_id = session_manager.resolve_window_for_thread(
-                user.id,
-                cb_thread_id,
-                chat_id=cb_chat_id,
-            )
-            if model_window_id:
-                session_manager.set_window_codex_thread_id(model_window_id, "")
         updated_catalog = _resolve_topic_model_catalog(
             user_id=user.id,
             thread_id=cb_thread_id,
@@ -8974,11 +8957,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
         session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
-        previous_model, previous_effort = session_manager.get_topic_model_selection(
-            user.id,
-            cb_thread_id,
-            chat_id=cb_chat_id,
-        )
         selected_effort = data[len(CB_MODEL_EFFORT_SET) :]
         catalog = _resolve_topic_model_catalog(
             user_id=user.id,
@@ -9007,14 +8985,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             model_slug=current_slug,
             reasoning_effort=selected_effort,
         )
-        if selected_effort != previous_effort:
-            effort_window_id = session_manager.resolve_window_for_thread(
-                user.id,
-                cb_thread_id,
-                chat_id=cb_chat_id,
-            )
-            if effort_window_id:
-                session_manager.set_window_codex_thread_id(effort_window_id, "")
         updated_catalog = _resolve_topic_model_catalog(
             user_id=user.id,
             thread_id=cb_thread_id,
