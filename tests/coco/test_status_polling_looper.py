@@ -111,3 +111,108 @@ async def test_emit_due_looper_prompt_notifies_when_time_limit_expires(monkeypat
 
     assert sent
     assert "time limit reached" in sent[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_emit_due_looper_prompt_runner_noop_sends_nothing(monkeypatch):
+    due = DueLooperPrompt(
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+        prompt_text="",
+        plan_path="",
+        keyword="done",
+        instructions="",
+        interval_seconds=1800,
+        prompt_count=2,
+        deadline_at=0.0,
+        runner_command="python tools/nudge.py",
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(status_polling, "stop_looper_if_expired", lambda **_kwargs: None)
+    monkeypatch.setattr(status_polling, "claim_due_looper_prompt", lambda **_kwargs: due)
+    monkeypatch.setattr(
+        status_polling,
+        "_run_looper_runner",
+        lambda **_kwargs: (0, ""),
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "send_topic_text_to_window",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("session send should not run")),
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "_send_text_to_topic",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("topic send should not run")),
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "note_run_started",
+        lambda **_kwargs: events.append("run_started"),
+    )
+    monkeypatch.setattr(status_polling, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    await status_polling._emit_due_looper_prompt(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+    )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_emit_due_looper_prompt_runner_sends_stdout_to_topic(monkeypatch):
+    due = DueLooperPrompt(
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+        prompt_text="",
+        plan_path="",
+        keyword="done",
+        instructions="",
+        interval_seconds=1800,
+        prompt_count=2,
+        deadline_at=0.0,
+        runner_command="python tools/nudge.py",
+    )
+    sent: list[str] = []
+
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(status_polling, "stop_looper_if_expired", lambda **_kwargs: None)
+    monkeypatch.setattr(status_polling, "claim_due_looper_prompt", lambda **_kwargs: due)
+    monkeypatch.setattr(
+        status_polling,
+        "_run_looper_runner",
+        lambda **_kwargs: (0, "candidate text"),
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "_send_text_to_topic",
+        lambda **kwargs: sent.append(kwargs["text"]) or (True, ""),
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "send_topic_text_to_window",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("session send should not run")),
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "note_run_started",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("run watchdog should not start")),
+    )
+    monkeypatch.setattr(status_polling, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    await status_polling._emit_due_looper_prompt(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+        chat_id=-100123,
+    )
+
+    assert sent == ["candidate text"]

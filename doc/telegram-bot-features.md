@@ -120,9 +120,10 @@
 | **callback_query.answer()** | ✅ | Instant feedback on all callback button clicks |
 | **editMessageText** | ✅ | Status-to-content conversion, tool_result editing into tool_use messages |
 | **editMessageMedia** | ❌ | Not currently used |
+| **sendPhoto** | ✅ | Used for outbound image delivery, including direct `coco topic send` photo+caption sends |
 | **deleteMessage** | ✅ | Status message cleanup, interactive UI cleanup |
 | **BotCommand + set_my_commands** | ✅ | Core command menu is registered dynamically at startup |
-| **sendDocument** | ❌ | Not currently used |
+| **sendDocument** | ✅ | Used for explicit document attachments and as a fallback when Telegram rejects an image as a photo |
 | **ReplyKeyboardRemove** | ✅ | Used when switching away from reply keyboard |
 | **Assistant command forwarding** | ✅ | /clear, /compact, /cost, /help, and other slash commands are forwarded to Codex |
 | **Message rate limiting** | ✅ | 1.1s minimum interval per user to avoid flood control |

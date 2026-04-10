@@ -245,6 +245,7 @@ By default under `~/.coco`, with Codex session state continuing to live in
 - [Topic architecture](doc/topic-architecture.md)
 - [Message handling](doc/message-handling.md)
 - [Multi-machine setup](doc/multi-machine-setup.md)
+- [Telegram bot feature matrix](doc/telegram-bot-features.md)
 
 ## Primary Commands
 
@@ -262,6 +263,48 @@ By default under `~/.coco`, with Codex session state continuing to live in
 
 Assistant commands like `/clear`, `/compact`, `/cost`, and `/help` are forwarded to Codex.
 
+## Shell and Agent CLI
+
+The Telegram slash surface is mirrored by a local CLI so agents and cron jobs
+can inspect or act on the currently bound topic without clicking through
+Telegram UI.
+
+Inspect the current topic:
+
+```bash
+coco topic
+coco topic --json
+```
+
+Send directly to the bound topic from shell:
+
+```bash
+coco topic send --text "hello"
+coco topic send --text-file /tmp/msg.md
+coco topic send --text-file /tmp/msg.md --image-url https://example.com/image.jpg
+coco topic send --text-file /tmp/msg.md --image-file /tmp/image.jpg
+```
+
+Notes:
+
+- `coco topic send` requires exactly one of `--text` or `--text-file`.
+- It accepts at most one image source via `--image-url` or `--image-file`.
+- Text-only sends use the normal Telegram text path. Image sends are delivered as
+  one photo with the text as the caption.
+
+Drive recurring shell workflows through looper when needed:
+
+```bash
+coco looper start plans/ship.md done --every 15m
+coco looper start --runner "python tools/nudge.py" --every-random 25m 75m --on-reply
+```
+
+Runner mode contract:
+
+- exit `0` with empty stdout: no message is sent
+- exit `0` with text on stdout: that text is sent to the topic
+- exit nonzero: the failure is logged and the looper stays alive
+
 ## Multi-Machine Notes
 
 The controller is the only Telegram-facing process.
@@ -272,7 +315,7 @@ That gives you:
 - one bot identity
 - multiple machines in the folder picker
 - offline/recovery notices for bound topics
-- remote document delivery (`.pdf`, `.txt`, `.md`)
+- remote attachment delivery (`.pdf`, `.txt`, `.md`, and common image types)
 - a cleaner security model than pretending Telegram is an RPC bus
 
 ## Storage

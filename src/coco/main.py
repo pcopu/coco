@@ -8,9 +8,54 @@ import sys
 def main() -> None:
     """Main entry point."""
     argv = list(sys.argv[1:])
+    direct_command_names = {
+        "start",
+        "folder",
+        "resume",
+        "history",
+        "esc",
+        "q",
+        "approvals",
+        "mentions",
+        "allowed",
+        "skills",
+        "worktree",
+        "restart",
+        "unbind",
+        "status",
+        "model",
+        "fast",
+        "transcription",
+        "update",
+        "looper",
+    }
     if argv and argv[0] in {"init", "setup"}:
         bootstrap = import_module("coco.bootstrap")
         code = bootstrap.main(argv[1:])
+        if code:
+            sys.exit(code)
+        return
+    if argv and argv[0] == "apps":
+        app_cli = import_module("coco.app_cli")
+        code = app_cli.main(argv[1:])
+        if code:
+            sys.exit(code)
+        return
+    if argv and argv[0].lstrip("/").lower() == "topic":
+        topic_cli = import_module("coco.topic_cli")
+        code = topic_cli.main(argv[1:])
+        if code:
+            sys.exit(code)
+        return
+    if argv and argv[0] in {"cmd", "command"}:
+        command_cli = import_module("coco.command_cli")
+        code = command_cli.main(argv[1:])
+        if code:
+            sys.exit(code)
+        return
+    if argv and argv[0].lstrip("/").lower() in direct_command_names:
+        command_cli = import_module("coco.command_cli")
+        code = command_cli.main(argv)
         if code:
             sys.exit(code)
         return

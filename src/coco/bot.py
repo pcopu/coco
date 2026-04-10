@@ -61,10 +61,14 @@ from .handlers.callback_data import (
     CB_ALLOWED_REFRESH,
     CB_ALLOWED_REMOVE,
     CB_ALLOWED_REMOVE_MENU,
+    CB_APPS_AUTORESEARCH_RUN,
+    CB_APPS_AUTORESEARCH_SCHEDULE,
+    CB_APPS_AUTORESEARCH_STOP,
     CB_APPS_AUTORESEARCH_OUTCOME,
     CB_APPS_BACK,
     CB_APPS_CONFIGURE,
     CB_APPS_LOOPER_INSTRUCTIONS,
+    CB_APPS_LOOPER_DISABLE,
     CB_APPS_LOOPER_INTERVAL,
     CB_APPS_LOOPER_KEYWORD,
     CB_APPS_LOOPER_LIMIT,
@@ -129,6 +133,7 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.autoresearch import (
     get_autoresearch_state,
+    run_autoresearch_now,
     set_autoresearch_outcome,
 )
 from .handlers.looper import (
@@ -177,7 +182,7 @@ from .handlers.run_watchdog import (
     note_run_completed,
     note_run_started,
 )
-from .handlers.status_polling import status_poll_loop
+from .handlers.status_polling import emit_looper_tick, status_poll_loop
 from .session import (
     TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL,
     TOPIC_SYNC_MODE_TELEGRAM_LIVE,
@@ -2665,6 +2670,62 @@ def _build_app_actions_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+def _resolve_enabled_thread_app_names(
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None = None,
+    catalog: dict | None = None,
+) -> list[str]:
+    """Return enabled app names for one topic."""
+    resolved_catalog = catalog or session_manager.discover_skill_catalog()
+    return [
+        item.name
+        for item in session_manager.resolve_thread_skills(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+            catalog=resolved_catalog,
+        )
+    ]
+
+
+def _set_topic_app_enabled(
+    *,
+    user_id: int,
+    thread_id: int,
+    app_name: str,
+    enabled: bool,
+    chat_id: int | None = None,
+    catalog: dict | None = None,
+) -> list[str]:
+    """Enable or disable one app for one topic and return updated names."""
+    enabled_names = _resolve_enabled_thread_app_names(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        catalog=catalog,
+    )
+    currently_enabled = app_name in enabled_names
+    if enabled and not currently_enabled:
+        enabled_names = [*enabled_names, app_name]
+        session_manager.set_thread_skills(
+            user_id,
+            thread_id,
+            enabled_names,
+            chat_id=chat_id,
+        )
+    elif not enabled and currently_enabled:
+        enabled_names = [name for name in enabled_names if name != app_name]
+        session_manager.set_thread_skills(
+            user_id,
+            thread_id,
+            enabled_names,
+            chat_id=chat_id,
+        )
+    return enabled_names
+
+
 def _normalize_looper_panel_config(
     raw: dict | None,
     *,
@@ -2886,6 +2947,14 @@ def _build_looper_panel_keyboard(
         [
             InlineKeyboardButton("▶ Start", callback_data=CB_APPS_LOOPER_START),
             InlineKeyboardButton("⏹ Stop", callback_data=CB_APPS_LOOPER_STOP),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🚫 Disable App",
+                callback_data=CB_APPS_LOOPER_DISABLE,
+            )
         ]
     )
     rows.append([InlineKeyboardButton("⬅ Back to Apps", callback_data=CB_APPS_BACK)])
@@ -4364,7 +4433,7 @@ def _build_app_actions_payload_for_topic(
     return True, text, keyboard, canonical
 
 
-def _build_autoresearch_panel_text(*, state) -> str:
+def _build_autoresearch_panel_text(*, state, scheduled: bool) -> str:
     """Build interactive autoresearch panel text for /apps."""
     outcome = ""
     last_delivered = ""
@@ -4380,13 +4449,18 @@ def _build_autoresearch_panel_text(*, state) -> str:
             if outcome
             else "Desired outcome: `(not set)`"
         ),
-        "Schedule: `daily research overnight, delivery after 9am server-local time`",
+        (
+            "Schedule: `daily research overnight, delivery after 9am server-local time`"
+            if scheduled
+            else "Schedule: `(off)`"
+        ),
     ]
     if last_delivered:
         lines.append(f"Last delivered for: `{last_delivered}`")
     lines.extend(
         [
             "",
+            "Run Now sends yesterday's research once without turning on the daily schedule.",
             "Set the outcome you want Coco to optimize for in this topic.",
             "Examples: `Close more inbound leads`, `Reduce flaky deploys`, `Ship cleaner PRs faster`.",
         ]
@@ -4394,9 +4468,25 @@ def _build_autoresearch_panel_text(*, state) -> str:
     return "\n".join(lines)
 
 
-def _build_autoresearch_panel_keyboard() -> InlineKeyboardMarkup:
+def _build_autoresearch_panel_keyboard(*, scheduled: bool) -> InlineKeyboardMarkup:
     """Build interactive autoresearch panel keyboard."""
     rows = [
+        [
+            InlineKeyboardButton(
+                "▶ Run Now",
+                callback_data=CB_APPS_AUTORESEARCH_RUN,
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⏹ Stop Daily" if scheduled else "⏰ Schedule Daily",
+                callback_data=(
+                    CB_APPS_AUTORESEARCH_STOP
+                    if scheduled
+                    else CB_APPS_AUTORESEARCH_SCHEDULE
+                ),
+            )
+        ],
         [
             InlineKeyboardButton(
                 "🎯 Set Outcome",
@@ -4416,11 +4506,20 @@ async def _build_autoresearch_panel_payload_for_topic(
     chat_id: int | None = None,
 ) -> tuple[bool, str, InlineKeyboardMarkup | None, str]:
     """Build autoresearch panel payload for one topic."""
-    _ = chat_id
+    scheduled = "autoresearch" in _resolve_enabled_thread_app_names(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
     state = get_autoresearch_state(user_id=user_id, thread_id=thread_id)
     if isinstance(user_data, dict):
         user_data[APPS_PENDING_THREAD_KEY] = thread_id
-    return True, _build_autoresearch_panel_text(state=state), _build_autoresearch_panel_keyboard(), ""
+    return (
+        True,
+        _build_autoresearch_panel_text(state=state, scheduled=scheduled),
+        _build_autoresearch_panel_keyboard(scheduled=scheduled),
+        "",
+    )
 
 
 async def _build_looper_panel_payload_for_topic(
@@ -7993,6 +8092,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_id=chat_id,
         text=text,
     )
+    if thread_id is not None:
+        looper_state = get_looper_state(user_id=user_id, thread_id=thread_id)
+        if (
+            looper_state is not None
+            and getattr(looper_state, "trigger_on_user_message", False)
+            and getattr(looper_state, "window_id", "").strip()
+        ):
+            await emit_looper_tick(
+                context.bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=looper_state.window_id,
+                chat_id=chat_id,
+                force=True,
+            )
 
 
 async def channel_post_text_handler(
@@ -8078,6 +8192,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     data = query.data
+    send_bot = getattr(context, "bot", None)
 
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
@@ -9628,6 +9743,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
         raw_identifier = data[len(CB_APPS_OPEN) :].strip()
+        catalog = session_manager.discover_skill_catalog()
+        canonical = resolve_skill_identifier(raw_identifier, catalog) if raw_identifier else None
+        if canonical == "autoresearch":
+            ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+                user_id=user.id,
+                thread_id=cb_thread_id,
+                user_data=context.user_data,
+                chat_id=cb_chat_id,
+            )
+            await safe_edit(query, text, reply_markup=keyboard if ok else None)
+            await query.answer("Auto research" if ok else "Unknown app.", show_alert=not ok)
+            return
         ok, text, keyboard, _canonical = _build_app_actions_payload_for_topic(
             user_id=user.id,
             thread_id=cb_thread_id,
@@ -9648,27 +9775,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not canonical:
             await query.answer("Unknown app.", show_alert=True)
             return
-        enabled_names = [
-            item.name
-            for item in session_manager.resolve_thread_skills(
-                user.id,
-                cb_thread_id,
-                chat_id=cb_chat_id,
-                catalog=catalog,
-            )
-        ]
-        if canonical in enabled_names:
-            enabled_names = [name for name in enabled_names if name != canonical]
-            action = "Disabled"
-        else:
-            enabled_names = [*enabled_names, canonical]
-            action = "Enabled"
-        session_manager.set_thread_skills(
-            user.id,
-            cb_thread_id,
-            enabled_names,
+        enabled_names = _resolve_enabled_thread_app_names(
+            user_id=user.id,
+            thread_id=cb_thread_id,
             chat_id=cb_chat_id,
+            catalog=catalog,
         )
+        next_enabled = canonical not in enabled_names
+        enabled_names = _set_topic_app_enabled(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            app_name=canonical,
+            enabled=next_enabled,
+            chat_id=cb_chat_id,
+            catalog=catalog,
+        )
+        action = "Enabled" if next_enabled else "Disabled"
         text, keyboard = _build_apps_overview_payload(
             enabled_names=enabled_names,
             catalog=catalog,
@@ -9687,23 +9809,64 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not canonical:
             await query.answer("Unknown app.", show_alert=True)
             return
-        enabled_names = [
-            item.name
-            for item in session_manager.resolve_thread_skills(
-                user.id,
-                cb_thread_id,
+        if canonical == "autoresearch":
+            state = get_autoresearch_state(user_id=user.id, thread_id=cb_thread_id)
+            outcome = str(getattr(state, "outcome", "") or "").strip()
+            if not outcome:
+                await query.answer("Set an outcome first.", show_alert=True)
+                return
+            await query.answer("Running auto research...")
+            resolved_chat_id = (
+                session_manager.resolve_chat_id(user.id, cb_thread_id)
+                if cb_chat_id is None
+                else session_manager.resolve_chat_id(
+                    user.id,
+                    cb_thread_id,
+                    chat_id=cb_chat_id,
+                )
+            )
+            digest_text = run_autoresearch_now(
+                user_id=user.id,
+                chat_id=resolved_chat_id,
+                thread_id=cb_thread_id,
+            )
+            ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+                user_id=user.id,
+                thread_id=cb_thread_id,
+                user_data=context.user_data,
+                chat_id=cb_chat_id,
+            )
+            await safe_edit(query, text, reply_markup=keyboard if ok else None)
+            if digest_text:
+                await safe_send(
+                    send_bot,
+                    resolved_chat_id,
+                    digest_text,
+                    message_thread_id=cb_thread_id,
+                )
+            else:
+                await safe_send(
+                    send_bot,
+                    resolved_chat_id,
+                    "ℹ️ No visible Coco activity from yesterday in this topic, so there was nothing to research.",
+                    message_thread_id=cb_thread_id,
+                )
+            return
+        enabled_names = _resolve_enabled_thread_app_names(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
+            catalog=catalog,
+        )
+        if canonical not in enabled_names:
+            enabled_names = _set_topic_app_enabled(
+                user_id=user.id,
+                thread_id=cb_thread_id,
+                app_name=canonical,
+                enabled=True,
                 chat_id=cb_chat_id,
                 catalog=catalog,
             )
-        ]
-        if canonical not in enabled_names:
-            session_manager.set_thread_skills(
-                user.id,
-                cb_thread_id,
-                [*enabled_names, canonical],
-                chat_id=cb_chat_id,
-            )
-            enabled_names = [*enabled_names, canonical]
             response_text = f"Enabled {canonical}"
         else:
             response_text = f"{canonical} already enabled"
@@ -9713,6 +9876,97 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         await safe_edit(query, text, reply_markup=keyboard)
         await query.answer(response_text)
+
+    elif data == CB_APPS_AUTORESEARCH_RUN:
+        if cb_thread_id is None:
+            await query.answer("Use this inside a named topic.", show_alert=True)
+            return
+        state = get_autoresearch_state(user_id=user.id, thread_id=cb_thread_id)
+        outcome = str(getattr(state, "outcome", "") or "").strip()
+        if not outcome:
+            await query.answer("Set an outcome first.", show_alert=True)
+            return
+        await query.answer("Running auto research...")
+        resolved_chat_id = (
+            session_manager.resolve_chat_id(user.id, cb_thread_id)
+            if cb_chat_id is None
+            else session_manager.resolve_chat_id(
+                user.id,
+                cb_thread_id,
+                chat_id=cb_chat_id,
+            )
+        )
+        digest_text = run_autoresearch_now(
+            user_id=user.id,
+            chat_id=resolved_chat_id,
+            thread_id=cb_thread_id,
+        )
+        ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            user_data=context.user_data,
+            chat_id=cb_chat_id,
+        )
+        await safe_edit(query, text, reply_markup=keyboard if ok else None)
+        if digest_text:
+            await safe_send(
+                send_bot,
+                resolved_chat_id,
+                digest_text,
+                message_thread_id=cb_thread_id,
+            )
+        else:
+            await safe_send(
+                send_bot,
+                resolved_chat_id,
+                "ℹ️ No visible Coco activity from yesterday in this topic, so there was nothing to research.",
+                message_thread_id=cb_thread_id,
+            )
+
+    elif data == CB_APPS_AUTORESEARCH_SCHEDULE:
+        if cb_thread_id is None:
+            await query.answer("Use this inside a named topic.", show_alert=True)
+            return
+        state = get_autoresearch_state(user_id=user.id, thread_id=cb_thread_id)
+        outcome = str(getattr(state, "outcome", "") or "").strip()
+        if not outcome:
+            await query.answer("Set an outcome first.", show_alert=True)
+            return
+        _set_topic_app_enabled(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            app_name="autoresearch",
+            enabled=True,
+            chat_id=cb_chat_id,
+        )
+        ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            user_data=context.user_data,
+            chat_id=cb_chat_id,
+        )
+        await safe_edit(query, text, reply_markup=keyboard if ok else None)
+        await query.answer("Daily auto research enabled")
+
+    elif data == CB_APPS_AUTORESEARCH_STOP:
+        if cb_thread_id is None:
+            await query.answer("Use this inside a named topic.", show_alert=True)
+            return
+        _set_topic_app_enabled(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            app_name="autoresearch",
+            enabled=False,
+            chat_id=cb_chat_id,
+        )
+        ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            user_data=context.user_data,
+            chat_id=cb_chat_id,
+        )
+        await safe_edit(query, text, reply_markup=keyboard if ok else None)
+        await query.answer("Daily auto research stopped")
 
     # Apps menu: configure one app (if supported).
     elif data.startswith(CB_APPS_CONFIGURE):
@@ -10178,6 +10432,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         await safe_edit(query, text, reply_markup=keyboard if ok else None)
         await query.answer("Looper stopped" if stopped else "Looper already stopped")
+
+    elif data == CB_APPS_LOOPER_DISABLE:
+        if cb_thread_id is None:
+            await query.answer("Use this inside a named topic.", show_alert=True)
+            return
+        stop_looper(user_id=user.id, thread_id=cb_thread_id, reason="manual_disable")
+        _set_topic_app_enabled(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            app_name="looper",
+            enabled=False,
+            chat_id=cb_chat_id,
+        )
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = ""
+        ok, text, keyboard, _wid = await _build_looper_panel_payload_for_topic(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            user_data=context.user_data,
+            chat_id=cb_chat_id,
+        )
+        await safe_edit(query, text, reply_markup=keyboard if ok else None)
+        await query.answer("Looper app disabled")
 
     # Allowed users menu: back/refresh
     elif data in {CB_ALLOWED_BACK, CB_ALLOWED_REFRESH}:

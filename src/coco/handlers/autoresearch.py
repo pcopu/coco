@@ -477,3 +477,40 @@ def claim_due_autoresearch_delivery(
     _autoresearch_state[key] = state
     _save_state()
     return state.last_digest_text
+
+
+def run_autoresearch_now(
+    *,
+    user_id: int,
+    chat_id: int,
+    thread_id: int,
+    now: datetime | None = None,
+) -> str | None:
+    """Generate and claim an immediate autoresearch digest for yesterday."""
+    _load_state()
+    key = _topic_key(user_id, thread_id)
+    state = _autoresearch_state.get(key) or AutoResearchState()
+    if not state.outcome:
+        return None
+
+    ts = _personality._normalize_now(now)
+    local_now = ts.astimezone(_personality._local_timezone(ts))
+    target_date = (local_now.date() - timedelta(days=1)).isoformat()
+    digest = generate_autoresearch_digest(
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        target_date=target_date,
+        outcome=state.outcome,
+    )
+    if digest is None:
+        return None
+
+    state.last_researched_for_date = target_date
+    state.last_delivered_for_date = target_date
+    state.last_digest_text = digest.message_text
+    state.last_digest_generated_at = ts.timestamp()
+    state.last_session_count = digest.session_count
+    _autoresearch_state[key] = state
+    _save_state()
+    return digest.message_text

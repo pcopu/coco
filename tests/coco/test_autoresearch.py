@@ -121,3 +121,63 @@ def test_claim_due_delivery_requires_outcome(tmp_path, monkeypatch):
         )
         is None
     )
+
+
+def test_run_now_generates_digest_and_marks_delivery(tmp_path, monkeypatch):
+    memory_path = tmp_path / "TELEGRAM_CHAT_MEMORY.jsonl"
+    _write_memory_entries(
+        memory_path,
+        [
+            {
+                "ts_utc": "2026-03-18T18:00:00+00:00",
+                "direction": "in",
+                "chat_id": -100321,
+                "thread_id": 77,
+                "from_user_id": 12345,
+                "text": "Please help me close more inbound leads",
+            },
+            {
+                "ts_utc": "2026-03-18T18:05:00+00:00",
+                "direction": "out_send",
+                "chat_id": -100321,
+                "thread_id": 77,
+                "text": "I tightened the follow-up email and highlighted the next step.",
+            },
+        ],
+    )
+    monkeypatch.setenv("COCO_TELEGRAM_MEMORY_LOG_PATH", str(memory_path))
+
+    auth_meta = tmp_path / "allowed_users_meta.json"
+    auth_meta.write_text(
+        json.dumps(
+            {
+                "names": {"12345": "Morgan"},
+                "admins": [12345],
+                "scopes": {"12345": "create_sessions"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(autoresearch.config, "auth_meta_file", auth_meta)
+
+    autoresearch.set_autoresearch_outcome(
+        user_id=12345,
+        thread_id=77,
+        outcome="Close more inbound leads",
+    )
+    runner = getattr(autoresearch, "run_autoresearch_now", None)
+    assert runner is not None
+
+    digest_text = runner(
+        user_id=12345,
+        chat_id=-100321,
+        thread_id=77,
+        now=datetime(2026, 3, 19, 8, 0, tzinfo=UTC),
+    )
+
+    state = autoresearch.get_autoresearch_state(user_id=12345, thread_id=77)
+    assert digest_text is not None
+    assert "Close more inbound leads" in digest_text
+    assert state is not None
+    assert state.last_researched_for_date == "2026-03-18"
+    assert state.last_delivered_for_date == "2026-03-18"

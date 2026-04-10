@@ -76,6 +76,9 @@ CB_APPS_OPEN = "am:open:"  # am:open:<app_name>
 CB_APPS_RUN = "am:run:"  # am:run:<app_name>
 CB_APPS_CONFIGURE = "am:cfg:"  # am:cfg:<app_name>
 CB_APPS_TOGGLE = "am:tg:"  # am:tg:<app_name>
+CB_APPS_AUTORESEARCH_RUN = "am:ar:run"
+CB_APPS_AUTORESEARCH_SCHEDULE = "am:ar:sched"
+CB_APPS_AUTORESEARCH_STOP = "am:ar:stop"
 CB_APPS_AUTORESEARCH_OUTCOME = "am:ar:out"
 CB_APPS_LOOPER_OPEN = "am:loop:open"
 CB_APPS_LOOPER_PLAN = "am:loop:plan:"  # am:loop:plan:<index>
@@ -86,6 +89,7 @@ CB_APPS_LOOPER_KEYWORD = "am:loop:key"
 CB_APPS_LOOPER_INSTRUCTIONS = "am:loop:ins"
 CB_APPS_LOOPER_START = "am:loop:start"
 CB_APPS_LOOPER_STOP = "am:loop:stop"
+CB_APPS_LOOPER_DISABLE = "am:loop:disable"
 
 # Session lifecycle manager
 CB_SESSION_REFRESH = "se:ref"

@@ -179,3 +179,106 @@ async def test_looper_start_accepts_spaced_duration_units(monkeypatch):
     assert start_calls[0]["limit_seconds"] == 3600
     assert replies
     assert "Looper started" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_looper_start_accepts_random_interval_range_and_on_reply(monkeypatch):
+    update = _make_update("/looper start plans/a.md done --every 25m-75m --on-reply")
+    replies: list[str] = []
+    start_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@77",
+    )
+
+    def _start_looper(**kwargs):
+        start_calls.append(kwargs)
+        return SimpleNamespace(
+            plan_path="plans/a.md",
+            keyword="done",
+            interval_seconds=1500,
+            interval_max_seconds=4500,
+            started_at=100.0,
+            deadline_at=0.0,
+            instructions="",
+            runner_command="",
+            trigger_on_user_message=True,
+        )
+
+    monkeypatch.setattr(bot, "start_looper", _start_looper)
+    monkeypatch.setattr(bot, "build_looper_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(bot.session_manager, "discover_skill_catalog", lambda: {})
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.looper_command(update, SimpleNamespace(user_data={}))
+
+    assert start_calls
+    assert start_calls[0]["interval_seconds"] == 1500
+    assert start_calls[0]["interval_max_seconds"] == 4500
+    assert start_calls[0]["trigger_on_user_message"] is True
+    assert replies
+    assert "Looper started" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_looper_start_accepts_runner_mode(monkeypatch):
+    update = _make_update('/looper start --runner "python tools/nudge.py" --every-random 25m 75m --on-reply')
+    replies: list[str] = []
+    start_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@77",
+    )
+
+    def _start_looper(**kwargs):
+        start_calls.append(kwargs)
+        return SimpleNamespace(
+            plan_path="",
+            keyword="done",
+            interval_seconds=1500,
+            interval_max_seconds=4500,
+            started_at=100.0,
+            deadline_at=0.0,
+            instructions="",
+            runner_command="python tools/nudge.py",
+            trigger_on_user_message=True,
+        )
+
+    monkeypatch.setattr(bot, "start_looper", _start_looper)
+    monkeypatch.setattr(bot, "build_looper_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(bot.session_manager, "discover_skill_catalog", lambda: {})
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.looper_command(update, SimpleNamespace(user_data={}))
+
+    assert start_calls
+    assert start_calls[0]["runner_command"] == "python tools/nudge.py"
+    assert start_calls[0]["interval_seconds"] == 1500
+    assert start_calls[0]["interval_max_seconds"] == 4500
+    assert start_calls[0]["trigger_on_user_message"] is True
+    assert replies
+    assert "Looper started" in replies[-1]

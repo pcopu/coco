@@ -74,6 +74,22 @@ def test_apps_keyboard_uses_icon_and_routes_by_config_support():
     assert "✅ demo" in enabled_labels
 
 
+def test_looper_panel_keyboard_includes_disable_app_button():
+    keyboard = bot._build_looper_panel_keyboard(
+        config_data={
+            "plan_path": "plans/ship.md",
+            "keyword": "done",
+            "instructions": "",
+            "interval_seconds": 900,
+            "limit_seconds": 0,
+            "candidates": ["plans/ship.md"],
+        },
+        active_state=None,
+    )
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert "🚫 Disable App" in labels
+
+
 @pytest.mark.asyncio
 async def test_apps_refresh_callback_edits_overview(monkeypatch):
     update, query = _make_callback_update(CB_APPS_REFRESH)
@@ -139,6 +155,42 @@ async def test_apps_open_callback_shows_action_sheet(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_apps_open_callback_shows_autoresearch_panel(monkeypatch):
+    update, query = _make_callback_update(f"{CB_APPS_OPEN}autoresearch")
+    edits: list[tuple[str, object]] = []
+    keyboard = InlineKeyboardMarkup([])
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def _build_autoresearch_panel_payload_for_topic(**_kwargs):
+        return True, "autoresearch panel", keyboard, ""
+
+    monkeypatch.setattr(
+        bot,
+        "_build_autoresearch_panel_payload_for_topic",
+        _build_autoresearch_panel_payload_for_topic,
+    )
+
+    async def _safe_edit(_query, text: str, **kwargs):
+        edits.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert edits == [("autoresearch panel", keyboard)]
+    assert query.answers
+    assert query.answers[-1] == ("Auto research", False)
+
+
+@pytest.mark.asyncio
 async def test_apps_configure_callback_shows_autoresearch_panel(monkeypatch):
     update, query = _make_callback_update(f"{bot.CB_APPS_CONFIGURE}autoresearch")
     edits: list[tuple[str, object]] = []
@@ -172,6 +224,191 @@ async def test_apps_configure_callback_shows_autoresearch_panel(monkeypatch):
     assert edits == [("autoresearch panel", keyboard)]
     assert query.answers
     assert query.answers[-1] == ("Auto research config", False)
+
+
+@pytest.mark.asyncio
+async def test_autoresearch_run_now_callback_sends_digest_without_enabling_schedule(monkeypatch):
+    update, query = _make_callback_update("am:ar:run")
+    edits: list[tuple[str, object]] = []
+    sent: list[tuple[int, int | None, str]] = []
+    keyboard = InlineKeyboardMarkup([])
+    enabled_names: list[str] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "get_autoresearch_state",
+        lambda **_kwargs: SimpleNamespace(outcome="Close more inbound leads"),
+    )
+    monkeypatch.setattr(
+        bot,
+        "run_autoresearch_now",
+        lambda **_kwargs: "digest text",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, chat_id=None: chat_id if chat_id is not None else -100321,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "discover_skill_catalog",
+        lambda: {"autoresearch": _make_skill("autoresearch", icon="🔎")},
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_thread_skills",
+        lambda _uid, _tid, names, **_kwargs: enabled_names.__setitem__(
+            slice(None), list(names)
+        ),
+    )
+
+    async def _build_autoresearch_panel_payload_for_topic(**_kwargs):
+        return True, "autoresearch panel", keyboard, ""
+
+    monkeypatch.setattr(
+        bot,
+        "_build_autoresearch_panel_payload_for_topic",
+        _build_autoresearch_panel_payload_for_topic,
+    )
+
+    async def _safe_edit(_query, text: str, **kwargs):
+        edits.append((text, kwargs.get("reply_markup")))
+
+    async def _safe_send(_bot, chat_id: int, text: str, *, message_thread_id=None, **_kwargs):
+        sent.append((chat_id, message_thread_id, text))
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert enabled_names == []
+    assert sent == [(-100321, 77, "digest text")]
+    assert edits == [("autoresearch panel", keyboard)]
+    assert query.answers
+    assert query.answers[-1] == ("Running auto research...", False)
+
+
+@pytest.mark.asyncio
+async def test_autoresearch_schedule_callback_enables_daily_delivery(monkeypatch):
+    update, query = _make_callback_update("am:ar:sched")
+    edits: list[tuple[str, object]] = []
+    keyboard = InlineKeyboardMarkup([])
+    enabled_names: list[str] = []
+    catalog = {"autoresearch": _make_skill("autoresearch", icon="🔎")}
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "get_autoresearch_state",
+        lambda **_kwargs: SimpleNamespace(outcome="Close more inbound leads"),
+    )
+    monkeypatch.setattr(bot.session_manager, "discover_skill_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [catalog[name] for name in enabled_names],
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_thread_skills",
+        lambda _uid, _tid, names, **_kwargs: enabled_names.__setitem__(
+            slice(None), list(names)
+        ),
+    )
+
+    async def _build_autoresearch_panel_payload_for_topic(**_kwargs):
+        return True, "autoresearch panel", keyboard, ""
+
+    monkeypatch.setattr(
+        bot,
+        "_build_autoresearch_panel_payload_for_topic",
+        _build_autoresearch_panel_payload_for_topic,
+    )
+
+    async def _safe_edit(_query, text: str, **kwargs):
+        edits.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert enabled_names == ["autoresearch"]
+    assert edits == [("autoresearch panel", keyboard)]
+    assert query.answers
+    assert query.answers[-1] == ("Daily auto research enabled", False)
+
+
+@pytest.mark.asyncio
+async def test_autoresearch_stop_callback_disables_daily_delivery(monkeypatch):
+    update, query = _make_callback_update("am:ar:stop")
+    edits: list[tuple[str, object]] = []
+    keyboard = InlineKeyboardMarkup([])
+    enabled_names: list[str] = ["autoresearch"]
+    catalog = {"autoresearch": _make_skill("autoresearch", icon="🔎")}
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bot.session_manager, "discover_skill_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [catalog[name] for name in enabled_names],
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_thread_skills",
+        lambda _uid, _tid, names, **_kwargs: enabled_names.__setitem__(
+            slice(None), list(names)
+        ),
+    )
+
+    async def _build_autoresearch_panel_payload_for_topic(**_kwargs):
+        return True, "autoresearch panel", keyboard, ""
+
+    monkeypatch.setattr(
+        bot,
+        "_build_autoresearch_panel_payload_for_topic",
+        _build_autoresearch_panel_payload_for_topic,
+    )
+
+    async def _safe_edit(_query, text: str, **kwargs):
+        edits.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert enabled_names == []
+    assert edits == [("autoresearch panel", keyboard)]
+    assert query.answers
+    assert query.answers[-1] == ("Daily auto research stopped", False)
 
 
 @pytest.mark.asyncio
@@ -341,3 +578,63 @@ async def test_looper_start_callback_uses_panel_config(monkeypatch):
     assert context.user_data[bot.STATE_KEY] == ""
     assert query.answers
     assert query.answers[-1] == ("Looper started", False)
+
+
+@pytest.mark.asyncio
+async def test_looper_disable_callback_stops_and_disables_app(monkeypatch):
+    update, query = _make_callback_update("am:loop:disable")
+    edits: list[tuple[str, object]] = []
+    keyboard = InlineKeyboardMarkup([])
+    enabled_names: list[str] = ["looper"]
+    stop_calls: list[tuple[int, int, str]] = []
+    catalog = {"looper": _make_skill("looper", icon="🔁")}
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bot.session_manager, "discover_skill_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [catalog[name] for name in enabled_names],
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_thread_skills",
+        lambda _uid, _tid, names, **_kwargs: enabled_names.__setitem__(
+            slice(None), list(names)
+        ),
+    )
+
+    def _stop_looper(*, user_id: int, thread_id: int, reason: str):
+        stop_calls.append((user_id, thread_id, reason))
+        return True
+
+    monkeypatch.setattr(bot, "stop_looper", _stop_looper)
+
+    async def _build_looper_panel_payload_for_topic(**_kwargs):
+        return True, "looper panel", keyboard, "@77"
+
+    monkeypatch.setattr(
+        bot,
+        "_build_looper_panel_payload_for_topic",
+        _build_looper_panel_payload_for_topic,
+    )
+
+    async def _safe_edit(_query, text: str, **kwargs):
+        edits.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert stop_calls == [(1147817421, 77, "manual_disable")]
+    assert enabled_names == []
+    assert edits == [("looper panel", keyboard)]
+    assert query.answers
+    assert query.answers[-1] == ("Looper app disabled", False)

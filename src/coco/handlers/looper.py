@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import random
 import re
 import time
 
@@ -40,6 +41,9 @@ class LooperState:
     interval_seconds: int
     started_at: float
     next_prompt_at: float
+    interval_max_seconds: int = 0
+    runner_command: str = ""
+    trigger_on_user_message: bool = False
     deadline_at: float = 0.0
     prompt_count: int = 0
     last_prompt_at: float = 0.0
@@ -51,6 +55,9 @@ class LooperState:
             "keyword": self.keyword,
             "instructions": self.instructions,
             "interval_seconds": self.interval_seconds,
+            "interval_max_seconds": self.interval_max_seconds,
+            "runner_command": self.runner_command,
+            "trigger_on_user_message": self.trigger_on_user_message,
             "started_at": self.started_at,
             "next_prompt_at": self.next_prompt_at,
             "deadline_at": self.deadline_at,
@@ -73,6 +80,7 @@ class DueLooperPrompt:
     interval_seconds: int
     prompt_count: int
     deadline_at: float
+    runner_command: str = ""
 
 
 # (user_id, thread_id) -> LooperState
@@ -117,6 +125,25 @@ def _is_single_word(value: str) -> bool:
     return bool(value) and " " not in value
 
 
+def _sample_interval_seconds(*, interval_seconds: int, interval_max_seconds: int = 0) -> int:
+    low = _clamp_int(
+        int(interval_seconds),
+        low=LOOPER_MIN_INTERVAL_SECONDS,
+        high=LOOPER_MAX_INTERVAL_SECONDS,
+    )
+    high_raw = int(interval_max_seconds) if int(interval_max_seconds) > 0 else low
+    high = _clamp_int(
+        high_raw,
+        low=LOOPER_MIN_INTERVAL_SECONDS,
+        high=LOOPER_MAX_INTERVAL_SECONDS,
+    )
+    if high < low:
+        low, high = high, low
+    if high == low:
+        return low
+    return random.randint(low, high)
+
+
 def _parse_state(raw: dict[str, object]) -> LooperState | None:
     try:
         window_id = str(raw.get("window_id", "")).strip()
@@ -128,6 +155,18 @@ def _parse_state(raw: dict[str, object]) -> LooperState | None:
             low=LOOPER_MIN_INTERVAL_SECONDS,
             high=LOOPER_MAX_INTERVAL_SECONDS,
         )
+        raw_interval_max_seconds = int(raw.get("interval_max_seconds", 0) or 0)
+        interval_max_seconds = (
+            _clamp_int(
+                raw_interval_max_seconds,
+                low=LOOPER_MIN_INTERVAL_SECONDS,
+                high=LOOPER_MAX_INTERVAL_SECONDS,
+            )
+            if raw_interval_max_seconds > 0
+            else 0
+        )
+        runner_command = str(raw.get("runner_command", "")).strip()
+        trigger_on_user_message = bool(raw.get("trigger_on_user_message", False))
         started_at = float(raw.get("started_at", 0.0))
         next_prompt_at = float(raw.get("next_prompt_at", 0.0))
         deadline_at = float(raw.get("deadline_at", 0.0))
@@ -136,7 +175,7 @@ def _parse_state(raw: dict[str, object]) -> LooperState | None:
     except (TypeError, ValueError):
         return None
 
-    if not window_id or not plan_path or not keyword:
+    if not window_id or (not plan_path and not runner_command) or not keyword:
         return None
     if not _is_single_word(keyword):
         return None
@@ -153,6 +192,9 @@ def _parse_state(raw: dict[str, object]) -> LooperState | None:
         keyword=keyword,
         instructions=instructions,
         interval_seconds=interval_seconds,
+        interval_max_seconds=interval_max_seconds,
+        runner_command=runner_command,
+        trigger_on_user_message=trigger_on_user_message,
         started_at=started_at,
         next_prompt_at=next_prompt_at,
         deadline_at=deadline_at,
@@ -250,15 +292,19 @@ def start_looper(
     plan_path: str,
     keyword: str,
     interval_seconds: int = LOOPER_DEFAULT_INTERVAL_SECONDS,
+    interval_max_seconds: int = 0,
     limit_seconds: int = 0,
     instructions: str = "",
+    runner_command: str = "",
+    trigger_on_user_message: bool = False,
     now: float | None = None,
 ) -> LooperState:
     """Create/replace looper config for a topic."""
     _load_state()
 
     plan = plan_path.strip()
-    if not plan:
+    normalized_runner_command = runner_command.strip()
+    if not plan and not normalized_runner_command:
         raise ValueError("plan_path is required")
 
     normalized_keyword = normalize_looper_keyword(keyword)
@@ -270,6 +316,15 @@ def start_looper(
         low=LOOPER_MIN_INTERVAL_SECONDS,
         high=LOOPER_MAX_INTERVAL_SECONDS,
     )
+    interval_high = 0
+    if int(interval_max_seconds) > 0:
+        interval_high = _clamp_int(
+            int(interval_max_seconds),
+            low=LOOPER_MIN_INTERVAL_SECONDS,
+            high=LOOPER_MAX_INTERVAL_SECONDS,
+        )
+        if interval_high < interval:
+            interval, interval_high = interval_high, interval
     limit = 0
     if int(limit_seconds) > 0:
         limit = _clamp_int(
@@ -280,14 +335,21 @@ def start_looper(
 
     ts = now if now is not None else time.time()
     deadline_at = ts + limit if limit > 0 else 0.0
+    next_interval = _sample_interval_seconds(
+        interval_seconds=interval,
+        interval_max_seconds=interval_high,
+    )
     state = LooperState(
         window_id=window_id,
         plan_path=plan,
         keyword=normalized_keyword,
         instructions=instructions.strip(),
         interval_seconds=interval,
+        interval_max_seconds=interval_high,
+        runner_command=normalized_runner_command,
+        trigger_on_user_message=bool(trigger_on_user_message),
         started_at=ts,
-        next_prompt_at=ts + interval,
+        next_prompt_at=ts + next_interval,
         deadline_at=deadline_at,
     )
     _looper_state[_topic_key(user_id, thread_id)] = state
@@ -301,8 +363,11 @@ def start_looper(
         plan_path=plan,
         keyword=normalized_keyword,
         interval_seconds=interval,
+        interval_max_seconds=interval_high,
         limit_seconds=limit,
         has_instructions=bool(state.instructions),
+        runner_mode=bool(state.runner_command),
+        trigger_on_user_message=state.trigger_on_user_message,
     )
     return state
 
@@ -405,6 +470,7 @@ def claim_due_looper_prompt(
     user_id: int,
     thread_id: int,
     window_id: str,
+    force: bool = False,
     now: float | None = None,
 ) -> DueLooperPrompt | None:
     """Claim one due prompt and schedule the next interval."""
@@ -419,28 +485,36 @@ def claim_due_looper_prompt(
     ts = now if now is not None else time.time()
     if state.deadline_at > 0 and ts >= state.deadline_at:
         return None
-    if ts < state.next_prompt_at:
+    if not force and ts < state.next_prompt_at:
         return None
 
     state.prompt_count += 1
     state.last_prompt_at = ts
-    state.next_prompt_at = ts + state.interval_seconds
+    scheduled_interval = _sample_interval_seconds(
+        interval_seconds=state.interval_seconds,
+        interval_max_seconds=state.interval_max_seconds,
+    )
+    state.next_prompt_at = ts + scheduled_interval
     _save_state()
 
-    prompt_text = build_looper_prompt(
-        plan_path=state.plan_path,
-        keyword=state.keyword,
-        instructions=state.instructions,
-        deadline_at=state.deadline_at,
-        now=ts,
-    )
+    prompt_text = ""
+    if not state.runner_command:
+        prompt_text = build_looper_prompt(
+            plan_path=state.plan_path,
+            keyword=state.keyword,
+            instructions=state.instructions,
+            deadline_at=state.deadline_at,
+            now=ts,
+        )
     emit_telemetry(
         "looper.prompt_claimed",
         user_id=user_id,
         thread_id=thread_id,
         window_id=window_id,
         prompt_count=state.prompt_count,
-        interval_seconds=state.interval_seconds,
+        interval_seconds=scheduled_interval,
+        runner_mode=bool(state.runner_command),
+        forced=force,
     )
     return DueLooperPrompt(
         user_id=user_id,
@@ -450,9 +524,10 @@ def claim_due_looper_prompt(
         plan_path=state.plan_path,
         keyword=state.keyword,
         instructions=state.instructions,
-        interval_seconds=state.interval_seconds,
+        interval_seconds=scheduled_interval,
         prompt_count=state.prompt_count,
         deadline_at=state.deadline_at,
+        runner_command=state.runner_command,
     )
 
 

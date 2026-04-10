@@ -13,8 +13,10 @@ Key components:
 """
 
 import asyncio
+import inspect
 import logging
 import random
+import subprocess
 import time
 
 from telegram import Bot
@@ -39,6 +41,7 @@ from .looper import (
 from . import autoresearch, personality
 from .message_queue import get_message_queue
 from .message_sender import safe_send
+from .topic_send import send_text_to_topic as _send_text_to_topic
 from .run_watchdog import (
     get_due_run_checks,
     note_auto_retry_attempt,
@@ -431,6 +434,7 @@ async def _emit_due_looper_prompt(
     thread_id: int | None,
     window_id: str,
     chat_id: int | None = None,
+    force: bool = False,
 ) -> None:
     """Send one due looper nudge when configured for this topic."""
     if thread_id is None:
@@ -476,8 +480,68 @@ async def _emit_due_looper_prompt(
         user_id=user_id,
         thread_id=thread_id,
         window_id=window_id,
+        force=force,
     )
     if not due:
+        return
+
+    if due.runner_command:
+        exit_code, runner_stdout = await asyncio.to_thread(
+            _run_looper_runner,
+            runner_command=due.runner_command,
+            window_id=window_id,
+        )
+        runner_text = runner_stdout.strip()
+        emit_telemetry(
+            "looper.runner_result",
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            exit_code=exit_code,
+            prompt_count=due.prompt_count,
+            text_len=len(runner_text),
+        )
+        if exit_code != 0:
+            logger.warning(
+                "Looper runner failed (user=%d thread=%d window=%s cmd=%r exit=%d)",
+                user_id,
+                thread_id,
+                window_id,
+                due.runner_command,
+                exit_code,
+            )
+            delay_looper_next_prompt(
+                user_id=user_id,
+                thread_id=thread_id,
+                delay_seconds=60,
+            )
+            return
+        if not runner_text:
+            return
+        send_result = _send_text_to_topic(
+            bot=bot,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=runner_text,
+        )
+        if inspect.isawaitable(send_result):
+            send_ok, send_err = await send_result
+        else:
+            send_ok, send_err = send_result
+        if not send_ok:
+            logger.warning(
+                "Looper runner send failed (user=%d thread=%d window=%s): %s",
+                user_id,
+                thread_id,
+                window_id,
+                send_err,
+            )
+            delay_looper_next_prompt(
+                user_id=user_id,
+                thread_id=thread_id,
+                delay_seconds=60,
+            )
         return
 
     if chat_id is None:
@@ -544,6 +608,43 @@ async def _emit_due_looper_prompt(
         f"⚠️ Looper nudge failed to send: `{send_err}`. Retrying soon.",
         message_thread_id=thread_id,
     )
+
+
+async def emit_looper_tick(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    chat_id: int | None = None,
+    force: bool = False,
+) -> None:
+    """Public looper tick entrypoint for schedulers and immediate triggers."""
+    await _emit_due_looper_prompt(
+        bot,
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        chat_id=chat_id,
+        force=force,
+    )
+
+
+def _run_looper_runner(
+    *,
+    runner_command: str,
+    window_id: str,
+) -> tuple[int, str]:
+    """Execute one looper runner in the bound workspace and capture stdout."""
+    workspace_dir = session_manager.get_window_state(window_id).cwd.strip() or None
+    completed = subprocess.run(
+        runner_command,
+        shell=True,
+        cwd=workspace_dir,
+        text=True,
+        capture_output=True,
+    )
+    return completed.returncode, completed.stdout
 
 
 async def _emit_due_personality_delivery(

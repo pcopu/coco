@@ -144,3 +144,69 @@ def test_main_dispatches_init_command_before_runtime_import(monkeypatch):
     main_mod.main()
 
     assert bootstrap_calls == [["--bot-token", "123:ABC"]]
+
+
+def test_main_dispatches_apps_command_before_runtime_import(monkeypatch):
+    app_cli_calls: list[list[str]] = []
+
+    app_cli_module = ModuleType("coco.app_cli")
+    app_cli_module.main = lambda argv=None: app_cli_calls.append(list(argv or [])) or 0
+
+    config_module = ModuleType("coco.config")
+
+    def _fail_config(name: str):
+        raise AssertionError(f"config import should not happen for apps cli: {name}")
+
+    config_module.__getattr__ = _fail_config  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "coco.app_cli", app_cli_module)
+    monkeypatch.setitem(sys.modules, "coco.config", config_module)
+    monkeypatch.setattr(main_mod.sys, "argv", ["coco", "apps", "list"])
+
+    main_mod.main()
+
+    assert app_cli_calls == [["list"]]
+
+
+def test_main_dispatches_direct_command_cli_before_runtime_import(monkeypatch):
+    command_cli_calls: list[list[str]] = []
+
+    command_cli_module = ModuleType("coco.command_cli")
+    command_cli_module.main = lambda argv=None: command_cli_calls.append(list(argv or [])) or 0
+
+    config_module = ModuleType("coco.config")
+
+    def _fail_config(name: str):
+        raise AssertionError(f"config import should not happen for direct command cli: {name}")
+
+    config_module.__getattr__ = _fail_config  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "coco.command_cli", command_cli_module)
+    monkeypatch.setitem(sys.modules, "coco.config", config_module)
+    monkeypatch.setattr(main_mod.sys, "argv", ["coco", "mentions", "on"])
+
+    main_mod.main()
+
+    assert command_cli_calls == [["mentions", "on"]]
+
+
+def test_main_dispatches_topic_cli_before_runtime_import(monkeypatch):
+    topic_cli_calls: list[list[str]] = []
+
+    topic_cli_module = ModuleType("coco.topic_cli")
+    topic_cli_module.main = lambda argv=None: topic_cli_calls.append(list(argv or [])) or 0
+
+    config_module = ModuleType("coco.config")
+
+    def _fail_config(name: str):
+        raise AssertionError(f"config import should not happen for topic cli: {name}")
+
+    config_module.__getattr__ = _fail_config  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "coco.topic_cli", topic_cli_module)
+    monkeypatch.setitem(sys.modules, "coco.config", config_module)
+    monkeypatch.setattr(main_mod.sys, "argv", ["coco", "topic", "--json"])
+
+    main_mod.main()
+
+    assert topic_cli_calls == [["--json"]]

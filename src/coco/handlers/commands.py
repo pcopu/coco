@@ -1216,26 +1216,57 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if len(subargs) < 2:
-        await safe_reply(
-            update.message,
-            (
-                "Usage: `/looper start <plan.md> <keyword> "
-                "[--every 10m] [--limit 1h] [--instructions \"...\"]`"
-            ),
-        )
-        return
-
-    plan_path = subargs[0].strip()
-    keyword = subargs[1].strip()
-
+    positionals: list[str] = []
+    plan_path = ""
+    keyword = "done"
     interval_seconds = LOOPER_DEFAULT_INTERVAL_SECONDS
+    interval_max_seconds = 0
     limit_seconds = 0
     instructions = ""
-    idx = 2
+    runner_command = ""
+    trigger_on_user_message = False
+    idx = 0
     while idx < len(subargs):
         token = subargs[idx]
         token_l = token.lower()
+
+        if token_l in {"--runner", "--command"}:
+            idx += 1
+            if idx >= len(subargs):
+                await safe_reply(update.message, "❌ Missing value for `--runner`.")
+                return
+            runner_command = subargs[idx].strip()
+            idx += 1
+            continue
+
+        if token_l.startswith("--runner=") or token_l.startswith("--command="):
+            _flag, _sep, value = token.partition("=")
+            runner_command = value.strip()
+            idx += 1
+            continue
+
+        if token_l in {"--on-reply", "--trigger-on-reply", "--trigger-on-user-message"}:
+            trigger_on_user_message = True
+            idx += 1
+            continue
+
+        if token_l in {"--every-random", "--interval-random"}:
+            if idx + 2 >= len(subargs):
+                await safe_reply(update.message, "❌ Missing values for `--every-random`.")
+                return
+            min_raw = subargs[idx + 1]
+            max_raw = subargs[idx + 2]
+            min_parsed = _parse_duration_to_seconds(min_raw, default_unit="m")
+            max_parsed = _parse_duration_to_seconds(max_raw, default_unit="m")
+            if min_parsed is None or max_parsed is None:
+                await safe_reply(
+                    update.message,
+                    f"❌ Invalid randomized interval: `{min_raw}` `{max_raw}`",
+                )
+                return
+            interval_seconds, interval_max_seconds = sorted((min_parsed, max_parsed))
+            idx += 3
+            continue
 
         if token_l in {"--every", "--interval"}:
             idx += 1
@@ -1243,6 +1274,16 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await safe_reply(update.message, "❌ Missing value for `--every`.")
                 return
             every_raw = subargs[idx]
+            if "-" in every_raw and not every_raw.startswith("-"):
+                left_raw, _sep, right_raw = every_raw.partition("-")
+                left = _parse_duration_to_seconds(left_raw, default_unit="m")
+                right = _parse_duration_to_seconds(right_raw, default_unit="m")
+                if left is None or right is None:
+                    await safe_reply(update.message, f"❌ Invalid interval: `{subargs[idx]}`")
+                    return
+                interval_seconds, interval_max_seconds = sorted((left, right))
+                idx += 1
+                continue
             parsed = _parse_duration_to_seconds(every_raw, default_unit="m")
             if (
                 parsed is not None
@@ -1259,16 +1300,28 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await safe_reply(update.message, f"❌ Invalid interval: `{subargs[idx]}`")
                 return
             interval_seconds = parsed
+            interval_max_seconds = 0
             idx += 1
             continue
 
         if token_l.startswith("--every=") or token_l.startswith("--interval="):
             _flag, _sep, value = token.partition("=")
+            if "-" in value and not value.startswith("-"):
+                left_raw, _sep, right_raw = value.partition("-")
+                left = _parse_duration_to_seconds(left_raw, default_unit="m")
+                right = _parse_duration_to_seconds(right_raw, default_unit="m")
+                if left is None or right is None:
+                    await safe_reply(update.message, f"❌ Invalid interval: `{value}`")
+                    return
+                interval_seconds, interval_max_seconds = sorted((left, right))
+                idx += 1
+                continue
             parsed = _parse_duration_to_seconds(value, default_unit="m")
             if parsed is None:
                 await safe_reply(update.message, f"❌ Invalid interval: `{value}`")
                 return
             interval_seconds = parsed
+            interval_max_seconds = 0
             idx += 1
             continue
 
@@ -1326,9 +1379,33 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     instructions = f"{instructions} {trailing}".strip()
             break
 
-        # Free-form tail without explicit flag is treated as custom instructions.
-        instructions = " ".join(subargs[idx:]).strip()
-        break
+        positionals.append(token)
+        idx += 1
+
+    if runner_command:
+        if positionals:
+            plan_path = positionals[0].strip()
+        if len(positionals) >= 2:
+            keyword = positionals[1].strip()
+        if len(positionals) > 2 and not instructions:
+            instructions = " ".join(positionals[2:]).strip()
+    else:
+        if len(positionals) < 2:
+            await safe_reply(
+                update.message,
+                (
+                    "Usage: `/looper start <plan.md> <keyword> "
+                    "[--every 10m|25m-75m] [--every-random 25m 75m] "
+                    "[--limit 1h] [--instructions \"...\"] [--on-reply]`\n"
+                    "Runner mode: `/looper start --runner \"python script.py\" "
+                    "[--every 25m-75m] [--on-reply]`"
+                ),
+            )
+            return
+        plan_path = positionals[0].strip()
+        keyword = positionals[1].strip()
+        if len(positionals) > 2 and not instructions:
+            instructions = " ".join(positionals[2:]).strip()
 
     if interval_seconds < LOOPER_MIN_INTERVAL_SECONDS:
         await safe_reply(
@@ -1348,6 +1425,15 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ),
         )
         return
+    if interval_max_seconds and interval_max_seconds > LOOPER_MAX_INTERVAL_SECONDS:
+        await safe_reply(
+            update.message,
+            (
+                "❌ Randomized interval is too long. "
+                f"Maximum is `{_format_duration_brief(LOOPER_MAX_INTERVAL_SECONDS)}`."
+            ),
+        )
+        return
 
     try:
         state = start_looper(
@@ -1357,8 +1443,11 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             plan_path=plan_path,
             keyword=keyword,
             interval_seconds=interval_seconds,
+            interval_max_seconds=interval_max_seconds,
             limit_seconds=limit_seconds,
             instructions=instructions,
+            runner_command=runner_command,
+            trigger_on_user_message=trigger_on_user_message,
         )
     except ValueError as e:
         await safe_reply(update.message, f"❌ {e}")
@@ -1386,18 +1475,20 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             auto_enabled = True
 
-    example_prompt = build_looper_prompt(
-        plan_path=state.plan_path,
-        keyword=state.keyword,
-        instructions=state.instructions,
-        deadline_at=state.deadline_at,
-    )
+    interval_label = _format_duration_brief(state.interval_seconds)
+    first_nudge_label = interval_label
+    if getattr(state, "interval_max_seconds", 0) and state.interval_max_seconds > state.interval_seconds:
+        interval_label = (
+            f"{_format_duration_brief(state.interval_seconds)}-"
+            f"{_format_duration_brief(state.interval_max_seconds)}"
+        )
+        first_nudge_label = f"{interval_label} randomized"
 
     lines = [
         "✅ Looper started for this topic.",
-        f"Plan file: `{state.plan_path}`",
+        f"Plan file: `{state.plan_path or '(runner mode)'}`",
         f"Completion keyword: `{state.keyword}`",
-        f"Interval: `{_format_duration_brief(state.interval_seconds)}`",
+        f"Interval: `{interval_label}`",
     ]
     if state.deadline_at > 0:
         lines.append(
@@ -1405,16 +1496,27 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     else:
         lines.append("Time limit: `(none)`")
-    lines.append(f"First nudge in: `{_format_duration_brief(state.interval_seconds)}`")
+    lines.append(f"First nudge in: `{first_nudge_label}`")
+    if getattr(state, "trigger_on_user_message", False):
+        lines.append("User reply trigger: `on`")
+    if getattr(state, "runner_command", ""):
+        lines.append(f"Runner command: `{state.runner_command}`")
     if auto_enabled:
         lines.append("App auto-enabled: `looper`")
-    lines.extend(
-        [
-            "",
-            "Example nudge:",
-            example_prompt,
-        ]
-    )
+    if not getattr(state, "runner_command", ""):
+        example_prompt = build_looper_prompt(
+            plan_path=state.plan_path,
+            keyword=state.keyword,
+            instructions=state.instructions,
+            deadline_at=state.deadline_at,
+        )
+        lines.extend(
+            [
+                "",
+                "Example nudge:",
+                example_prompt,
+            ]
+        )
     await safe_reply(update.message, "\n".join(lines))
 
 
