@@ -534,6 +534,7 @@ async def test_resume_latest_codex_session_for_window_syncs_topic_model_selectio
 
     binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
     assert resumed == "thread-new"
+    assert mgr.consume_window_pending_session_start_reason("@1") == "resume"
     assert binding is not None
     assert binding.codex_thread_id == "thread-new"
     assert binding.model_slug == "gpt-5.4"
@@ -992,6 +993,66 @@ async def test_ensure_codex_thread_passes_topic_service_tier(
 
 
 @pytest.mark.asyncio
+async def test_send_inputs_via_app_server_marks_fresh_start_for_new_thread(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    captured_inputs: list[dict[str, object]] = []
+
+    async def _thread_start(
+        *,
+        cwd: str | None = None,
+        approval_policy: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ):
+        _ = cwd, approval_policy, model, effort, service_tier
+        return {"thread": {"id": "thread-1"}}
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        service_tier: str | None = None,
+        timeout: float = 90.0,
+    ):
+        _ = thread_id, approval_policy, service_tier, timeout
+        captured_inputs.extend(inputs)
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.thread_start",
+        _thread_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert "Session start reason: fresh_start" in str(captured_inputs[0]["text"])
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_via_app_server_prepends_runtime_capability_hint(
     mgr: SessionManager,
     monkeypatch,
@@ -1040,6 +1101,60 @@ async def test_send_inputs_via_app_server_prepends_runtime_capability_hint(
     assert "Filesystem write access: enabled" in str(captured_inputs[0]["text"])
     assert "Approval policy: never" in str(captured_inputs[0]["text"])
     assert captured_inputs[1] == {"type": "text", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_via_app_server_includes_one_shot_session_start_reason(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    captured_inputs: list[dict[str, object]] = []
+    mgr.set_window_codex_thread_id("@1", "thread-1")
+    mgr.set_window_approval_mode("@1", "never")
+    mgr.mark_window_pending_session_start_reason("@1", "after_clear")
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        service_tier: str | None = None,
+        timeout: float = 90.0,
+    ):
+        _ = thread_id, approval_policy, service_tier, timeout
+        captured_inputs.extend(inputs)
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert "Session start reason: after_clear" in str(captured_inputs[0]["text"])
+    assert mgr.consume_window_pending_session_start_reason("@1") == ""
+
+
+def test_clear_window_session_marks_next_turn_as_after_clear(mgr: SessionManager):
+    mgr.clear_window_session("@1")
+    assert mgr.consume_window_pending_session_start_reason("@1") == "after_clear"
 
 
 @pytest.mark.asyncio

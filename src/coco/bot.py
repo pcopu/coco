@@ -6134,6 +6134,11 @@ async def _bind_selected_folder_to_topic(
         )
         return False, f"Failed to start app-server session: {e}", ""
 
+    session_manager.mark_window_pending_session_start_reason(
+        created_wid,
+        "resume" if resume_thread_id else "fresh_start",
+    )
+
     if pending_thread_id is not None:
         session_manager.bind_topic_to_codex_thread(
             user_id=user_id,

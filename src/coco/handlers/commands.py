@@ -461,7 +461,46 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if await _is_window_in_progress(user.id, thread_id, wid):
-        existing_internal = queued_topic_input_count(user.id, thread_id)
+        native_attempts = 0
+        native_error = ""
+        can_try_native_queue = (
+            _codex_app_server_enabled()
+            and not session_manager.is_window_external_turn_active(wid)
+            and bool(binding.codex_thread_id)
+            and (
+                bool(session_manager.get_window_codex_active_turn_id(wid))
+                or codex_app_server_client.is_turn_in_progress(binding.codex_thread_id)
+            )
+        )
+        if can_try_native_queue:
+            native_attempts = 1
+            success, native_error = await session_manager.send_topic_text_to_window(
+                user_id=user.id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                window_id=wid,
+                text=queued_text,
+            )
+            if success:
+                await _set_hourglass_reaction(update.message)
+                emit_telemetry(
+                    "queue.q_native_enqueued",
+                    user_id=user.id,
+                    thread_id=thread_id,
+                    window_id=wid,
+                    used_native_queue=True,
+                    native_attempts=1,
+                    native_error="",
+                    text_len=len(queued_text),
+                )
+                logger.info(
+                    "Queued /q input via native app-server follow-up (user=%d, thread=%d, window=%s)",
+                    user.id,
+                    thread_id,
+                    wid,
+                )
+                return
+
         qsize = enqueue_queued_topic_input(
             user.id,
             thread_id,
@@ -483,8 +522,8 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             window_id=wid,
             queue_size=qsize,
             used_native_queue=False,
-            native_attempts=0,
-            native_error="",
+            native_attempts=native_attempts,
+            native_error=native_error,
             text_len=len(queued_text),
         )
         logger.info(

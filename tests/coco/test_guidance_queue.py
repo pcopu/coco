@@ -1005,6 +1005,220 @@ async def test_q_enqueues_internal_queue_and_updates_dock_when_in_progress(monke
 
 
 @pytest.mark.asyncio
+async def test_q_uses_native_queue_when_app_server_turn_is_active(monkeypatch):
+    events: list[str] = []
+    telemetry: list[tuple[str, dict[str, object]]] = []
+
+    class _Chat:
+        type = "supergroup"
+        id = -100321
+
+    class _Message:
+        def __init__(self) -> None:
+            self.text = "/q next task"
+            self.chat = _Chat()
+            self.chat_id = self.chat.id
+            self.message_thread_id = 777
+            self.message_id = 888
+
+    message = _Message()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1147817421),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(
+        bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@77",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-77",
+            cwd="/tmp/project",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _wid: "turn-77",
+    )
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return True
+
+    async def _set_hourglass(_message):
+        events.append("hourglass")
+
+    async def _send_topic_text_to_window(**_kwargs):
+        events.append(f"native:{_kwargs['window_id']}:{_kwargs['text']}")
+        return True, ""
+
+    def _unexpected_enqueue(*_args, **_kwargs):
+        raise AssertionError("internal queue should not be used when native queue succeeds")
+
+    async def _unexpected_sync_dock(*_args, **_kwargs):
+        raise AssertionError("queue dock should not update for native queue")
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _set_hourglass)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "enqueue_queued_topic_input", _unexpected_enqueue)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _unexpected_sync_dock)
+    monkeypatch.setattr(
+        bot,
+        "emit_telemetry",
+        lambda event, **fields: telemetry.append((event, fields)),
+    )
+
+    await bot.queue_command(update, context)
+
+    assert events == ["native:@77:next task", "hourglass"]
+    assert telemetry == [
+        (
+            "queue.q_native_enqueued",
+            {
+                "user_id": 1147817421,
+                "thread_id": 777,
+                "window_id": "@77",
+                "used_native_queue": True,
+                "native_attempts": 1,
+                "native_error": "",
+                "text_len": len("next task"),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_q_falls_back_to_internal_queue_when_native_queue_fails(monkeypatch):
+    events: list[str] = []
+    telemetry: list[tuple[str, dict[str, object]]] = []
+
+    class _Chat:
+        type = "supergroup"
+        id = -100321
+
+    class _Message:
+        def __init__(self) -> None:
+            self.text = "/q next task"
+            self.chat = _Chat()
+            self.chat_id = self.chat.id
+            self.message_thread_id = 777
+            self.message_id = 888
+
+    message = _Message()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1147817421),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(
+        bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@77",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-77",
+            cwd="/tmp/project",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _wid: "turn-77",
+    )
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return True
+
+    async def _set_hourglass(_message):
+        events.append("hourglass")
+
+    async def _send_topic_text_to_window(**_kwargs):
+        events.append("native_attempt")
+        return False, "native queue unsupported"
+
+    def _enqueue(_uid: int, _tid: int, _text: str, _chat_id: int, _msg_id: int):
+        events.append("internal_queue")
+        return 1
+
+    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
+        events.append(f"dock_sync:{window_id}")
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _set_hourglass)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "enqueue_queued_topic_input", _enqueue)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(
+        bot,
+        "emit_telemetry",
+        lambda event, **fields: telemetry.append((event, fields)),
+    )
+
+    await bot.queue_command(update, context)
+
+    assert events == ["native_attempt", "internal_queue", "hourglass", "dock_sync:@77"]
+    assert telemetry == [
+        (
+            "queue.q_internal_enqueued",
+            {
+                "user_id": 1147817421,
+                "thread_id": 777,
+                "window_id": "@77",
+                "queue_size": 1,
+                "used_native_queue": False,
+                "native_attempts": 1,
+                "native_error": "native queue unsupported",
+                "text_len": len("next task"),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch):
     mq.clear_queued_topic_inputs(1147817421, 777)
     mq.enqueue_queued_topic_input(1147817421, 777, "first queued task", -100321, 111)

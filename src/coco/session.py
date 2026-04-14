@@ -61,6 +61,7 @@ TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL = "host_follow_final"
 EXPECTED_TRANSCRIPT_USER_ECHO_MAX_AGE_SECONDS = 120.0
 CODEX_SERVICE_TIERS = frozenset({"fast", "flex"})
 TRANSCRIPTION_PROFILES = frozenset({"compatible", "auto"})
+SESSION_START_REASONS = frozenset({"fresh_start", "resume", "after_clear"})
 
 
 @dataclass
@@ -324,6 +325,11 @@ class SessionManager:
         repr=False,
     )
     _external_turn_active_by_window: dict[str, bool] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _pending_session_start_reason_by_window: dict[str, str] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -1195,8 +1201,34 @@ class SessionManager:
         """Clear session association for a window (e.g., after /clear command)."""
         state = self.get_window_state(window_id)
         state.session_id = ""
+        self.mark_window_pending_session_start_reason(window_id, "after_clear")
         self._save_state()
         logger.info("Cleared session for window_id %s", window_id)
+
+    @staticmethod
+    def _normalize_session_start_reason(reason: str) -> str:
+        """Normalize one-shot session-start reason labels."""
+        normalized = reason.strip().lower()
+        return normalized if normalized in SESSION_START_REASONS else ""
+
+    def mark_window_pending_session_start_reason(self, window_id: str, reason: str) -> None:
+        """Remember a one-shot session-start reason for the next Codex turn."""
+        normalized_window_id = window_id.strip()
+        normalized_reason = self._normalize_session_start_reason(reason)
+        if not normalized_window_id:
+            return
+        if not normalized_reason:
+            self._pending_session_start_reason_by_window.pop(normalized_window_id, None)
+            return
+        self._pending_session_start_reason_by_window[normalized_window_id] = normalized_reason
+
+    def peek_window_pending_session_start_reason(self, window_id: str) -> str:
+        """Return the pending one-shot session-start reason for a window, if any."""
+        return self._pending_session_start_reason_by_window.get(window_id.strip(), "")
+
+    def consume_window_pending_session_start_reason(self, window_id: str) -> str:
+        """Consume and return the pending one-shot session-start reason for a window."""
+        return self._pending_session_start_reason_by_window.pop(window_id.strip(), "")
 
     def get_window_approval_mode(self, window_id: str) -> str:
         """Get the per-window approval mode override (empty means inherit)."""
@@ -2793,14 +2825,19 @@ class SessionManager:
         workspace_path: str,
         can_write: bool,
         approval_policy: str,
+        session_start_reason: str = "",
     ) -> str:
         """Build one short runtime context note to avoid stale read-only assumptions."""
         write_state = "enabled" if can_write else "disabled"
+        session_reason_line = ""
+        if session_start_reason:
+            session_reason_line = f"Session start reason: {session_start_reason}\n"
         return (
             "[coco runtime context]\n"
             f"Workspace: {workspace_path}\n"
             f"Filesystem write access: {write_state}\n"
             f"Approval policy: {approval_policy}\n"
+            f"{session_reason_line}"
             "Telegram attachments: to upload a workspace file for the user, "
             'append a standalone line exactly like '
             '<telegram-attachment path="relative/path.pdf" /> '
@@ -3056,6 +3093,7 @@ class SessionManager:
         resumed_turn_id = self._extract_lifecycle_turn_id(result)
         self.set_window_codex_thread_id(window_id, resumed_thread_id)
         self.set_window_codex_active_turn_id(window_id, resumed_turn_id)
+        self.mark_window_pending_session_start_reason(window_id, "resume")
         state = self.get_window_state(window_id)
         if cwd and state.cwd != cwd:
             state.cwd = cwd
@@ -3272,6 +3310,10 @@ class SessionManager:
             model_slug, reasoning_effort = self.get_window_topic_model_selection(window_id)
         if not service_tier:
             service_tier = self.get_window_topic_service_tier_selection(window_id)
+        had_thread_before = bool(self.get_window_codex_thread_id(window_id))
+        pending_session_start_reason = self.peek_window_pending_session_start_reason(
+            window_id
+        )
         ensure_kwargs: dict[str, str] = {}
         if model_slug:
             ensure_kwargs["model"] = model_slug
@@ -3285,10 +3327,14 @@ class SessionManager:
             **ensure_kwargs,
         )
         workspace_path, can_write = self._runtime_write_state(cwd)
+        session_start_reason = pending_session_start_reason
+        if not session_start_reason and not had_thread_before and thread_id:
+            session_start_reason = "fresh_start"
         runtime_hint = self._build_runtime_capability_hint(
             workspace_path=workspace_path,
             can_write=can_write,
             approval_policy=approval_policy,
+            session_start_reason=session_start_reason,
         )
         normalized_inputs = self._normalize_app_server_inputs(inputs)
         turn_inputs = [{"type": "text", "text": runtime_hint}, *normalized_inputs]
@@ -3335,6 +3381,8 @@ class SessionManager:
             state.cwd = cwd
         if window_name and state.window_name != window_name:
             state.window_name = window_name
+        if pending_session_start_reason:
+            self.consume_window_pending_session_start_reason(window_id)
         self._save_state()
         self.note_window_input(window_id, window_name=window_name, cwd=cwd)
         expected_transcript_text = self._build_expected_transcript_user_text(turn_inputs)
