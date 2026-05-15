@@ -541,6 +541,101 @@ async def test_resume_latest_codex_session_for_window_syncs_topic_model_selectio
     assert binding.reasoning_effort == "high"
 
 
+@pytest.mark.asyncio
+async def test_get_topic_goal_reads_existing_codex_thread(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-1",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    calls: list[str] = []
+
+    async def _thread_goal_get(*, thread_id: str):
+        calls.append(thread_id)
+        return {"goal": {"objective": "Ship the goal feature", "status": "active"}}
+
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_goal_get", _thread_goal_get)
+
+    ok, payload, message = await mgr.get_topic_goal(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+    )
+
+    assert ok is True
+    assert payload == {"goal": {"objective": "Ship the goal feature", "status": "active"}}
+    assert message == ""
+    assert calls == ["thread-1"]
+
+
+@pytest.mark.asyncio
+async def test_set_topic_goal_creates_thread_for_window_when_missing(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_thread(100, 1, "@1", window_name="proj")
+    mgr.get_window_state("@1").cwd = "/tmp/proj"
+    ensure_calls: list[tuple[str, str]] = []
+    set_calls: list[tuple[str, str]] = []
+
+    async def _ensure_codex_thread_for_window(*, window_id: str, cwd: str, **_kwargs):
+        ensure_calls.append((window_id, cwd))
+        mgr.set_window_codex_thread_id(window_id, "thread-new")
+        return "thread-new", "on-request"
+
+    async def _thread_goal_set(*, thread_id: str, goal: str):
+        set_calls.append((thread_id, goal))
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    monkeypatch.setattr(mgr, "_ensure_codex_thread_for_window", _ensure_codex_thread_for_window)
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_goal_set", _thread_goal_set)
+
+    ok, payload, message = await mgr.set_topic_goal(
+        user_id=100,
+        thread_id=1,
+        goal_text="Ship the goal feature",
+    )
+
+    assert ok is True
+    assert payload == {"goal": {"objective": "Ship the goal feature", "status": "active"}}
+    assert message == ""
+    assert ensure_calls == [("@1", "/tmp/proj")]
+    assert set_calls == [("thread-new", "Ship the goal feature")]
+
+
+@pytest.mark.asyncio
+async def test_get_topic_goal_rejects_remote_machine_binding(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local Node"))
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-1",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote Node",
+    )
+
+    ok, payload, message = await mgr.get_topic_goal(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+    )
+
+    assert ok is False
+    assert payload is None
+    assert "Remote" in message or "remote" in message
+
+
 class TestRuntimeCapabilityHint:
     def test_runtime_hint_includes_telegram_attachment_protocol(self):
         hint = SessionManager._build_runtime_capability_hint(

@@ -18,6 +18,7 @@ def main() -> None:
         "approvals",
         "mentions",
         "allowed",
+        "plugins",
         "skills",
         "worktree",
         "restart",

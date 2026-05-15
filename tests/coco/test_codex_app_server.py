@@ -72,6 +72,20 @@ class _FakeStdoutOverrun:
         return b"x" * n
 
 
+def test_app_server_argv_enables_goals_feature(monkeypatch):
+    client = cas.CodexAppServerClient()
+
+    monkeypatch.setattr(client, "_resolve_codex_binary", lambda: "/usr/bin/codex")
+    monkeypatch.setattr(cas.config, "codex_sandbox_mode", "")
+
+    argv = client._app_server_argv()
+
+    assert argv[:4] == ["/usr/bin/codex", "app-server", "--listen", "stdio://"]
+    assert "--enable" in argv
+    enable_idx = argv.index("--enable")
+    assert argv[enable_idx + 1] == "goals"
+
+
 @pytest.mark.asyncio
 async def test_ensure_started_runs_initialize_handshake_once(monkeypatch):
     client = cas.CodexAppServerClient()
@@ -154,6 +168,12 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
             return {"thread": {"id": "th_main"}}
         if method == "thread/rollback":
             return {"threadId": "th_main"}
+        if method == "thread/goal/get":
+            return {"goal": {"objective": "Ship the feature", "status": "active"}}
+        if method == "thread/goal/set":
+            return {"goal": {"objective": "Ship the feature", "status": "active"}}
+        if method == "thread/goal/clear":
+            return {"cleared": True}
         return {}
 
     monkeypatch.setattr(client, "request", _request)
@@ -163,12 +183,21 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
     listed = await client.thread_list(limit=10)
     read = await client.thread_read(thread_id="th_main")
     rolled = await client.thread_rollback(thread_id="th_main", num_turns=2)
+    goal = await client.thread_goal_get(thread_id="th_main")
+    updated_goal = await client.thread_goal_set(
+        thread_id="th_main",
+        goal="Ship the feature",
+    )
+    cleared_goal = await client.thread_goal_clear(thread_id="th_main")
 
     assert forked["thread"]["id"] == "th_forked"
     assert resumed["thread"]["id"] == "th_resumed"
     assert listed["threads"][0]["id"] == "th_main"
     assert read["thread"]["id"] == "th_main"
     assert rolled["threadId"] == "th_main"
+    assert goal["goal"]["objective"] == "Ship the feature"
+    assert updated_goal["goal"]["status"] == "active"
+    assert cleared_goal["cleared"] is True
     assert calls[0] == (
         "thread/fork",
         {"threadId": "th_main", "turnId": "turn_1", "serviceTier": "fast"},
@@ -193,6 +222,21 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
         "thread/rollback",
         {"threadId": "th_main", "numTurns": 2},
         120.0,
+    )
+    assert calls[5] == (
+        "thread/goal/get",
+        {"threadId": "th_main"},
+        30.0,
+    )
+    assert calls[6] == (
+        "thread/goal/set",
+        {"threadId": "th_main", "goal": "Ship the feature"},
+        60.0,
+    )
+    assert calls[7] == (
+        "thread/goal/clear",
+        {"threadId": "th_main"},
+        30.0,
     )
 
 

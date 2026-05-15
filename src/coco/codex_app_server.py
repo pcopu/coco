@@ -26,6 +26,7 @@ ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] 
 # JSONL payloads; use a larger cap to avoid read-loop termination.
 APP_SERVER_STREAM_LIMIT = 1024 * 1024
 TIMEOUT_RECYCLE_METHODS = frozenset({"thread/start", "turn/start", "turn/steer"})
+APP_SERVER_ENABLED_FEATURES = ("goals",)
 
 
 class CodexAppServerError(RuntimeError):
@@ -87,6 +88,9 @@ class CodexAppServerClient:
 
     def _app_server_argv(self) -> list[str]:
         argv = [self._resolve_codex_binary(), "app-server", "--listen", "stdio://"]
+
+        for feature_name in APP_SERVER_ENABLED_FEATURES:
+            argv.extend(["--enable", feature_name])
 
         # By default, Codex may sandbox tool execution (read-only + no network),
         # which breaks common workflows like `git pull`. Configure the app-server
@@ -673,6 +677,37 @@ class CodexAppServerClient:
         elif turn_id:
             params["turnId"] = turn_id
         result = await self.request("thread/rollback", params, timeout=120.0)
+        return result if isinstance(result, dict) else {}
+
+    async def thread_goal_get(
+        self,
+        *,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        params = {"threadId": thread_id}
+        result = await self.request("thread/goal/get", params, timeout=30.0)
+        return result if isinstance(result, dict) else {}
+
+    async def thread_goal_set(
+        self,
+        *,
+        thread_id: str,
+        goal: str,
+    ) -> dict[str, Any]:
+        params = {
+            "threadId": thread_id,
+            "goal": goal,
+        }
+        result = await self.request("thread/goal/set", params, timeout=60.0)
+        return result if isinstance(result, dict) else {}
+
+    async def thread_goal_clear(
+        self,
+        *,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        params = {"threadId": thread_id}
+        result = await self.request("thread/goal/clear", params, timeout=30.0)
         return result if isinstance(result, dict) else {}
 
     async def turn_start(

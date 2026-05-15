@@ -129,3 +129,36 @@ def test_command_cli_transcription_reports_status(monkeypatch, capsys):
     assert code == 0
     assert "Server transcription mode: `COMPATIBLE`" in out
     assert "Resolved here: `cpu / int8 / base`" in out
+
+
+def test_command_cli_goal_status_reads_topic_goal(monkeypatch, capsys):
+    monkeypatch.setattr(command_cli.bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(command_cli.bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        command_cli.bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def _get_topic_goal(*_args, **_kwargs):
+        return True, {"goal": {"objective": "Ship the goal feature", "status": "active"}}, ""
+
+    monkeypatch.setattr(command_cli.bot.session_manager, "get_topic_goal", _get_topic_goal)
+
+    code = command_cli.main(
+        [
+            "goal",
+            "status",
+            "--user-id",
+            "1147817421",
+            "--chat-id",
+            "-100123",
+            "--thread-id",
+            "77",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Goal: `active`" in out
+    assert "Ship the goal feature" in out

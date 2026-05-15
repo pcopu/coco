@@ -237,6 +237,8 @@ def test_topic_cli_json_includes_capabilities_and_state(monkeypatch, capsys):
         "active_turn_id": "turn_456",
     }
     assert "mentions" in payload["commands"]["available"]
+    assert "goal" in payload["commands"]["available"]
+    assert payload["commands"]["examples"]["goal"] == "coco goal"
     assert payload["commands"]["examples"]["looper"] == "coco looper start plans/ship.md done --every 15m"
     assert payload["transcription"] == {
         "mode": "compatible",

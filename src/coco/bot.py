@@ -213,7 +213,10 @@ _status_poll_task: asyncio.Task | None = None
 _controller_rpc_server: ControllerRpcServer | None = None
 _update_check_task: asyncio.Task | None = None
 
-# Track whether this turn already produced a dedicated final assistant text item.
+# Track whether this turn already produced user-visible terminal output.
+# This is usually a final assistant text item, but image/document-only tool
+# output should also suppress the misleading "no final assistant response"
+# fallback on turn completion.
 _turn_has_final_text: dict[str, bool] = {}
 # Track transient app-server turn failures that should trigger one guarded retry
 # after the failing turn fully completes.
@@ -4376,6 +4379,11 @@ async def apps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await command_handlers.apps_command(update, context)
 
 
+async def plugins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from .handlers import commands as command_handlers
+    await command_handlers.plugins_command(update, context)
+
+
 def _build_apps_panel_payload_for_topic(
     *,
     user_id: int,
@@ -6510,6 +6518,332 @@ def _load_codex_default_service_tier() -> str:
     return "flex"
 
 
+def _codex_config_path() -> Path:
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _codex_plugins_cache_root() -> Path:
+    return Path.home() / ".codex" / "plugins" / "cache"
+
+
+def _codex_tmp_plugins_root() -> Path:
+    return Path.home() / ".codex" / ".tmp" / "plugins"
+
+
+def _load_codex_config_toml() -> dict[str, object]:
+    """Best-effort load of ~/.codex/config.toml."""
+    config_path = _codex_config_path()
+    if not config_path.is_file():
+        return {}
+    try:
+        with config_path.open("rb") as f:
+            loaded = tomllib.load(f)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception as e:
+        logger.debug("Failed reading Codex config %s: %s", config_path, e)
+        return {}
+
+
+def _discover_cached_codex_plugins() -> list[dict[str, object]]:
+    """Read installed plugin metadata from ~/.codex/plugins/cache."""
+    cache_root = _codex_plugins_cache_root()
+    entries: list[dict[str, object]] = []
+    if not cache_root.is_dir():
+        return entries
+
+    for plugin_json in sorted(cache_root.glob("*/*/*/.codex-plugin/plugin.json")):
+        try:
+            payload = json.loads(plugin_json.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.debug("Failed reading plugin manifest %s: %s", plugin_json, e)
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+        market = plugin_json.parents[2].name
+        plugin_name = str(payload.get("name", plugin_json.parents[1].name)).strip()
+        plugin_id = f"{plugin_name}@{market}"
+        interface = payload.get("interface")
+        display_name = plugin_name
+        if isinstance(interface, dict):
+            raw_display = interface.get("displayName")
+            if isinstance(raw_display, str) and raw_display.strip():
+                display_name = raw_display.strip()
+        version = payload.get("version")
+        if not isinstance(version, str):
+            version = ""
+
+        entries.append(
+            {
+                "plugin_id": plugin_id,
+                "name": plugin_name,
+                "display_name": display_name,
+                "enabled": False,
+                "installed": True,
+                "version": version,
+                "manifest_path": str(plugin_json),
+            }
+        )
+
+    return entries
+
+
+def _load_codex_plugin_inventory() -> list[dict[str, object]]:
+    """Merge Codex config plugin flags with cached plugin manifests."""
+    cfg = _load_codex_config_toml()
+    plugins_cfg = cfg.get("plugins")
+    cached = _discover_cached_codex_plugins()
+    by_id: dict[str, dict[str, object]] = {
+        str(item["plugin_id"]): dict(item) for item in cached if item.get("plugin_id")
+    }
+
+    if isinstance(plugins_cfg, dict):
+        for raw_plugin_id, plugin_cfg in plugins_cfg.items():
+            if not isinstance(raw_plugin_id, str):
+                continue
+            entry = by_id.setdefault(
+                raw_plugin_id,
+                {
+                    "plugin_id": raw_plugin_id,
+                    "name": raw_plugin_id.split("@", 1)[0],
+                    "display_name": raw_plugin_id.split("@", 1)[0],
+                    "enabled": False,
+                    "installed": False,
+                    "version": "",
+                    "manifest_path": "",
+                },
+            )
+            if isinstance(plugin_cfg, dict):
+                enabled = plugin_cfg.get("enabled")
+                entry["enabled"] = bool(enabled) if isinstance(enabled, bool) else bool(
+                    entry.get("enabled")
+                )
+
+    inventory = list(by_id.values())
+    inventory.sort(
+        key=lambda item: (
+            not bool(item.get("enabled")),
+            str(item.get("display_name") or item.get("name") or item.get("plugin_id")).lower(),
+        )
+    )
+    return inventory
+
+
+def _load_codex_marketplaces() -> list[dict[str, str]]:
+    """Discover local plugin marketplace checkouts under ~/.codex/.tmp/plugins."""
+    root = _codex_tmp_plugins_root()
+    marketplace_json = root / ".agents" / "plugins" / "marketplace.json"
+    if not marketplace_json.is_file():
+        return []
+    try:
+        payload = json.loads(marketplace_json.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug("Failed reading marketplace metadata %s: %s", marketplace_json, e)
+        return []
+
+    name = str(payload.get("name", "")).strip() or "unknown"
+    display_name = name
+    interface = payload.get("interface")
+    if isinstance(interface, dict):
+        raw_display = interface.get("displayName")
+        if isinstance(raw_display, str) and raw_display.strip():
+            display_name = raw_display.strip()
+    return [
+        {
+            "name": name,
+            "display_name": display_name,
+            "root_path": str(root),
+        }
+    ]
+
+
+def _load_codex_marketplace_plugin_inventory() -> list[dict[str, object]]:
+    """Discover installable plugin definitions from local marketplace checkout."""
+    marketplaces = _load_codex_marketplaces()
+    installed = {
+        str(item.get("plugin_id")): item for item in _load_codex_plugin_inventory()
+    }
+    rows: list[dict[str, object]] = []
+    for market in marketplaces:
+        market_name = str(market.get("name", "")).strip()
+        market_root = Path(str(market.get("root_path", "")))
+        plugins_root = market_root / "plugins"
+        if not market_name or not plugins_root.is_dir():
+            continue
+        for plugin_json in sorted(plugins_root.glob("*/.codex-plugin/plugin.json")):
+            plugin_dir = plugin_json.parent.parent
+            try:
+                payload = json.loads(plugin_json.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.debug("Failed reading marketplace plugin %s: %s", plugin_json, e)
+                continue
+            if not isinstance(payload, dict):
+                continue
+            name = str(payload.get("name", plugin_dir.name)).strip() or plugin_dir.name
+            plugin_id = f"{name}@{market_name}"
+            interface = payload.get("interface")
+            display_name = name
+            category = ""
+            if isinstance(interface, dict):
+                raw_display = interface.get("displayName")
+                if isinstance(raw_display, str) and raw_display.strip():
+                    display_name = raw_display.strip()
+                raw_category = interface.get("category")
+                if isinstance(raw_category, str) and raw_category.strip():
+                    category = raw_category.strip()
+            if not category:
+                raw_category = payload.get("category")
+                if isinstance(raw_category, str) and raw_category.strip():
+                    category = raw_category.strip()
+            entry = installed.get(plugin_id, {})
+            rows.append(
+                {
+                    "plugin_id": plugin_id,
+                    "name": name,
+                    "display_name": display_name,
+                    "category": category,
+                    "marketplace_name": market_name,
+                    "source_path": str(plugin_dir),
+                    "installed": bool(entry.get("installed")),
+                    "enabled": bool(entry.get("enabled")),
+                }
+            )
+    rows.sort(
+        key=lambda item: (
+            str(item.get("display_name") or item.get("name") or item.get("plugin_id")).lower()
+        )
+    )
+    return rows
+
+
+def _search_codex_marketplace_plugins(
+    query: str,
+    *,
+    limit: int = 12,
+) -> list[dict[str, object]]:
+    """Search locally available marketplace plugins by id/name/display/category."""
+    needle = query.strip().lower()
+    inventory = _load_codex_marketplace_plugin_inventory()
+    if not needle:
+        return inventory[:limit]
+    matches: list[dict[str, object]] = []
+    for item in inventory:
+        haystack = " ".join(
+            [
+                str(item.get("plugin_id", "")),
+                str(item.get("name", "")),
+                str(item.get("display_name", "")),
+                str(item.get("category", "")),
+                str(item.get("marketplace_name", "")),
+            ]
+        ).lower()
+        if needle in haystack:
+            matches.append(item)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def _find_codex_plugin(
+    inventory: list[dict[str, object]],
+    identifier: str,
+) -> dict[str, object] | None:
+    """Resolve a plugin by id, name, or display name."""
+    needle = identifier.strip().lower()
+    if not needle:
+        return None
+    for item in inventory:
+        values = {
+            str(item.get("plugin_id", "")).strip().lower(),
+            str(item.get("name", "")).strip().lower(),
+            str(item.get("display_name", "")).strip().lower(),
+        }
+        if needle in values:
+            return item
+    return None
+
+
+def _build_codex_plugins_overview_text(inventory: list[dict[str, object]] | None = None) -> str:
+    """Render a compact Codex plugin overview for Telegram."""
+    inventory = inventory if inventory is not None else _load_codex_plugin_inventory()
+    lines = ["🧩 Codex Plugins", ""]
+    if not inventory:
+        lines.append("No Codex plugins were found in `~/.codex/plugins/cache`.")
+        lines.append("")
+        lines.append(
+            "Use the Codex Plugins UI to install a plugin first, then manage its enabled state here."
+        )
+        return "\n".join(lines)
+
+    for item in inventory:
+        display = str(item.get("display_name") or item.get("name") or item.get("plugin_id"))
+        plugin_id = str(item.get("plugin_id", "unknown"))
+        version = str(item.get("version", "")).strip()
+        state = "enabled" if bool(item.get("enabled")) else "disabled"
+        installed = bool(item.get("installed"))
+        suffix_parts = [state]
+        if installed:
+            suffix_parts.append("installed")
+        else:
+            suffix_parts.append("config only")
+        if version:
+            suffix_parts.append(f"v{version}")
+        lines.append(f"• {display} - `{plugin_id}` ({', '.join(suffix_parts)})")
+
+    lines.append("")
+    lines.append("Use `/plugins enable <plugin>` or `/plugins disable <plugin>`.")
+    return "\n".join(lines)
+
+
+def _build_codex_marketplaces_overview_text(
+    marketplaces: list[dict[str, str]] | None = None,
+) -> str:
+    """Render local marketplace checkouts visible to CoCo."""
+    marketplaces = marketplaces if marketplaces is not None else _load_codex_marketplaces()
+    lines = ["🧭 Codex Marketplaces", ""]
+    if not marketplaces:
+        lines.append("No local marketplace checkout was found.")
+        return "\n".join(lines)
+    for item in marketplaces:
+        display = item.get("display_name") or item.get("name") or "unknown"
+        name = item.get("name") or "unknown"
+        root_path = item.get("root_path") or ""
+        lines.append(f"• {display} - `{name}`")
+        if root_path:
+            lines.append(f"  {root_path}")
+    lines.append("")
+    lines.append("Use `/plugins search <term>` to browse locally available plugins.")
+    return "\n".join(lines)
+
+
+def _build_codex_marketplace_search_text(
+    query: str,
+    matches: list[dict[str, object]],
+) -> str:
+    """Render marketplace search results."""
+    lines = [f"🔎 Marketplace Matches for `{query.strip()}`", ""]
+    if not matches:
+        lines.append("No matching marketplace plugins were found.")
+        return "\n".join(lines)
+    for item in matches:
+        display = str(item.get("display_name") or item.get("name") or item.get("plugin_id"))
+        plugin_id = str(item.get("plugin_id", "unknown"))
+        category = str(item.get("category", "")).strip()
+        flags: list[str] = []
+        if bool(item.get("installed")):
+            flags.append("installed")
+        if bool(item.get("enabled")):
+            flags.append("enabled")
+        suffix = f" ({', '.join(flags)})" if flags else ""
+        if category:
+            lines.append(f"• {display} - `{plugin_id}` [{category}]{suffix}")
+        else:
+            lines.append(f"• {display} - `{plugin_id}`{suffix}")
+    lines.append("")
+    lines.append("Use `/plugins install <plugin>` to copy one into the local Codex cache.")
+    return "\n".join(lines)
+
+
 def _load_codex_model_catalog() -> dict[str, object]:
     """Load current model config + model catalog from local Codex files."""
     config_path = Path.home() / ".codex" / "config.toml"
@@ -6774,6 +7108,179 @@ def _set_codex_config_value(key: str, value: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _set_codex_plugin_enabled(plugin_id: str, enabled: bool) -> tuple[bool, str]:
+    """Set one [plugins."<id>"].enabled flag in ~/.codex/config.toml."""
+    normalized_id = plugin_id.strip()
+    if not normalized_id:
+        return False, "Plugin id cannot be empty."
+
+    config_path = _codex_config_path()
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    except OSError as e:
+        return False, f"Failed to read config: {e}"
+
+    section_header = f'[plugins.{_toml_string(normalized_id)}]'
+    desired_line = f"enabled = {'true' if enabled else 'false'}"
+    lines = content.splitlines()
+
+    start = None
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if line.strip() == section_header:
+            start = i
+            for j in range(i + 1, len(lines)):
+                maybe_header = lines[j].strip()
+                if maybe_header.startswith("[") and maybe_header.endswith("]"):
+                    end = j
+                    break
+            break
+
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(section_header)
+        lines.append(desired_line)
+    else:
+        updated = False
+        for k in range(start + 1, end):
+            stripped = lines[k].strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            left, sep, _right = lines[k].partition("=")
+            if sep and left.strip() == "enabled":
+                indent = lines[k][: len(lines[k]) - len(lines[k].lstrip())]
+                lines[k] = f"{indent}{desired_line}"
+                updated = True
+                break
+        if not updated:
+            lines.insert(start + 1, desired_line)
+
+    new_content = "\n".join(lines)
+    if lines:
+        new_content += "\n"
+    try:
+        config_path.write_text(new_content, encoding="utf-8")
+    except OSError as e:
+        return False, f"Failed to write config: {e}"
+    return True, ""
+
+
+def _run_codex_marketplace_command(argv: list[str]) -> tuple[bool, str]:
+    """Run one `codex plugin marketplace ...` command and summarize the result."""
+    codex_binary = _resolve_codex_exec_binary()
+    if not codex_binary:
+        return False, "Codex CLI executable not found in PATH."
+    ok, stdout, stderr, err = _run_command_sync(
+        [codex_binary, "plugin", "marketplace", *argv],
+        timeout_seconds=60,
+    )
+    if ok:
+        summary = _tail_text(stdout or stderr or "OK", limit=700)
+        return True, summary or "OK"
+    details = _tail_text(stderr or stdout or err, limit=700)
+    return False, details or err or "Marketplace command failed."
+
+
+def _install_codex_marketplace_plugin(plugin_id: str) -> tuple[bool, str]:
+    """Copy a marketplace plugin into the local Codex cache and enable it."""
+    target = None
+    for item in _load_codex_marketplace_plugin_inventory():
+        if str(item.get("plugin_id", "")).strip().lower() == plugin_id.strip().lower():
+            target = item
+            break
+    if not target:
+        return False, f"Unknown marketplace plugin: {plugin_id}"
+
+    market_name = str(target.get("marketplace_name", "")).strip()
+    plugin_name = str(target.get("name", "")).strip()
+    source_path_raw = str(target.get("source_path", "")).strip()
+    if not market_name or not plugin_name or not source_path_raw:
+        return False, f"Marketplace plugin metadata is incomplete for {plugin_id}"
+
+    source_path = Path(source_path_raw)
+    if not source_path.is_dir():
+        return False, f"Marketplace source path does not exist: {source_path}"
+
+    checkout_root = _codex_tmp_plugins_root()
+    revision = "manual"
+    git_dir = checkout_root / ".git"
+    if git_dir.exists():
+        ok, stdout, _stderr, _err = _run_command_sync(
+            ["git", "-C", str(checkout_root), "rev-parse", "--short=8", "HEAD"],
+            timeout_seconds=15,
+        )
+        if ok and stdout.strip():
+            revision = stdout.strip()
+
+    dest_root = _codex_plugins_cache_root() / market_name / plugin_name
+    dest_path = dest_root / revision
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        if not dest_path.exists():
+            shutil.copytree(source_path, dest_path)
+    except OSError as e:
+        return False, f"Failed copying plugin into cache: {e}"
+
+    ok, err = _set_codex_plugin_enabled(f"{plugin_name}@{market_name}", True)
+    if not ok:
+        return False, err
+    return True, ""
+
+
+def _install_codex_plugin_from_source(
+    plugin_id: str,
+    source_path: str,
+) -> tuple[bool, str]:
+    """Install one plugin by explicit id and source directory path."""
+    normalized_id = plugin_id.strip()
+    raw_source = source_path.strip()
+    if not normalized_id:
+        return False, "Plugin id cannot be empty."
+    if "@" not in normalized_id:
+        return False, "Plugin id must include a marketplace suffix, for example `name@market`."
+    if not raw_source:
+        return False, "Source path cannot be empty."
+
+    name, market = normalized_id.split("@", 1)
+    name = name.strip()
+    market = market.strip()
+    if not name or not market:
+        return False, "Plugin id must look like `name@market`."
+
+    source = Path(raw_source).expanduser()
+    if not source.is_dir():
+        return False, f"Source path does not exist: {source}"
+    manifest = source / ".codex-plugin" / "plugin.json"
+    if not manifest.is_file():
+        return False, f"Plugin manifest not found at: {manifest}"
+
+    revision = "manual"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            raw_version = payload.get("version")
+            if isinstance(raw_version, str) and raw_version.strip():
+                revision = raw_version.strip()
+    except Exception:
+        pass
+
+    dest_root = _codex_plugins_cache_root() / market / name
+    dest_path = dest_root / revision
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        if not dest_path.exists():
+            shutil.copytree(source, dest_path)
+    except OSError as e:
+        return False, f"Failed copying plugin into cache: {e}"
+
+    ok, err = _set_codex_plugin_enabled(normalized_id, True)
+    if not ok:
+        return False, err
+    return True, ""
+
+
 def _ensure_codex_project_trust(
     project_path: Path,
     *,
@@ -6866,6 +7373,11 @@ def _ensure_codex_trust_for_runtime() -> None:
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from .handlers import commands as command_handlers
     await command_handlers.model_command(update, context)
+
+
+async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from .handlers import commands as command_handlers
+    await command_handlers.goal_command(update, context)
 
 
 async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -11921,6 +12433,19 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             if not combined_image_data:
                 combined_image_data = None
 
+        has_visible_nontext_output = bool(combined_image_data or document_data)
+        if (
+            msg.role == "assistant"
+            and msg.is_complete
+            and msg.session_id
+            and has_visible_nontext_output
+        ):
+            # Some turns, notably built-in image generation, can complete with
+            # user-visible tool output but no final assistant text item.
+            # Mark the turn as satisfied so `turn/completed` does not inject the
+            # misleading "without a final assistant response" fallback.
+            _turn_has_final_text[msg.session_id] = True
+
         parts = (
             build_response_parts(
                 delivery_text,
@@ -12043,6 +12568,7 @@ async def post_init(application: Application) -> None:
         BotCommand("mentions", "Toggle mention-only invocation for this session"),
         BotCommand("allowed", "Manage allowed user IDs"),
         BotCommand("apps", "Manage per-topic CoCo apps"),
+        BotCommand("plugins", "Manage machine-level Codex plugins"),
         BotCommand("skills", "Manage per-topic Codex skills"),
         BotCommand("worktree", "List/create/fold git worktrees"),
         BotCommand("restart", "Restart CoCo bot process"),
@@ -12343,11 +12869,13 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("mentions", mentions_command))
     application.add_handler(CommandHandler("allowed", allowed_command))
     application.add_handler(CommandHandler("apps", apps_command))
+    application.add_handler(CommandHandler("plugins", plugins_command))
     application.add_handler(CommandHandler("skills", skills_command))
     application.add_handler(CommandHandler("worktree", worktree_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("goal", goal_command))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("fast", fast_command))
     application.add_handler(CommandHandler("transcription", transcription_command))

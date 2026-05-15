@@ -611,3 +611,42 @@ async def test_turn_completed_uses_warning_when_progress_empty(monkeypatch):
     assert finalized == [(10, "@1", 111, True)]
     assert len(final_content) == 1
     assert "without a final assistant response" in final_content[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_skips_warning_after_image_only_tool_result(monkeypatch):
+    finalized: list[tuple[int, str, int | None, bool]] = []
+    final_content: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+        finalized.append((user_id, window_id, thread_id, compact))
+
+    async def _enqueue_content(**kwargs):
+        final_content.append(kwargs)
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_finalize)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", lambda **_kwargs: None)
+
+    bot._turn_has_final_text["th-image"] = True
+    await bot._handle_codex_app_server_notification(
+        "turn/completed",
+        {"threadId": "th-image", "turn": {"status": "completed"}},
+        bot=object(),
+    )
+
+    assert finalized == [(10, "@1", 111, True)]
+    assert final_content == []

@@ -110,6 +110,7 @@ def _parse_send_args(args: list[str]) -> tuple[str, str, str, str, str]:
 def _command_examples() -> dict[str, str]:
     return {
         "mentions": "coco mentions on",
+        "goal": "coco goal",
         "fast": "coco fast off",
         "transcription": "coco transcription",
         "looper": "coco looper start plans/ship.md done --every 15m",

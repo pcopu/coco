@@ -194,6 +194,7 @@ async def test_handle_new_message_delivers_transcript_tool_result_images_in_tele
     assert len(delivered) == 1
     assert delivered[0]["content_type"] == "tool_result"
     assert delivered[0]["image_data"] == [("image/png", b"png-bytes")]
+    assert bot._turn_has_final_text.get("thread-1") is True
 
 
 @pytest.mark.asyncio

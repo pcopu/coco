@@ -2148,6 +2148,160 @@ class SessionManager:
             return binding.machine_id.strip()
         return ""
 
+    @staticmethod
+    def _format_goal_transport_error(err: Exception) -> str:
+        """Render one user-facing error string for native goal transport failures."""
+        text = str(err).strip() or err.__class__.__name__
+        if "goals feature is disabled" in text.lower():
+            return "Codex goals feature is disabled on this machine."
+        return text
+
+    async def resolve_goal_thread_for_topic(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+        create: bool = False,
+    ) -> tuple[str, str]:
+        """Resolve the native Codex thread id for one topic goal operation."""
+        if thread_id is None:
+            return "", "Use `/goal` inside a named topic."
+
+        binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if binding is None:
+            return "", "No session is bound to this topic. Run `/start` or `/folder` first."
+
+        local_machine_id, _local_machine_name = self._local_machine_identity()
+        machine_id = binding.machine_id.strip()
+        if machine_id and machine_id != local_machine_id:
+            machine_name = binding.machine_display_name.strip() or machine_id
+            return "", f"Goals are not supported for topics bound to remote machine `{machine_name}` yet."
+
+        window_id = binding.window_id.strip()
+        codex_thread_id = binding.codex_thread_id.strip()
+        if not codex_thread_id and window_id:
+            codex_thread_id = self.get_window_codex_thread_id(window_id)
+        if codex_thread_id:
+            return codex_thread_id, ""
+
+        if not create:
+            return "", "No persisted Codex thread is bound yet; no goal is set."
+
+        if not window_id:
+            return "", "No session is bound to this topic. Run `/start` or `/folder` first."
+
+        state = self.get_window_state(window_id)
+        cwd = binding.cwd.strip() or state.cwd.strip()
+        if not cwd:
+            return "", "No workspace is bound to this topic yet. Run `/start` or `/folder` first."
+
+        lock = self._get_window_send_lock(window_id)
+        async with lock:
+            existing_thread_id = self.get_window_codex_thread_id(window_id)
+            if existing_thread_id:
+                return existing_thread_id, ""
+
+            resumed_thread_id = ""
+            try:
+                resumed_thread_id = await self.resume_latest_codex_session_for_window(
+                    window_id=window_id,
+                    cwd=cwd,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Goal thread resume skipped for %s (%s): %s",
+                    window_id,
+                    self.get_display_name(window_id),
+                    e,
+                )
+
+            if resumed_thread_id:
+                return resumed_thread_id, ""
+
+            created_thread_id, _approval_policy = await self._ensure_codex_thread_for_window(
+                window_id=window_id,
+                cwd=cwd,
+            )
+            return created_thread_id, ""
+
+    async def get_topic_goal(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+    ) -> tuple[bool, dict[str, Any] | None, str]:
+        """Read the native Codex goal for one topic."""
+        codex_thread_id, error = await self.resolve_goal_thread_for_topic(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            create=False,
+        )
+        if not codex_thread_id:
+            return False, None, error
+        try:
+            payload = await codex_app_server_client.thread_goal_get(
+                thread_id=codex_thread_id
+            )
+        except Exception as e:
+            return False, None, self._format_goal_transport_error(e)
+        return True, payload, ""
+
+    async def set_topic_goal(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        goal_text: str,
+        chat_id: int | None = None,
+    ) -> tuple[bool, dict[str, Any] | None, str]:
+        """Create/update the native Codex goal for one topic."""
+        normalized_goal_text = goal_text.strip()
+        if not normalized_goal_text:
+            return False, None, "Goal text is required."
+        codex_thread_id, error = await self.resolve_goal_thread_for_topic(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            create=True,
+        )
+        if not codex_thread_id:
+            return False, None, error
+        try:
+            payload = await codex_app_server_client.thread_goal_set(
+                thread_id=codex_thread_id,
+                goal=normalized_goal_text,
+            )
+        except Exception as e:
+            return False, None, self._format_goal_transport_error(e)
+        return True, payload, ""
+
+    async def clear_topic_goal(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+    ) -> tuple[bool, dict[str, Any] | None, str]:
+        """Clear the native Codex goal for one topic."""
+        codex_thread_id, error = await self.resolve_goal_thread_for_topic(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            create=False,
+        )
+        if not codex_thread_id:
+            return False, None, error
+        try:
+            payload = await codex_app_server_client.thread_goal_clear(
+                thread_id=codex_thread_id
+            )
+        except Exception as e:
+            return False, None, self._format_goal_transport_error(e)
+        return True, payload, ""
+
     def get_machine_transcription_profile_selection(self, machine_id: str = "") -> str:
         """Return the server-wide transcription profile for one machine."""
         normalized_machine_id = machine_id.strip()

@@ -16,6 +16,7 @@ _COMMAND_HANDLER_NAMES = {
     "approvals_command",
     "mentions_command",
     "allowed_command",
+    "plugins_command",
     "skills_command",
     "apps_command",
     "looper_command",
@@ -23,6 +24,7 @@ _COMMAND_HANDLER_NAMES = {
     "restart_command",
     "resume_command",
     "status_command",
+    "goal_command",
     "model_command",
     "fast_command",
     "transcription_command",
@@ -126,6 +128,56 @@ def _render_app_server_history(
         text = text[-3900:]
         text = f"📋 [{display_name}] Recent messages\n\n…(truncated)\n{text}"
     return text
+
+
+def _extract_goal_status_and_text(payload: object) -> tuple[str, str]:
+    """Normalize one native goal response into (status, text)."""
+    if not isinstance(payload, dict):
+        return "", ""
+
+    status = ""
+    text = ""
+
+    goal_block = payload.get("goal")
+    if isinstance(goal_block, dict):
+        for key in ("objective", "text", "goal"):
+            value = goal_block.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+        raw_status = goal_block.get("status")
+        if isinstance(raw_status, str) and raw_status.strip():
+            status = raw_status.strip().lower()
+    elif isinstance(goal_block, str) and goal_block.strip():
+        text = goal_block.strip()
+
+    if not text:
+        for key in ("objective", "text"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+    if not status:
+        raw_status = payload.get("status")
+        if isinstance(raw_status, str) and raw_status.strip():
+            status = raw_status.strip().lower()
+
+    return status, text
+
+
+def _render_goal_text(payload: object, *, prefix: str = "") -> str:
+    """Render one native goal response for Telegram/CLI output."""
+    status, text = _extract_goal_status_and_text(payload)
+    lines: list[str] = []
+    if prefix:
+        lines.append(prefix)
+    if status:
+        lines.append(f"Goal: `{status}`")
+    if text:
+        lines.append(text)
+    if not lines:
+        return "No goal is set for this Codex thread."
+    return "\n".join(lines)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1173,6 +1225,216 @@ async def apps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def plugins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _sync_bot_globals()
+    """Manage machine-level Codex plugins via ~/.codex config/cache."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not await _ensure_chat_allowed(update):
+        return
+    if not update.message:
+        return
+    if not _is_admin_user(user.id):
+        await safe_reply(update.message, "❌ Only admins can manage Codex plugins.")
+        return
+
+    raw_args = _extract_command_args(update.message.text or "").strip()
+    inventory = _load_codex_plugin_inventory()
+
+    if not raw_args:
+        await safe_reply(update.message, _build_codex_plugins_overview_text(inventory))
+        return
+
+    parts = raw_args.split()
+    subcmd = parts[0].strip().lower()
+    subargs = parts[1:]
+    usage = (
+        "Use `/plugins`, `/plugins list`, `/plugins search <term>`, "
+        "`/plugins install <plugin>`, `/plugins install-id <id> <path>`, `/plugins enable <plugin>`, "
+        "`/plugins disable <plugin>`, or `/plugins marketplace ...`."
+    )
+
+    if subcmd in {"list", "ls", "status"}:
+        await safe_reply(update.message, _build_codex_plugins_overview_text(inventory))
+        return
+
+    if subcmd in {"marketplaces", "sources"}:
+        await safe_reply(
+            update.message,
+            _build_codex_marketplaces_overview_text(),
+        )
+        return
+
+    if subcmd in {"search", "find", "available", "explore"}:
+        query = " ".join(subargs).strip()
+        matches = _search_codex_marketplace_plugins(query)
+        if not query:
+            query = "all"
+        await safe_reply(
+            update.message,
+            _build_codex_marketplace_search_text(query, matches),
+        )
+        return
+
+    if subcmd in {"install", "add"}:
+        if not subargs:
+            await safe_reply(update.message, "Usage: `/plugins install <plugin>`")
+            return
+        identifier = " ".join(subargs).strip()
+        plugin = _find_codex_plugin(inventory, identifier)
+        plugin_id = str(plugin["plugin_id"]) if plugin else ""
+        if not plugin_id:
+            matches = _search_codex_marketplace_plugins(identifier, limit=20)
+            exact = None
+            lowered = identifier.lower()
+            for item in matches:
+                values = {
+                    str(item.get("plugin_id", "")).lower(),
+                    str(item.get("name", "")).lower(),
+                    str(item.get("display_name", "")).lower(),
+                }
+                if lowered in values:
+                    exact = item
+                    break
+            if exact is None and len(matches) == 1:
+                exact = matches[0]
+            if exact is None:
+                await safe_reply(
+                    update.message,
+                    _build_codex_marketplace_search_text(identifier, matches),
+                )
+                return
+            plugin_id = str(exact.get("plugin_id", "")).strip()
+        if not plugin_id:
+            await safe_reply(update.message, f"❌ Unknown Codex plugin: `{identifier}`")
+            return
+        ok, err = _install_codex_marketplace_plugin(plugin_id)
+        if not ok:
+            await safe_reply(update.message, f"❌ {err}")
+            return
+        await safe_reply(
+            update.message,
+            (
+                f"✅ Installed Codex plugin `{plugin_id}`.\n"
+                "Start a new Codex thread if you want the newly installed plugin surface immediately."
+            ),
+        )
+        await safe_reply(
+            update.message,
+            _build_codex_plugins_overview_text(_load_codex_plugin_inventory()),
+        )
+        return
+
+    if subcmd in {"install-id", "install-path", "add-id"}:
+        try:
+            parsed = shlex.split(raw_args)
+        except ValueError as e:
+            await safe_reply(update.message, f"❌ Failed to parse arguments: {e}")
+            return
+        if len(parsed) < 3:
+            await safe_reply(
+                update.message,
+                "Usage: `/plugins install-id <plugin-id> <source-path>`",
+            )
+            return
+        plugin_id = parsed[1].strip()
+        source_path = parsed[2].strip()
+        ok, err = _install_codex_plugin_from_source(plugin_id, source_path)
+        if not ok:
+            await safe_reply(update.message, f"❌ {err}")
+            return
+        await safe_reply(
+            update.message,
+            (
+                f"✅ Installed Codex plugin `{plugin_id}` from `{source_path}`.\n"
+                "Start a new Codex thread if you want the newly installed plugin surface immediately."
+            ),
+        )
+        await safe_reply(
+            update.message,
+            _build_codex_plugins_overview_text(_load_codex_plugin_inventory()),
+        )
+        return
+
+    if subcmd == "marketplace":
+        if not subargs:
+            await safe_reply(
+                update.message,
+                "Use `/plugins marketplace list`, `/plugins marketplace add <source>`, "
+                "`/plugins marketplace upgrade [name]`, or `/plugins marketplace remove <name>`.",
+            )
+            return
+        action = subargs[0].strip().lower()
+        extra = subargs[1:]
+        if action == "list":
+            await safe_reply(update.message, _build_codex_marketplaces_overview_text())
+            return
+        if action not in {"add", "upgrade", "remove"}:
+            await safe_reply(
+                update.message,
+                "Unknown marketplace action.\n"
+                "Use `/plugins marketplace list|add|upgrade|remove`.",
+            )
+            return
+        if action == "add" and not extra:
+            await safe_reply(update.message, "Usage: `/plugins marketplace add <source>`")
+            return
+        if action == "remove" and not extra:
+            await safe_reply(update.message, "Usage: `/plugins marketplace remove <name>`")
+            return
+        ok, result = _run_codex_marketplace_command([action, *extra])
+        if not ok:
+            await safe_reply(update.message, f"❌ {result}")
+            return
+        await safe_reply(update.message, f"✅ Marketplace command succeeded.\n{result}")
+        if action in {"add", "upgrade", "remove"}:
+            await safe_reply(update.message, _build_codex_marketplaces_overview_text())
+        return
+
+    if subcmd not in {"enable", "on", "disable", "off"}:
+        await safe_reply(update.message, f"Unknown subcommand.\n{usage}")
+        return
+
+    if not subargs:
+        verb = "enable" if subcmd in {"enable", "on"} else "disable"
+        await safe_reply(update.message, f"Usage: `/plugins {verb} <plugin>`")
+        return
+
+    identifier = " ".join(subargs).strip()
+    plugin = _find_codex_plugin(inventory, identifier)
+    if not plugin:
+        await safe_reply(update.message, f"❌ Unknown Codex plugin: `{identifier}`")
+        return
+
+    desired_enabled = subcmd in {"enable", "on"}
+    if bool(plugin.get("enabled")) == desired_enabled:
+        state = "enabled" if desired_enabled else "disabled"
+        await safe_reply(
+            update.message,
+            f"ℹ️ Codex plugin `{plugin['plugin_id']}` is already {state}.",
+        )
+        return
+
+    ok, err = _set_codex_plugin_enabled(str(plugin["plugin_id"]), desired_enabled)
+    if not ok:
+        await safe_reply(update.message, f"❌ {err}")
+        return
+
+    state_word = "Enabled" if desired_enabled else "Disabled"
+    await safe_reply(
+        update.message,
+        (
+            f"✅ {state_word} Codex plugin `{plugin['plugin_id']}`.\n"
+            "Start a new Codex thread if you want the updated plugin surface immediately."
+        ),
+    )
+    await safe_reply(
+        update.message,
+        _build_codex_plugins_overview_text(_load_codex_plugin_inventory()),
+    )
+
+
 async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_bot_globals()
     """Manage recurring plan nudges for one topic."""
@@ -1816,6 +2078,77 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if native_sent:
             return
     await safe_reply(update.message, "❌ Failed to fetch status from app-server.")
+
+
+async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _sync_bot_globals()
+    """Show/change the native Codex /goal for one topic."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not await _ensure_chat_allowed(update):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ Use `/goal` inside a named topic.")
+        return
+
+    chat_id = _scoped_chat_id(update)
+    if chat_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+
+    raw_args = _extract_command_args(update.message.text or "").strip()
+    usage = "Usage: `/goal`, `/goal status`, `/goal set <text>`, or `/goal clear`"
+    action, _, remainder = raw_args.partition(" ")
+    normalized_action = action.strip().lower()
+    remainder = remainder.strip()
+
+    if not raw_args or normalized_action == "status":
+        ok, payload, message = await session_manager.get_topic_goal(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        if not ok:
+            prefix = "ℹ️" if "no goal" in message.lower() else "❌"
+            await safe_reply(update.message, f"{prefix} {message}")
+            return
+        await safe_reply(update.message, _render_goal_text(payload))
+        return
+
+    if normalized_action == "set":
+        if not remainder:
+            await safe_reply(update.message, f"❌ Goal text is required.\n{usage}")
+            return
+        ok, payload, message = await session_manager.set_topic_goal(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            goal_text=remainder,
+        )
+        if not ok:
+            await safe_reply(update.message, f"❌ {message}")
+            return
+        await safe_reply(update.message, _render_goal_text(payload, prefix="✅ Goal updated."))
+        return
+
+    if normalized_action == "clear":
+        ok, _payload, message = await session_manager.clear_topic_goal(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        if not ok:
+            prefix = "ℹ️" if "no goal" in message.lower() else "❌"
+            await safe_reply(update.message, f"{prefix} {message}")
+            return
+        await safe_reply(update.message, "✅ Goal cleared.")
+        return
+
+    await safe_reply(update.message, f"❌ Unknown goal command `{normalized_action}`.\n{usage}")
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
