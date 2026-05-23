@@ -5,6 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
+import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +19,7 @@ from .config import config
 from .handlers.directory_browser import clamp_browse_path, resolve_browse_root
 from .node_registry import node_registry
 from .session import session_manager
+from .utils import env_alias
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +38,9 @@ ALLOWED_TELEGRAM_IMAGE_TYPES = {
     ".tiff": "image/tiff",
 }
 TELEGRAM_ATTACHMENT_MAX_BYTES = 45 * 1024 * 1024
+_remote_restart_requested = False
+_COCO_SELF_UPDATE_COMMAND_ENV = "COCO_SELF_UPDATE_COMMAND"
+_CODEX_UPGRADE_COMMAND_ENV = "COCO_CODEX_UPGRADE_COMMAND"
 
 
 def _resolve_attachment_path(
@@ -228,6 +237,7 @@ class AgentRpcServer:
         self._server.register("agent/resume_latest", self._resume_latest)
         self._server.register("agent/resume_thread", self._resume_thread)
         self._server.register("agent/send_inputs", self._send_inputs)
+        self._server.register("agent/run_update", self._run_update)
 
     async def start(self, *, host: str, port: int) -> None:
         await self._server.start(host=host, port=port)
@@ -502,6 +512,29 @@ class AgentRpcServer:
             "thread_id": state.codex_thread_id,
             "turn_id": state.codex_active_turn_id,
         }
+
+    async def _run_update(self, params: dict[str, Any]) -> dict[str, Any]:
+        action = str(params.get("action", "")).strip().lower()
+        if action not in {"coco", "codex", "both"}:
+            raise ClusterRpcError("invalid update action")
+        if _remote_restart_requested:
+            return {"ok": False, "message": "Restart already in progress."}
+
+        messages: list[str] = []
+        if action in {"coco", "both"}:
+            ok, message = await asyncio.to_thread(_run_remote_coco_update_sync)
+            if not ok:
+                return {"ok": False, "message": message}
+            messages.append(message)
+        if action in {"codex", "both"}:
+            ok, message = await asyncio.to_thread(_run_remote_codex_upgrade_sync)
+            if not ok:
+                return {"ok": False, "message": message}
+            messages.append(message)
+
+        _queue_remote_restart()
+        summary = "\n".join(part for part in messages if part).strip() or "Remote update completed."
+        return {"ok": True, "message": f"{summary}\nRestarting remote CoCo now."}
 
 
 class AgentRpcClient:
@@ -875,5 +908,137 @@ class AgentRpcClient:
             raise ClusterRpcError("invalid send response")
         return result
 
+    async def run_update(
+        self,
+        machine_id: str,
+        *,
+        action: str,
+        notice_chat_id: int,
+        notice_thread_id: int | None,
+    ) -> dict[str, Any]:
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/run_update",
+            params={
+                "action": action,
+                "notice_chat_id": notice_chat_id,
+                "notice_thread_id": notice_thread_id,
+            },
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid run update response")
+        return result
+
 
 agent_rpc_client = AgentRpcClient(shared_secret=config.cluster_shared_secret)
+
+
+def _resolve_repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _run_command_sync(
+    argv: list[str],
+    *,
+    cwd: str | Path | None = None,
+    timeout_seconds: float = 600.0,
+) -> tuple[bool, str, str, str]:
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return False, "", "", str(exc)
+    except subprocess.TimeoutExpired as exc:
+        return False, exc.stdout or "", exc.stderr or "", "timeout"
+    except OSError as exc:
+        return False, "", "", str(exc)
+    return proc.returncode == 0, proc.stdout, proc.stderr, ""
+
+
+def _tail_text(value: str, *, limit: int = 280) -> str:
+    text = " ".join(value.strip().split())
+    if len(text) <= limit:
+        return text
+    return "…" + text[-(limit - 1) :]
+
+
+def _resolve_codex_upgrade_command() -> tuple[str, str]:
+    custom = env_alias(_CODEX_UPGRADE_COMMAND_ENV)
+    if custom:
+        return custom, "custom"
+    if shutil.which("uv"):
+        return "uv tool upgrade codex", "uv"
+    if shutil.which("pipx"):
+        return "pipx upgrade codex", "pipx"
+    if shutil.which("npm"):
+        return "npm install -g @openai/codex@latest", "npm"
+    return "", "none"
+
+
+def _run_remote_codex_upgrade_sync() -> tuple[bool, str]:
+    command, _source = _resolve_codex_upgrade_command()
+    if not command:
+        return False, "No supported Codex upgrade command found."
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        return False, f"Invalid upgrade command syntax: {exc}"
+    ok, stdout, stderr, err = _run_command_sync(argv, cwd=_resolve_repo_root())
+    if not ok:
+        return False, f"Codex upgrade failed: {_tail_text(stderr or stdout or err or 'unknown error')}"
+    return True, "Codex upgrade completed."
+
+
+def _run_remote_coco_update_sync() -> tuple[bool, str]:
+    repo_root = _resolve_repo_root()
+    if not (repo_root / ".git").exists():
+        return False, "CoCo update unavailable: runtime is not a git checkout."
+
+    custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
+    if custom:
+        ok, stdout, stderr, err = _run_command_sync(["bash", "-lc", custom], cwd=repo_root)
+        if not ok:
+            return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'unknown error')}"
+        return True, "CoCo update completed."
+
+    ok, stdout, stderr, err = _run_command_sync(["git", "status", "--porcelain"], cwd=repo_root)
+    if not ok:
+        return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'git status failed')}"
+    if stdout.strip():
+        return False, "CoCo update blocked: worktree has local changes."
+
+    ok, stdout, stderr, err = _run_command_sync(["git", "pull", "--ff-only"], cwd=repo_root)
+    if not ok:
+        return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'git pull failed')}"
+    if shutil.which("uv") and (repo_root / "pyproject.toml").is_file():
+        ok, stdout, stderr, err = _run_command_sync(["uv", "sync"], cwd=repo_root)
+        if not ok:
+            return False, f"CoCo dependency sync failed: {_tail_text(stderr or stdout or err or 'uv sync failed')}"
+    return True, "CoCo update completed."
+
+
+def _queue_remote_restart() -> None:
+    global _remote_restart_requested
+    if _remote_restart_requested:
+        return
+    _remote_restart_requested = True
+    asyncio.create_task(_restart_remote_process_after_delay())
+
+
+async def _restart_remote_process_after_delay(delay_seconds: float = 0.25) -> None:
+    global _remote_restart_requested
+    await asyncio.sleep(delay_seconds)
+    argv = [sys.executable, *sys.argv]
+    try:
+        os.execv(sys.executable, argv)
+    except Exception:
+        _remote_restart_requested = False
+        logger.exception("Failed to restart remote CoCo process")

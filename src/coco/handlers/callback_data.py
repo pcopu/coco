@@ -44,6 +44,8 @@ CB_UPDATE_RUN = "up:run"
 CB_UPDATE_RUN_CODEX = "up:run:codex"
 CB_UPDATE_RUN_COCO = "up:run:coco"
 CB_UPDATE_RUN_BOTH = "up:run:both"
+CB_UPDATE_RUN_NODE = "up:node:"  # up:node:<machine_id>:<action>
+CB_UPDATE_ROLL_AGENTS = "up:roll:agents"
 
 # Session approvals
 CB_APPROVAL_SET = "ap:set:"  # ap:set:<mode>

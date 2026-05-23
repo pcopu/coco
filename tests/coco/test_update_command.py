@@ -12,6 +12,8 @@ from coco.handlers.callback_data import (
     CB_UPDATE_RUN_BOTH,
     CB_UPDATE_RUN_COCO,
     CB_UPDATE_RUN_CODEX,
+    CB_UPDATE_RUN_NODE,
+    CB_UPDATE_ROLL_AGENTS,
 )
 
 
@@ -89,6 +91,100 @@ def test_build_update_panel_text_mentions_coco_self_update():
     assert "git pull --ff-only origin main" in text
     assert "uv tool upgrade codex" in text
     assert "Admins can apply CoCo, Codex, or both from this panel." in text
+
+
+def test_build_update_panel_text_lists_remote_nodes(monkeypatch):
+    monkeypatch.setattr(
+        bot.node_registry,
+        "iter_nodes",
+        lambda: [
+            SimpleNamespace(
+                machine_id="userver",
+                display_name="userver",
+                status="online",
+                is_local=True,
+                rpc_host="100.83.15.19",
+                rpc_port=8787,
+                agent_version="",
+            ),
+            SimpleNamespace(
+                machine_id="desktop-hsfeb9e",
+                display_name="DESKTOP-HSFEB9E",
+                status="online",
+                is_local=False,
+                rpc_host="100.78.23.5",
+                rpc_port=8787,
+                agent_version="abc1234",
+            ),
+        ],
+    )
+    coco_snapshot = bot._CocoUpdateSnapshot(
+        repo_root="/srv/coco",
+        current_branch="main",
+        upstream_ref="origin/main",
+        current_commit="1111111",
+        latest_commit="2222222",
+        behind_count=1,
+        ahead_count=0,
+        dirty=False,
+        check_error="",
+        update_command="git pull --ff-only origin main",
+        update_source="git",
+    )
+    codex_snapshot = bot._CodexUpdateSnapshot(
+        codex_binary="codex",
+        current_version="0.1.0",
+        latest_version="0.1.1",
+        behind=True,
+        check_error="",
+        upgrade_command="uv tool upgrade codex",
+        upgrade_source="uv",
+    )
+
+    text = bot._build_update_panel_text(
+        coco_snapshot,
+        codex_snapshot,
+        can_trigger_upgrade=True,
+    )
+
+    assert "Nodes" in text
+    assert "DESKTOP-HSFEB9E" in text
+    assert "100.78.23.5:8787" in text
+    assert "abc1234" in text
+
+
+def test_build_update_panel_keyboard_includes_remote_node_actions(monkeypatch):
+    monkeypatch.setattr(
+        bot.node_registry,
+        "iter_nodes",
+        lambda: [
+            SimpleNamespace(
+                machine_id="userver",
+                display_name="userver",
+                status="online",
+                is_local=True,
+            ),
+            SimpleNamespace(
+                machine_id="desktop-hsfeb9e",
+                display_name="DESKTOP-HSFEB9E",
+                status="online",
+                is_local=False,
+            ),
+        ],
+    )
+
+    keyboard = bot._build_update_panel_keyboard(can_trigger_upgrade=True)
+    callback_data = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+
+    assert f"{CB_UPDATE_RUN_NODE}desktop-hsfeb9e:coco" in callback_data
+    assert f"{CB_UPDATE_RUN_NODE}desktop-hsfeb9e:codex" in callback_data
+    assert f"{CB_UPDATE_RUN_NODE}desktop-hsfeb9e:both" in callback_data
+    assert CB_UPDATE_ROLL_AGENTS in callback_data
 
 
 @pytest.mark.asyncio
@@ -460,3 +556,140 @@ async def test_update_run_callback_executes_both_updates(monkeypatch):
     assert "CoCo and Codex updated. Restarting." in edits[-1]
     assert query.answers
     assert query.answers[-1] == ("Update queued", False)
+
+
+@pytest.mark.asyncio
+async def test_update_run_node_callback_executes_remote_both_update(monkeypatch):
+    update, query = _make_callback_update(f"{CB_UPDATE_RUN_NODE}desktop-hsfeb9e:both")
+    edits: list[str] = []
+    run_calls: list[tuple[str, str, int, int | None]] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def _run_remote_node_update_and_restart(
+        *,
+        machine_id: str,
+        action: str,
+        chat_id: int,
+        thread_id: int | None,
+    ):
+        run_calls.append((machine_id, action, chat_id, thread_id))
+        return True, "Remote node updated. Restarting."
+
+    monkeypatch.setattr(
+        bot,
+        "_run_remote_node_update_and_restart",
+        _run_remote_node_update_and_restart,
+    )
+
+    async def _safe_edit(_query, text: str, **_kwargs):
+        edits.append(text)
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert run_calls == [("desktop-hsfeb9e", "both", -100123, 77)]
+    assert edits
+    assert "Remote node updated. Restarting." in edits[-1]
+    assert query.answers
+    assert query.answers[-1] == ("Update queued", False)
+
+
+@pytest.mark.asyncio
+async def test_update_roll_agents_callback_executes_rolling_update(monkeypatch):
+    update, query = _make_callback_update(CB_UPDATE_ROLL_AGENTS)
+    edits: list[str] = []
+    roll_calls: list[tuple[int, int | None]] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def _run_rolling_agent_updates(*, chat_id: int, thread_id: int | None):
+        roll_calls.append((chat_id, thread_id))
+        return True, "Rolled remote agents."
+
+    monkeypatch.setattr(bot, "_run_rolling_agent_updates", _run_rolling_agent_updates)
+
+    async def _safe_edit(_query, text: str, **_kwargs):
+        edits.append(text)
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}))
+
+    assert roll_calls == [(-100123, 77)]
+    assert edits
+    assert "Rolled remote agents." in edits[-1]
+    assert query.answers
+    assert query.answers[-1] == ("Update queued", False)
+
+
+@pytest.mark.asyncio
+async def test_run_remote_node_update_and_restart_calls_agent_rpc_and_verifies(monkeypatch):
+    rpc_calls: list[tuple[str, str, int, int | None]] = []
+    verify_calls: list[str] = []
+
+    async def _run_update(machine_id: str, *, action: str, notice_chat_id: int, notice_thread_id: int | None):
+        rpc_calls.append((machine_id, action, notice_chat_id, notice_thread_id))
+        return {"ok": True, "message": "remote updated"}
+
+    async def _wait(machine_id: str, *, timeout_seconds: float = 0.0):
+        verify_calls.append(machine_id)
+        return True, "online"
+
+    monkeypatch.setattr(bot.agent_rpc_client, "run_update", _run_update)
+    monkeypatch.setattr(bot, "_wait_for_remote_node_online", _wait)
+
+    ok, text = await bot._run_remote_node_update_and_restart(
+        machine_id="desktop-hsfeb9e",
+        action="both",
+        chat_id=-100123,
+        thread_id=77,
+    )
+
+    assert ok is True
+    assert rpc_calls == [("desktop-hsfeb9e", "both", -100123, 77)]
+    assert verify_calls == ["desktop-hsfeb9e"]
+    assert "remote updated" in text
+    assert "online" in text
+
+
+@pytest.mark.asyncio
+async def test_run_rolling_agent_updates_runs_online_remote_nodes_only(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        bot.node_registry,
+        "iter_nodes",
+        lambda: [
+            SimpleNamespace(machine_id="userver", display_name="userver", status="online", is_local=True),
+            SimpleNamespace(machine_id="b-node", display_name="B Node", status="offline", is_local=False),
+            SimpleNamespace(machine_id="a-node", display_name="A Node", status="online", is_local=False),
+            SimpleNamespace(machine_id="c-node", display_name="C Node", status="online", is_local=False),
+        ],
+    )
+
+    async def _run_remote(*, machine_id: str, action: str, chat_id: int, thread_id: int | None):
+        calls.append(machine_id)
+        return True, f"{machine_id} ok"
+
+    monkeypatch.setattr(bot, "_run_remote_node_update_and_restart", _run_remote)
+
+    ok, text = await bot._run_rolling_agent_updates(chat_id=-100123, thread_id=77)
+
+    assert ok is True
+    assert calls == ["a-node", "c-node"]
+    assert "a-node ok" in text
+    assert "c-node ok" in text

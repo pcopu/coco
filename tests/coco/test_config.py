@@ -12,6 +12,7 @@ from coco.config import Config
 def _base_env(monkeypatch, tmp_path):
     # chdir to tmp_path so load_dotenv won't find the real .env in repo root
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("COCO_RPC_LISTEN_HOST", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test:token")
     monkeypatch.setenv("ALLOWED_USERS", "12345")
     monkeypatch.setenv("COCO_DIR", str(tmp_path))

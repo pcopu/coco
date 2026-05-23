@@ -249,6 +249,39 @@ async def test_raw_response_unknown_phase_stays_progress(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_raw_response_image_generation_routes_image_output(monkeypatch):
+    handled = []
+
+    async def _handle_new_message(msg, _bot):
+        handled.append(msg)
+
+    monkeypatch.setattr(bot, "handle_new_message", _handle_new_message)
+    bot._turn_has_final_text.pop("th-img", None)
+
+    await bot._handle_codex_app_server_notification(
+        "rawResponseItem/completed",
+        {
+            "threadId": "th-img",
+            "item": {
+                "type": "image_generation_call",
+                "id": "ig_123",
+                "status": "completed",
+                "result": "aGVsbG8=",
+            },
+        },
+        bot=object(),
+    )
+
+    assert len(handled) == 1
+    msg = handled[0]
+    assert msg.session_id == "th-img"
+    assert msg.content_type == "text"
+    assert msg.text == ""
+    assert msg.image_data == [("image/png", b"hello")]
+    assert bot._turn_has_final_text.get("th-img") is True
+
+
+@pytest.mark.asyncio
 async def test_turn_completed_finalizes_progress_and_clears_active_turn(monkeypatch):
     set_turn_calls: list[tuple[str, str]] = []
     completed: list[dict[str, object]] = []

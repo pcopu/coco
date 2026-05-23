@@ -39,6 +39,7 @@ from .looper import (
     stop_looper_if_expired,
 )
 from . import autoresearch, personality
+from . import resource_monitor
 from .message_queue import get_message_queue
 from .message_sender import safe_send
 from .topic_send import send_text_to_topic as _send_text_to_topic
@@ -67,6 +68,26 @@ WATCHDOG_ACTIVE_TURN_KEEPALIVE_EMOJIS: tuple[str, ...] = (
     "📡",
     "🛠️",
 )
+
+
+async def _emit_due_resource_monitor_notifications(bot: Bot) -> None:
+    """Send due host resource notices to allowed users' private chats."""
+    notifications = resource_monitor.collect_due_notifications()
+    if not notifications:
+        return
+
+    recipients = sorted(config.allowed_users)
+    if not recipients:
+        return
+
+    for text in notifications:
+        for user_id in recipients:
+            await safe_send(
+                bot,
+                user_id,
+                text,
+                message_thread_id=None,
+            )
 
 
 def _local_machine_identity() -> tuple[str, str]:
@@ -763,6 +784,7 @@ async def status_poll_loop(bot: Bot) -> None:
             current_ts = time.time()
             await _probe_stale_nodes(bot, now=current_ts)
             await _emit_node_status_notifications(bot)
+            await _emit_due_resource_monitor_notifications(bot)
 
             raw_bindings = list(session_manager.iter_topic_window_bindings())
             bindings: list[tuple[int, int | None, int, str]] = []

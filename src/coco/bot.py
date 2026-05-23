@@ -1,6 +1,7 @@
 """Telegram bot handlers — the main UI layer of CoCo."""
 
 import asyncio
+import base64
 import errno
 import json
 import logging
@@ -41,7 +42,8 @@ from telegram.ext import (
 from .codex_app_server import CodexAppServerError, codex_app_server_client
 from .config import config
 from .controller_rpc import ControllerRpcServer
-from .node_registry import node_registry
+from .agent_rpc import agent_rpc_client
+from .node_registry import NODE_STATUS_ONLINE, node_registry
 from .handlers.callback_data import (
     CB_APP_APPROVAL_DECIDE,
     CB_APPROVAL_OPEN_DEFAULTS,
@@ -102,6 +104,8 @@ from .handlers.callback_data import (
     CB_UPDATE_RUN_BOTH,
     CB_UPDATE_RUN_CODEX,
     CB_UPDATE_RUN_COCO,
+    CB_UPDATE_RUN_NODE,
+    CB_UPDATE_ROLL_AGENTS,
     CB_SESSION_FORK,
     CB_SESSION_PAGE,
     CB_SESSION_REFRESH,
@@ -5141,6 +5145,29 @@ def _build_update_panel_text(
     if codex_snapshot.check_error:
         lines.extend(["", "Codex check notes:", codex_snapshot.check_error])
 
+    node_lines: list[str] = []
+    for node in node_registry.iter_nodes():
+        machine_id = str(getattr(node, "machine_id", "")).strip()
+        if not machine_id:
+            continue
+        display_name = str(getattr(node, "display_name", machine_id)).strip() or machine_id
+        scope = "local" if getattr(node, "is_local", False) else "remote"
+        status = str(getattr(node, "status", "unknown")).strip() or "unknown"
+        endpoint_host = str(getattr(node, "rpc_host", "")).strip()
+        endpoint_port = int(getattr(node, "rpc_port", 0) or 0)
+        endpoint = (
+            f"{endpoint_host}:{endpoint_port}"
+            if endpoint_host and endpoint_port > 0
+            else "<unset>"
+        )
+        version = str(getattr(node, "agent_version", "")).strip() or "<unknown>"
+        node_lines.append(
+            f"- `{display_name}` [{scope}, {status}] rpc `{endpoint}` version `{version}`"
+        )
+
+    if node_lines:
+        lines.extend(["", "*Nodes*", *node_lines])
+
     lines.extend(
         [
             "",
@@ -5167,8 +5194,129 @@ def _build_update_panel_keyboard(*, can_trigger_upgrade: bool) -> InlineKeyboard
         rows.append(
             [InlineKeyboardButton("Update Both", callback_data=CB_UPDATE_RUN_BOTH)]
         )
+        remote_nodes = [
+            node
+            for node in node_registry.iter_nodes()
+            if not getattr(node, "is_local", False)
+            and getattr(node, "status", "") == NODE_STATUS_ONLINE
+            and getattr(node, "machine_id", "").strip()
+        ]
+        for node in remote_nodes:
+            machine_id = str(node.machine_id).strip()
+            label = str(getattr(node, "display_name", machine_id)).strip() or machine_id
+            short = label[:12]
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{short} CoCo",
+                        callback_data=f"{CB_UPDATE_RUN_NODE}{machine_id}:coco",
+                    ),
+                    InlineKeyboardButton(
+                        f"{short} Codex",
+                        callback_data=f"{CB_UPDATE_RUN_NODE}{machine_id}:codex",
+                    ),
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{short} Both",
+                        callback_data=f"{CB_UPDATE_RUN_NODE}{machine_id}:both",
+                    )
+                ]
+            )
+        if remote_nodes:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "Roll Agents",
+                        callback_data=CB_UPDATE_ROLL_AGENTS,
+                    )
+                ]
+            )
     rows.append([InlineKeyboardButton("Refresh", callback_data=CB_UPDATE_REFRESH)])
     return InlineKeyboardMarkup(rows)
+
+
+async def _run_remote_node_update_and_restart(
+    *,
+    machine_id: str,
+    action: str,
+    chat_id: int,
+    thread_id: int | None,
+) -> tuple[bool, str]:
+    result = await agent_rpc_client.run_update(
+        machine_id,
+        action=action,
+        notice_chat_id=chat_id,
+        notice_thread_id=thread_id,
+    )
+    ok = bool(result.get("ok", False))
+    message = str(result.get("message", "")).strip() or "Remote update finished."
+    if not ok:
+        return False, message
+
+    verify_ok, verify_text = await _wait_for_remote_node_online(machine_id)
+    if verify_ok:
+        return True, f"{message}\nVerification: {verify_text}"
+    return False, f"{message}\nVerification failed: {verify_text}"
+
+
+async def _run_rolling_agent_updates(
+    *,
+    chat_id: int,
+    thread_id: int | None,
+) -> tuple[bool, str]:
+    remote_nodes = [
+        node
+        for node in node_registry.iter_nodes()
+        if not getattr(node, "is_local", False)
+        and getattr(node, "status", "") == NODE_STATUS_ONLINE
+        and getattr(node, "machine_id", "").strip()
+    ]
+    remote_nodes.sort(
+        key=lambda node: (
+            str(getattr(node, "display_name", "")).lower(),
+            str(getattr(node, "machine_id", "")).lower(),
+        )
+    )
+    if not remote_nodes:
+        return False, "No online remote agents are available."
+
+    lines: list[str] = []
+    overall_ok = True
+    for node in remote_nodes:
+        machine_id = str(node.machine_id).strip()
+        ok, text = await _run_remote_node_update_and_restart(
+            machine_id=machine_id,
+            action="both",
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        overall_ok = overall_ok and ok
+        lines.append(text)
+        if not ok:
+            break
+    return overall_ok, "\n\n".join(lines)
+
+
+async def _wait_for_remote_node_online(
+    machine_id: str,
+    *,
+    timeout_seconds: float = 45.0,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    last_error = "no response"
+    while time.monotonic() < deadline:
+        try:
+            payload = await agent_rpc_client.ping(machine_id)
+        except Exception as exc:
+            last_error = str(exc) or exc.__class__.__name__
+            await asyncio.sleep(2.0)
+            continue
+        display_name = str(payload.get("display_name", "")).strip() or machine_id
+        return True, f"`{display_name}` is back online."
+    return False, last_error
 
 
 def _update_notice_targets() -> list[tuple[int, int | None]]:
@@ -7531,7 +7679,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ This media type is not supported yet. Send text, photos, voice notes, or audio files.",
+        "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, or PDF documents.",
     )
 
 
@@ -7542,6 +7690,10 @@ _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 # --- Audio directory for incoming voice/audio media ---
 _AUDIO_DIR = coco_dir() / "audio"
 _AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Document directory for incoming PDF media ---
+_DOCUMENTS_DIR = coco_dir() / "documents"
+_DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-topic lock for Codex image resume submissions: (user_id, thread_id) -> lock
 _photo_resume_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -7575,6 +7727,29 @@ def _pick_audio_suffix(media: object) -> str:
         "audio/webm": ".webm",
     }
     return mime_map.get(mime_type, ".ogg")
+
+
+def _pick_document_suffix(media: object) -> str:
+    """Infer a useful local file extension for Telegram documents."""
+    file_name = str(getattr(media, "file_name", "") or "").strip()
+    if file_name:
+        suffix = Path(file_name).suffix.strip().lower()
+        if suffix:
+            return suffix
+
+    mime_type = str(getattr(media, "mime_type", "") or "").strip().lower()
+    if mime_type == "application/pdf":
+        return ".pdf"
+    return ".bin"
+
+
+def _build_document_prompt(*, file_path: Path, caption: str | None) -> str:
+    """Build prompt text for an inbound Telegram PDF."""
+    caption_text = (caption or "").strip()
+    base = f"User uploaded a PDF document: {file_path}"
+    if caption_text:
+        return f"{caption_text}\n\n{base}"
+    return base
 
 
 def _build_audio_prompt(*, transcript: str, caption: str | None) -> str:
@@ -7921,6 +8096,57 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         expect_response=True,
     )
     await _set_eyes_reaction(update.message)
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram PDF documents by saving and forwarding a local path hint."""
+    chat = update.effective_chat
+    if not _is_chat_allowed(chat):
+        if update.message:
+            await safe_reply(update.message, "❌ This group is not allowed to use this bot.")
+        return
+
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    document = getattr(message, "document", None)
+    if document is None:
+        return
+
+    suffix = _pick_document_suffix(document)
+    mime_type = str(getattr(document, "mime_type", "") or "").strip().lower()
+    if suffix != ".pdf" and mime_type != "application/pdf":
+        await safe_reply(
+            message,
+            "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, or PDF documents.",
+        )
+        return
+
+    thread_id = _get_thread_id(update)
+    chat_id = _group_chat_id(chat)
+    if chat_id is not None and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+
+    tg_file = await document.get_file()
+    file_path = _DOCUMENTS_DIR / f"{int(time.time())}_{document.file_unique_id}{suffix}"
+    await tg_file.download_to_drive(file_path)
+
+    await message.chat.send_action(ChatAction.TYPING)
+    await _forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        text=_build_document_prompt(file_path=file_path, caption=message.caption),
+    )
 
 
 async def _forward_topic_text_message(
@@ -9554,6 +9780,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else:
             await safe_edit(query, "⏳ Running Codex upgrade...")
             ok, text = await _run_codex_upgrade_and_restart(
+                chat_id=int(message_chat_id),
+                thread_id=cb_thread_id,
+            )
+        await safe_edit(query, text)
+        if ok:
+            await query.answer("Update queued")
+        else:
+            await query.answer("Update failed", show_alert=True)
+
+    elif data.startswith(CB_UPDATE_RUN_NODE) or data == CB_UPDATE_ROLL_AGENTS:
+        if not _is_admin_user(user.id):
+            await query.answer("Only admins can run updates.", show_alert=True)
+            return
+        message_chat_id = getattr(query.message, "chat_id", None)
+        if message_chat_id is None and chat is not None:
+            message_chat_id = chat.id
+        if message_chat_id is None:
+            await query.answer("Unable to resolve chat for restart.", show_alert=True)
+            return
+
+        if data == CB_UPDATE_ROLL_AGENTS:
+            await safe_edit(query, "⏳ Running rolling remote agent updates...")
+            ok, text = await _run_rolling_agent_updates(
+                chat_id=int(message_chat_id),
+                thread_id=cb_thread_id,
+            )
+        else:
+            payload = data[len(CB_UPDATE_RUN_NODE) :]
+            machine_id, sep, action = payload.rpartition(":")
+            machine_id = machine_id.strip()
+            action = action.strip().lower()
+            if not sep or not machine_id or action not in {"coco", "codex", "both"}:
+                await query.answer("Invalid remote update action.", show_alert=True)
+                return
+            label = {
+                "coco": "CoCo update",
+                "codex": "Codex upgrade",
+                "both": "CoCo + Codex updates",
+            }[action]
+            await safe_edit(query, f"⏳ Running {label} on `{machine_id}`...")
+            ok, text = await _run_remote_node_update_and_restart(
+                machine_id=machine_id,
+                action=action,
                 chat_id=int(message_chat_id),
                 thread_id=cb_thread_id,
             )
@@ -11662,6 +11931,30 @@ def _extract_app_server_response_item_text(item: dict[str, object]) -> str:
     return "\n".join(parts).strip()
 
 
+def _extract_app_server_response_item_images(
+    item: dict[str, object],
+) -> list[tuple[str, bytes]] | None:
+    """Extract native image-generation output from app-server response items."""
+    item_type = item.get("type")
+    if item_type not in {"image_generation_call", "image_generation_end"}:
+        return None
+
+    result = item.get("result")
+    if not isinstance(result, str):
+        return None
+    result = result.strip()
+    if not result:
+        return None
+
+    try:
+        raw_bytes = base64.b64decode(result)
+    except Exception:
+        logger.debug("Failed to decode app-server image generation result")
+        return None
+
+    return [("image/png", raw_bytes)]
+
+
 def _is_transient_app_server_turn_error(message: str, details: str = "") -> bool:
     """Return whether an app-server error message looks like a transient run failure."""
     text = " ".join(part.strip() for part in (message, details) if part.strip()).lower()
@@ -12333,27 +12626,45 @@ async def _handle_codex_app_server_notification(
             return
         item_type = item.get("type")
         role = item.get("role")
-        if item_type != "message" or role != "assistant":
+        if item_type == "message" and role == "assistant":
+            text = _extract_app_server_response_item_text(item)
+            if not text:
+                return
+            content_type = TranscriptParser.assistant_phase_to_content_type(
+                item.get("phase")
+            )
+            if content_type == "text":
+                _turn_has_final_text[thread_id] = True
+            await handle_new_message(
+                NewMessage(
+                    session_id=thread_id,
+                    text=text,
+                    is_complete=True,
+                    content_type=content_type,
+                    role="assistant",
+                    source="app_server",
+                ),
+                bot,
+            )
             return
-        text = _extract_app_server_response_item_text(item)
-        if not text:
+
+        image_data = _extract_app_server_response_item_images(item)
+        if not image_data:
             return
-        content_type = TranscriptParser.assistant_phase_to_content_type(
-            item.get("phase")
-        )
-        if content_type == "text":
-            _turn_has_final_text[thread_id] = True
+        _turn_has_final_text[thread_id] = True
         await handle_new_message(
             NewMessage(
                 session_id=thread_id,
-                text=text,
+                text="",
                 is_complete=True,
-                content_type=content_type,
+                content_type="text",
                 role="assistant",
                 source="app_server",
+                image_data=image_data,
             ),
             bot,
         )
+        return
 
 
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
@@ -12899,6 +13210,8 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to assistant
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # PDF documents: download and forward local file path to assistant
+    application.add_handler(MessageHandler(filters.Document.PDF, document_handler))
     # Voice/audio: download, transcribe locally, and forward transcript
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_handler))
     # Catch-all: non-text content (stickers, voice, etc.)
