@@ -3964,7 +3964,7 @@ async def _extract_telegram_attachments_for_window(
     ]
     stripped = re.sub(r"\n{3,}", "\n\n", _TELEGRAM_ATTACHMENT_TAG_RE.sub("", text)).strip()
     if not raw_paths or not workspace_dir:
-        return stripped, None
+        return stripped, None, None
 
     from .agent_rpc import agent_rpc_client
 
