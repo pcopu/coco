@@ -53,6 +53,10 @@ APP_SERVER_TURN_STEER_TIMEOUT_RE = re.compile(
     r"Timed out waiting for app-server response:\s*turn/steer",
     re.IGNORECASE,
 )
+APP_SERVER_NO_ACTIVE_TURN_RE = re.compile(
+    r"\bno active turn to steer\b",
+    re.IGNORECASE,
+)
 STATE_SCHEMA_VERSION = 6
 TOPIC_BINDING_TRANSPORT_WINDOW = "window"
 TOPIC_BINDING_TRANSPORT_CODEX_THREAD = "codex_thread"
@@ -1922,7 +1926,16 @@ class SessionManager:
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
                 if resolved_thread_id:
-                    self.set_window_codex_thread_id(window_id, resolved_thread_id)
+                    self.bind_topic_to_codex_thread(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        codex_thread_id=resolved_thread_id,
+                        cwd=cwd,
+                        display_name=state.window_name or self.get_display_name(window_id),
+                        window_id=window_id,
+                        machine_id=machine_id,
+                    )
                 if resolved_turn_id or self.get_window_codex_active_turn_id(window_id):
                     self.set_window_codex_active_turn_id(window_id, resolved_turn_id)
                 ok = bool(remote_result.get("ok", False))
@@ -1991,7 +2004,16 @@ class SessionManager:
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
                 if resolved_thread_id:
-                    self.set_window_codex_thread_id(window_id, resolved_thread_id)
+                    self.bind_topic_to_codex_thread(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        codex_thread_id=resolved_thread_id,
+                        cwd=cwd,
+                        display_name=state.window_name or self.get_display_name(window_id),
+                        window_id=window_id,
+                        machine_id=machine_id,
+                    )
                 if resolved_turn_id or self.get_window_codex_active_turn_id(window_id):
                     self.set_window_codex_active_turn_id(window_id, resolved_turn_id)
                 ok = bool(remote_result.get("ok", False))
@@ -3275,6 +3297,11 @@ class SessionManager:
         """Return whether an app-server exception is a turn/steer timeout."""
         return bool(APP_SERVER_TURN_STEER_TIMEOUT_RE.search(str(err)))
 
+    @staticmethod
+    def _is_no_active_turn_error(err: Exception) -> bool:
+        """Return whether app-server rejected a stale turn/steer request."""
+        return bool(APP_SERVER_NO_ACTIVE_TURN_RE.search(str(err)))
+
     async def _retry_send_after_missing_codex_thread(
         self,
         *,
@@ -3506,9 +3533,15 @@ class SessionManager:
             or ""
         )
 
+        if steer and not active_turn:
+            logger.info(
+                "No active app-server turn for %s (%s); starting a new turn instead of steering",
+                window_id,
+                self.get_display_name(window_id),
+            )
+            steer = False
+
         if steer or active_turn:
-            if not active_turn:
-                return False, "No active turn to steer."
             result = await codex_app_server_client.turn_steer(
                 thread_id=thread_id,
                 expected_turn_id=active_turn,
@@ -3625,7 +3658,7 @@ class SessionManager:
                             error_text = (
                                 f"{error_text}; retry with new thread failed: {retry_error}"
                             )
-                    elif self._is_turn_steer_timeout_error(e):
+                    elif self._is_turn_steer_timeout_error(e) or self._is_no_active_turn_error(e):
                         try:
                             return await self._retry_send_after_steer_timeout(
                                 window_id=window_id,
