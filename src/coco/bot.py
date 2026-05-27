@@ -13,10 +13,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -4176,6 +4178,7 @@ async def _dispatch_next_queued_input(
         chat_id=chat_id,
         window_id=window_id,
         text=queued_text,
+        force_new_turn=True,
     )
     emit_telemetry(
         "queue.dispatch.send_result",
@@ -7679,7 +7682,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, or PDF documents.",
+        "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, PDF documents, or ZIP archives.",
     )
 
 
@@ -7691,12 +7694,41 @@ _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 _AUDIO_DIR = coco_dir() / "audio"
 _AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Document directory for incoming PDF media ---
+# --- Document directory for incoming PDF/ZIP media ---
 _DOCUMENTS_DIR = coco_dir() / "documents"
 _DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-topic lock for Codex image resume submissions: (user_id, thread_id) -> lock
 _photo_resume_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+_DOCUMENT_TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".html",
+    ".css",
+    ".sql",
+    ".sh",
+    ".svg",
+}
+_DOCUMENT_BINARY_EXTENSIONS = {
+    ".pdf",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+}
+_ARCHIVE_EXTENSIONS = {
+    ".zip",
+    ".tgz",
+    ".tar.gz",
+}
 
 
 def _pick_image_prompt(caption: str | None) -> str:
@@ -7733,6 +7765,9 @@ def _pick_document_suffix(media: object) -> str:
     """Infer a useful local file extension for Telegram documents."""
     file_name = str(getattr(media, "file_name", "") or "").strip()
     if file_name:
+        lower_name = file_name.lower()
+        if lower_name.endswith(".tar.gz"):
+            return ".tar.gz"
         suffix = Path(file_name).suffix.strip().lower()
         if suffix:
             return suffix
@@ -7740,16 +7775,66 @@ def _pick_document_suffix(media: object) -> str:
     mime_type = str(getattr(media, "mime_type", "") or "").strip().lower()
     if mime_type == "application/pdf":
         return ".pdf"
+    if mime_type in {"application/zip", "application/x-zip-compressed"}:
+        return ".zip"
+    if mime_type in {"application/gzip", "application/x-gzip"}:
+        return ".tgz"
     return ".bin"
 
 
 def _build_document_prompt(*, file_path: Path, caption: str | None) -> str:
-    """Build prompt text for an inbound Telegram PDF."""
+    """Build prompt text for an inbound Telegram document."""
     caption_text = (caption or "").strip()
-    base = f"User uploaded a PDF document: {file_path}"
+    base = f"User uploaded a document: {file_path}"
     if caption_text:
         return f"{caption_text}\n\n{base}"
     return base
+
+
+def _build_zip_prompt(*, archive_path: Path, extracted_dir: Path, caption: str | None) -> str:
+    """Build prompt text for an inbound Telegram archive."""
+    caption_text = (caption or "").strip()
+    base = (
+        f"User uploaded an archive: {archive_path}\n"
+        f"Extracted contents directory: {extracted_dir}"
+    )
+    if caption_text:
+        return f"{caption_text}\n\n{base}"
+    return base
+
+
+def _extract_zip_archive(archive_path: Path, destination_dir: Path) -> None:
+    """Extract a ZIP archive into one destination dir, rejecting path traversal."""
+    destination_root = destination_dir.resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            resolved_member = (destination_root / member.filename).resolve()
+            if os.path.commonpath([str(destination_root), str(resolved_member)]) != str(destination_root):
+                raise ValueError(f"ZIP archive contains unsafe path: {member.filename}")
+        archive.extractall(destination_root)
+
+
+def _extract_tar_archive(archive_path: Path, destination_dir: Path) -> None:
+    """Extract a tar archive into one destination dir, rejecting path traversal."""
+    destination_root = destination_dir.resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, mode="r:*") as archive:
+        for member in archive.getmembers():
+            resolved_member = (destination_root / member.name).resolve()
+            if os.path.commonpath([str(destination_root), str(resolved_member)]) != str(destination_root):
+                raise ValueError(f"Archive contains unsafe path: {member.name}")
+        archive.extractall(destination_root, filter="data")
+
+
+def _is_supported_document_suffix(suffix: str) -> bool:
+    normalized = suffix.strip().lower()
+    return normalized in (_DOCUMENT_TEXT_EXTENSIONS | _DOCUMENT_BINARY_EXTENSIONS)
+
+
+def _is_supported_archive_suffix(suffix: str) -> bool:
+    normalized = suffix.strip().lower()
+    return normalized in _ARCHIVE_EXTENSIONS
 
 
 def _build_audio_prompt(*, transcript: str, caption: str | None) -> str:
@@ -8099,7 +8184,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Telegram PDF documents by saving and forwarding a local path hint."""
+    """Handle supported Telegram documents and archives by forwarding local path hints."""
     chat = update.effective_chat
     if not _is_chat_allowed(chat):
         if update.message:
@@ -8121,11 +8206,12 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     suffix = _pick_document_suffix(document)
-    mime_type = str(getattr(document, "mime_type", "") or "").strip().lower()
-    if suffix != ".pdf" and mime_type != "application/pdf":
+    is_archive = _is_supported_archive_suffix(suffix)
+    is_document = _is_supported_document_suffix(suffix)
+    if not is_document and not is_archive:
         await safe_reply(
             message,
-            "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, or PDF documents.",
+            "⚠ This file type is not supported yet. Send text, photos, voice notes, audio files, supported documents, or supported archives.",
         )
         return
 
@@ -8139,13 +8225,36 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await tg_file.download_to_drive(file_path)
 
     await message.chat.send_action(ChatAction.TYPING)
+    prompt_text = _build_document_prompt(file_path=file_path, caption=message.caption)
+    if is_archive:
+        extracted_dir = _DOCUMENTS_DIR / f"{file_path.stem}_unpacked"
+        try:
+            if suffix == ".zip":
+                _extract_zip_archive(file_path, extracted_dir)
+            else:
+                _extract_tar_archive(file_path, extracted_dir)
+        except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
+            logger.warning(
+                "Archive extraction failed (user=%d thread=%s archive=%s): %s",
+                user.id,
+                thread_id,
+                file_path,
+                exc,
+            )
+            await safe_reply(message, f"❌ Archive extraction failed: {exc}")
+            return
+        prompt_text = _build_zip_prompt(
+            archive_path=file_path,
+            extracted_dir=extracted_dir,
+            caption=message.caption,
+        )
     await _forward_topic_text_message(
         message=message,
         context=context,
         user_id=user.id,
         thread_id=thread_id,
         chat_id=chat_id,
-        text=_build_document_prompt(file_path=file_path, caption=message.caption),
+        text=prompt_text,
     )
 
 
@@ -13210,8 +13319,10 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to assistant
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    # PDF documents: download and forward local file path to assistant
-    application.add_handler(MessageHandler(filters.Document.PDF, document_handler))
+    # Supported documents/archives: download and forward local file path to assistant
+    application.add_handler(
+        MessageHandler(filters.Document.ALL, document_handler)
+    )
     # Voice/audio: download, transcribe locally, and forward transcript
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_handler))
     # Catch-all: non-text content (stickers, voice, etc.)

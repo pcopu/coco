@@ -487,6 +487,7 @@ class AgentRpcServer:
         reasoning_effort = str(params.get("reasoning_effort", "")).strip()
         service_tier = str(params.get("service_tier", "")).strip().lower()
         steer = bool(params.get("steer", False))
+        force_new_turn = bool(params.get("force_new_turn", False))
         inputs = params.get("inputs", [])
         if not isinstance(inputs, list):
             raise ClusterRpcError("inputs must be a list")
@@ -501,6 +502,7 @@ class AgentRpcServer:
             window_id,
             inputs,
             steer=steer,
+            force_new_turn=force_new_turn,
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
@@ -880,6 +882,7 @@ class AgentRpcClient:
         window_name: str,
         inputs: list[dict[str, Any]],
         steer: bool,
+        force_new_turn: bool = False,
         thread_id: str = "",
         approval_mode: str = "",
         model_slug: str = "",
@@ -897,6 +900,7 @@ class AgentRpcClient:
                 "window_name": window_name,
                 "inputs": inputs,
                 "steer": steer,
+                "force_new_turn": force_new_turn,
                 "thread_id": thread_id,
                 "approval_mode": approval_mode,
                 "model_slug": model_slug,

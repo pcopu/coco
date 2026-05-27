@@ -1846,6 +1846,7 @@ class SessionManager:
         window_id: str,
         text: str,
         steer: bool = False,
+        force_new_turn: bool = False,
     ) -> tuple[bool, str]:
         """Send user/topic text with app/skill context applied."""
         machine_id = self.get_window_machine_id(window_id)
@@ -1917,6 +1918,7 @@ class SessionManager:
                     window_name=state.window_name or self.get_display_name(window_id),
                     inputs=[{"type": "text", "text": text}],
                     steer=steer,
+                    force_new_turn=force_new_turn,
                     thread_id=state.codex_thread_id.strip(),
                     approval_mode=state.approval_mode.strip(),
                     model_slug=model_slug,
@@ -1941,7 +1943,12 @@ class SessionManager:
                 ok = bool(remote_result.get("ok", False))
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
-                ok, msg = await self.send_to_window(window_id, text, steer=steer)
+                ok, msg = await self.send_to_window(
+                    window_id,
+                    text,
+                    steer=steer,
+                    force_new_turn=force_new_turn,
+                )
             if ok:
                 self.mark_topic_telegram_live(
                     user_id=user_id,
@@ -1995,6 +2002,7 @@ class SessionManager:
                     window_name=state.window_name or self.get_display_name(window_id),
                     inputs=inputs,
                     steer=steer,
+                    force_new_turn=force_new_turn,
                     thread_id=state.codex_thread_id.strip(),
                     approval_mode=state.approval_mode.strip(),
                     model_slug=model_slug,
@@ -2019,7 +2027,12 @@ class SessionManager:
                 ok = bool(remote_result.get("ok", False))
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
-                ok, msg = await self.send_inputs_to_window(window_id, inputs, steer=steer)
+                ok, msg = await self.send_inputs_to_window(
+                    window_id,
+                    inputs,
+                    steer=steer,
+                    force_new_turn=force_new_turn,
+                )
             if ok:
                 self.mark_topic_telegram_live(
                     user_id=user_id,
@@ -3481,6 +3494,7 @@ class SessionManager:
         window_id: str,
         inputs: list[dict[str, Any]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
         model_slug: str = "",
@@ -3532,6 +3546,8 @@ class SessionManager:
             or codex_app_server_client.get_active_turn_id(thread_id)
             or ""
         )
+        if force_new_turn:
+            active_turn = ""
 
         if steer and not active_turn:
             logger.info(
@@ -3586,6 +3602,7 @@ class SessionManager:
         inputs: list[dict[str, Any]],
         *,
         steer: bool = False,
+        force_new_turn: bool = False,
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
@@ -3625,6 +3642,7 @@ class SessionManager:
                         window_id=window_id,
                         inputs=inputs,
                         steer=steer,
+                        force_new_turn=force_new_turn,
                         window_name=window_name,
                         cwd=cwd,
                         **send_kwargs,
@@ -3713,6 +3731,7 @@ class SessionManager:
         text: str,
         *,
         steer: bool = False,
+        force_new_turn: bool = False,
     ) -> tuple[bool, str]:
         """Send plain text input to a window.
 
@@ -3727,7 +3746,12 @@ class SessionManager:
             steer,
         )
         payload = [{"type": "text", "text": text}]
-        return await self.send_inputs_to_window(window_id, payload, steer=steer)
+        return await self.send_inputs_to_window(
+            window_id,
+            payload,
+            steer=steer,
+            force_new_turn=force_new_turn,
+        )
 
     # --- Message history ---
 

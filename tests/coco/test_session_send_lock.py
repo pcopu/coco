@@ -30,10 +30,11 @@ async def test_send_to_window_serializes_same_window(monkeypatch, mgr: SessionMa
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
-        _ = window_id, inputs, steer, window_name, cwd
+        _ = window_id, inputs, steer, force_new_turn, window_name, cwd
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
@@ -71,10 +72,11 @@ async def test_send_to_window_allows_parallel_across_windows(monkeypatch, mgr: S
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
-        _ = window_id, inputs, steer, window_name, cwd
+        _ = window_id, inputs, steer, force_new_turn, window_name, cwd
         nonlocal active, max_active, started
         active += 1
         max_active = max(max_active, active)
@@ -111,10 +113,11 @@ async def test_send_to_window_serializes_app_server_turn_mutations(monkeypatch, 
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
-        _ = window_id, inputs, steer, window_name, cwd
+        _ = window_id, inputs, steer, force_new_turn, window_name, cwd
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)

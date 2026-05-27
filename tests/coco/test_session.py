@@ -432,7 +432,14 @@ class TestHostFollowTakeover:
             resumed.append((window_id, cwd))
             return "thread-new"
 
-        async def _send_to_window(window_id: str, text: str, *, steer: bool = False):
+        async def _send_to_window(
+            window_id: str,
+            text: str,
+            *,
+            steer: bool = False,
+            force_new_turn: bool = False,
+        ):
+            _ = force_new_turn
             sent.append((window_id, text, steer))
             return True, "ok"
 
@@ -1322,12 +1329,14 @@ async def test_send_inputs_to_window_app_server_only_uses_cached_state_without_l
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
         captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
         captured["window_name"] = window_name
         captured["cwd"] = cwd
         return True, "ok"
@@ -1366,12 +1375,14 @@ async def test_send_inputs_to_window_hybrid_app_server_mode_skips_legacy_lookup(
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
         captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
         captured["window_name"] = window_name
         captured["cwd"] = cwd
         return True, "ok"
@@ -1459,10 +1470,11 @@ async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
-        _ = window_id, inputs, window_name, cwd
+        _ = window_id, inputs, window_name, cwd, force_new_turn
         call_states.append(mgr.get_window_codex_thread_id("@900003"))
         if len(call_states) == 1:
             assert steer is False
@@ -1543,10 +1555,11 @@ async def test_send_inputs_to_window_thread_not_found_prefers_latest_cwd_resume(
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
-        _ = window_id, inputs, window_name, cwd
+        _ = window_id, inputs, window_name, cwd, force_new_turn
         call_states.append(mgr.get_window_codex_thread_id("@900007"))
         if len(call_states) == 1:
             assert steer is False
@@ -1653,10 +1666,11 @@ async def test_send_inputs_to_window_turn_steer_timeout_retries_with_turn_start(
         window_id: str,
         inputs: list[dict[str, object]],
         steer: bool,
+        force_new_turn: bool = False,
         window_name: str,
         cwd: str,
     ):
-        _ = window_id, inputs, window_name, cwd, steer
+        _ = window_id, inputs, window_name, cwd, steer, force_new_turn
         call_states.append(
             (
                 mgr.get_window_codex_thread_id("@900005"),
@@ -1755,6 +1769,73 @@ async def test_send_inputs_to_window_turn_steer_timeout_retry_failure_returns_co
     event, payload = telemetry_events[-1]
     assert event == "transport.app_server.send_failed"
     assert payload["fallback_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_to_window_force_new_turn_ignores_cached_active_turn(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    state = mgr.get_window_state("@900008")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+    state.codex_active_turn_id = "turn-stale"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    async def _ensure_codex_thread_for_window(**_kwargs):
+        return "thread-live", "full-auto"
+
+    turn_start_calls: list[dict[str, object]] = []
+
+    async def _turn_start_with_retry(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str,
+        service_tier: str,
+    ):
+        turn_start_calls.append(
+            {
+                "thread_id": thread_id,
+                "inputs": inputs,
+                "approval_policy": approval_policy,
+                "service_tier": service_tier,
+            }
+        )
+        return {"turn": {"id": "turn-new"}}
+
+    async def _unexpected_turn_steer(**_kwargs):
+        raise AssertionError("force_new_turn should bypass turn/steer")
+
+    monkeypatch.setattr(mgr, "_ensure_codex_thread_for_window", _ensure_codex_thread_for_window)
+    monkeypatch.setattr(mgr, "_turn_start_with_retry", _turn_start_with_retry)
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_steer",
+        _unexpected_turn_steer,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "turn-live-from-client",
+    )
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900008",
+        [{"type": "text", "text": "queued task"}],
+        steer=False,
+        force_new_turn=True,
+    )
+
+    assert ok is True
+    assert msg == "Sent via app-server to demo"
+    assert len(turn_start_calls) == 1
+    assert turn_start_calls[0]["thread_id"] == "thread-live"
+    assert mgr.get_window_codex_active_turn_id("@900008") == "turn-new"
 
 
 @pytest.mark.asyncio
@@ -1864,10 +1945,12 @@ async def test_send_topic_text_to_window_injects_app_context_for_app_server(
         inputs: list[dict[str, object]],
         *,
         steer: bool = False,
+        force_new_turn: bool = False,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
         captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
         return True, "ok"
 
     monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
@@ -1916,10 +1999,12 @@ async def test_send_topic_text_to_window_uses_codex_skill_inputs_for_app_server(
         inputs: list[dict[str, object]],
         *,
         steer: bool = False,
+        force_new_turn: bool = False,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
         captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
         return True, "ok"
 
     monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
@@ -1972,7 +2057,14 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
 
     captured: dict[str, object] = {}
 
-    async def _send_to_window(window_id: str, text: str, *, steer: bool = False):
+    async def _send_to_window(
+        window_id: str,
+        text: str,
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+    ):
+        _ = force_new_turn
         captured["window_id"] = window_id
         captured["text"] = text
         captured["steer"] = steer

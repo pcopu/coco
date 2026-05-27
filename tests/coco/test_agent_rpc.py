@@ -62,6 +62,7 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         inputs,
         *,
         steer=False,
+        force_new_turn=False,
         model_slug="",
         reasoning_effort="",
         service_tier="",
@@ -69,6 +70,7 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
         captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
         captured["model_slug"] = model_slug
         captured["reasoning_effort"] = reasoning_effort
         captured["service_tier"] = service_tier
