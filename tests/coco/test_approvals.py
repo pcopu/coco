@@ -3,6 +3,8 @@
 from pathlib import Path
 import shlex
 
+import pytest
+
 import coco.bot as bot
 
 
@@ -188,3 +190,33 @@ def test_build_approvals_text_includes_runtime_write_status(monkeypatch):
     assert "Runtime write check: `not writable`" in text
     assert "Write error: `permission denied`" in text
     assert "Panel: `session override`" in text
+
+
+@pytest.mark.asyncio
+async def test_probe_workspace_write_access_for_remote_window_uses_agent(monkeypatch):
+    monkeypatch.setattr(bot.session_manager, "get_window_machine_id", lambda _wid: "remote-node")
+    monkeypatch.setattr(bot, "_local_machine_identity", lambda: ("local-node", "Local Node"))
+
+    def _fail_local_probe(_workspace_dir: str):
+        raise AssertionError("local probe should not run for remote windows")
+
+    async def _fake_remote_probe(machine_id: str, *, workspace_dir: str):
+        assert machine_id == "remote-node"
+        assert workspace_dir == r"D:\0dev\raja"
+        return {
+            "workspace_path": workspace_dir,
+            "can_write": True,
+            "write_error": "",
+        }
+
+    monkeypatch.setattr(bot, "_probe_workspace_write_access", _fail_local_probe)
+    monkeypatch.setattr(bot.agent_rpc_client, "probe_workspace_write_access", _fake_remote_probe)
+
+    checked_path, can_write, write_error = await bot._probe_workspace_write_access_for_window(
+        "@1",
+        workspace_dir=r"D:\0dev\raja",
+    )
+
+    assert checked_path == r"D:\0dev\raja"
+    assert can_write is True
+    assert write_error is None

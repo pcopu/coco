@@ -2047,6 +2047,34 @@ def _local_machine_identity() -> tuple[str, str]:
     return machine_id, machine_name
 
 
+async def _probe_workspace_write_access_for_window(
+    window_id: str,
+    *,
+    workspace_dir: str | None = None,
+) -> tuple[str, bool, str | None]:
+    machine_id = session_manager.get_window_machine_id(window_id).strip()
+    local_machine_id, _local_machine_name = _local_machine_identity()
+    if not machine_id or machine_id == local_machine_id:
+        return _probe_workspace_write_access(workspace_dir)
+
+    from .agent_rpc import agent_rpc_client
+
+    try:
+        payload = await agent_rpc_client.probe_workspace_write_access(
+            machine_id,
+            workspace_dir=(workspace_dir or "").strip(),
+        )
+    except Exception as exc:
+        checked_path = (workspace_dir or "").strip()
+        return checked_path, False, f"Remote probe failed: {exc}"
+
+    checked_path = str(payload.get("workspace_path", workspace_dir or "")).strip()
+    can_write = bool(payload.get("can_write", False))
+    raw_error = payload.get("write_error")
+    write_error = raw_error.strip() if isinstance(raw_error, str) and raw_error.strip() else None
+    return checked_path, can_write, write_error
+
+
 def _sorted_machine_choices() -> list[object]:
     node_registry.ensure_local_node()
     local_machine_id, _ = _local_machine_identity()
@@ -2190,6 +2218,7 @@ def _build_approvals_text(
     window_id: str,
     *,
     workspace_dir: str | None = None,
+    workspace_probe: tuple[str, bool, str | None] | None = None,
     defaults_view: bool = False,
 ) -> str:
     """Build /approvals panel text for one bound session."""
@@ -2202,7 +2231,7 @@ def _build_approvals_text(
         else _approval_mode_display_text(window_override_mode)
     )
     display = session_manager.get_display_name(window_id)
-    checked_path, can_write, write_error = _probe_workspace_write_access(workspace_dir)
+    checked_path, can_write, write_error = workspace_probe or _probe_workspace_write_access(workspace_dir)
     write_state = "writable" if can_write else "not writable"
     panel_label = "app default" if defaults_view else "session override"
     lines = [
@@ -9997,12 +10026,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             thread_id=cb_thread_id,
             window_id=wid,
         )
+        workspace_probe = await _probe_workspace_write_access_for_window(
+            wid,
+            workspace_dir=workspace_dir,
+        )
         await safe_edit(
             query,
             _build_approvals_text(
                 user.id,
                 wid,
                 workspace_dir=workspace_dir,
+                workspace_probe=workspace_probe,
                 defaults_view=False,
             ),
             reply_markup=_build_approvals_keyboard(
@@ -10037,12 +10071,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             thread_id=cb_thread_id,
             window_id=wid,
         )
+        workspace_probe = await _probe_workspace_write_access_for_window(
+            wid,
+            workspace_dir=workspace_dir,
+        )
         await safe_edit(
             query,
             _build_approvals_text(
                 user.id,
                 wid,
                 workspace_dir=workspace_dir,
+                workspace_probe=workspace_probe,
                 defaults_view=True,
             ),
             reply_markup=_build_approvals_keyboard(
@@ -10096,12 +10135,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             thread_id=cb_thread_id,
             window_id=wid,
         )
+        workspace_probe = await _probe_workspace_write_access_for_window(
+            wid,
+            workspace_dir=workspace_dir,
+        )
         await safe_edit(
             query,
             _build_approvals_text(
                 user.id,
                 wid,
                 workspace_dir=workspace_dir,
+                workspace_probe=workspace_probe,
                 defaults_view=False,
             ),
             reply_markup=_build_approvals_keyboard(
@@ -10149,12 +10193,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             thread_id=cb_thread_id,
             window_id=wid,
         )
+        workspace_probe = await _probe_workspace_write_access_for_window(
+            wid,
+            workspace_dir=workspace_dir,
+        )
         await safe_edit(
             query,
             _build_approvals_text(
                 user.id,
                 wid,
                 workspace_dir=workspace_dir,
+                workspace_probe=workspace_probe,
                 defaults_view=True,
             ),
             reply_markup=_build_approvals_keyboard(

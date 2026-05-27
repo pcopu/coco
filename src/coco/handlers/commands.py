@@ -623,6 +623,10 @@ async def approvals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         thread_id=thread_id,
         window_id=wid,
     )
+    workspace_probe = await _probe_workspace_write_access_for_window(
+        wid,
+        workspace_dir=workspace_dir,
+    )
 
     await safe_reply(
         update.message,
@@ -630,6 +634,7 @@ async def approvals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             user.id,
             wid,
             workspace_dir=workspace_dir,
+            workspace_probe=workspace_probe,
             defaults_view=False,
         ),
         reply_markup=_build_approvals_keyboard(

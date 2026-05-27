@@ -43,6 +43,27 @@ _COCO_SELF_UPDATE_COMMAND_ENV = "COCO_SELF_UPDATE_COMMAND"
 _CODEX_UPGRADE_COMMAND_ENV = "COCO_CODEX_UPGRADE_COMMAND"
 
 
+def _probe_workspace_write_access(workspace_dir: str) -> tuple[str, bool, str | None]:
+    checked_path = workspace_dir or ""
+    if not checked_path:
+        return checked_path, False, "No workspace configured"
+    try:
+        target = Path(checked_path).expanduser()
+    except (RuntimeError, ValueError) as exc:
+        return checked_path, False, str(exc)
+    if not target.exists():
+        return str(target), False, "Directory does not exist"
+    if not target.is_dir():
+        return str(target), False, "Path is not a directory"
+    probe = target / ".coco_write_probe"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return str(target), True, None
+    except Exception as exc:
+        return str(target), False, str(exc)
+
+
 def _resolve_attachment_path(
     *,
     workspace_dir: str,
@@ -226,6 +247,7 @@ class AgentRpcServer:
         self._probe_client = ClusterRpcClient(shared_secret=shared_secret, timeout_seconds=10.0)
         self._server.register("agent/ping", self._ping)
         self._server.register("agent/probe_machine", self._probe_machine)
+        self._server.register("agent/probe_workspace_write_access", self._probe_workspace_write_access)
         self._server.register("agent/browse", self._browse)
         self._server.register("agent/folder_sessions", self._folder_sessions)
         self._server.register("agent/list_threads", self._list_threads)
@@ -291,6 +313,15 @@ class AgentRpcServer:
             "root_path": str(root),
             "current_path": str(current),
             "subdirs": subdirs,
+        }
+
+    async def _probe_workspace_write_access(self, params: dict[str, Any]) -> dict[str, Any]:
+        workspace_dir = str(params.get("workspace_dir", "")).strip()
+        checked_path, can_write, write_error = _probe_workspace_write_access(workspace_dir)
+        return {
+            "workspace_path": checked_path,
+            "can_write": can_write,
+            "write_error": write_error or "",
         }
 
     async def _folder_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -610,6 +641,23 @@ class AgentRpcClient:
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid browse response")
+        return result
+
+    async def probe_workspace_write_access(
+        self,
+        machine_id: str,
+        *,
+        workspace_dir: str,
+    ) -> dict[str, Any]:
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/probe_workspace_write_access",
+            params={"workspace_dir": workspace_dir},
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid workspace probe response")
         return result
 
     async def folder_sessions(

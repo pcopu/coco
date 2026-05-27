@@ -170,3 +170,33 @@ async def test_agent_rpc_probe_machine_via_remote_monitor(monkeypatch, tmp_path)
         assert payload["display_name"] == "Target Node"
     finally:
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_probe_workspace_write_access_round_trip(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        host, port = server.bound_address()
+        node_registry.note_heartbeat(
+            machine_id="probe-node",
+            display_name="Probe Node",
+            transport="agent_rpc",
+            rpc_host=host,
+            rpc_port=port,
+            is_local=False,
+            now=100.0,
+        )
+        client = AgentRpcClient(shared_secret="rpc-secret")
+        payload = await client.probe_workspace_write_access(
+            "probe-node",
+            workspace_dir=str(workspace),
+        )
+        assert payload["workspace_path"] == str(workspace)
+        assert payload["can_write"] is True
+        assert payload["write_error"] == ""
+    finally:
+        await server.stop()
