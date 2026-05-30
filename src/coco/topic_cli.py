@@ -15,9 +15,12 @@ from .config import config
 from .handlers.autoresearch import get_autoresearch_state
 from .handlers.looper import get_looper_state
 from .handlers.topic_send import send_message_to_topic, send_text_to_topic
+from .runtime_capabilities import (
+    get_transcription_runtime_summary,
+    get_tts_runtime_summary,
+)
 from .session import TopicBinding, WindowState, session_manager
 from .skills import SkillDefinition
-from .transcription import resolve_transcription_runtime
 
 
 def _extract_json_flag(argv: list[str]) -> tuple[list[str], bool]:
@@ -270,7 +273,8 @@ def _build_payload(*, target: app_cli.TopicTarget) -> dict[str, Any]:
     catalog = session_manager.discover_skill_catalog()
     topic = _topic_payload(target=target, binding=binding)
     session = _session_payload(target=target, binding=binding)
-    transcription_runtime = resolve_transcription_runtime("compatible")
+    transcription_runtime = get_transcription_runtime_summary("compatible")
+    tts_runtime = get_tts_runtime_summary()
     commands_available = sorted({*command_cli.CLI_COMMAND_NAMES, "apps", "topic"})
     return {
         "topic": topic,
@@ -280,11 +284,12 @@ def _build_payload(*, target: app_cli.TopicTarget) -> dict[str, Any]:
             "examples": _command_examples(),
         },
         "transcription": {
-            "mode": "compatible",
-            "device": transcription_runtime.device,
-            "compute_type": transcription_runtime.compute_type,
-            "model_name": transcription_runtime.model_name,
+            "mode": transcription_runtime["mode"],
+            "device": transcription_runtime["device"],
+            "compute_type": transcription_runtime["compute_type"],
+            "model_name": transcription_runtime["model_name"],
         },
+        "tts": tts_runtime,
         "apps": _apps_payload(target=target, catalog=catalog),
     }
 
@@ -294,6 +299,7 @@ def _render_text(payload: dict[str, Any]) -> str:
     session = payload["session"]
     apps = payload["apps"]
     transcription = payload["transcription"]
+    tts = payload["tts"]
     enabled_names = [app["name"] for app in apps if app.get("enabled")]
     lines = [
         (
@@ -321,6 +327,14 @@ def _render_text(payload: dict[str, Any]) -> str:
                 "Transcription: "
                 f"`{transcription['mode']}` -> "
                 f"`{transcription['device']} / {transcription['compute_type']} / {transcription['model_name']}`"
+            ),
+            (
+                "TTS: "
+                + (
+                    f"`available` -> `{tts['default_voice']} @ {tts['default_speed']:.1f}x`"
+                    if tts.get("available")
+                    else "`unavailable`"
+                )
             ),
             (
                 "Enabled apps: "

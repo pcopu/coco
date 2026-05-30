@@ -36,8 +36,10 @@ from .message_sender import (
     NO_LINK_PREVIEW,
     send_documents,
     send_photo,
+    send_voice,
     send_with_fallback,
 )
+from ..tts import TtsError, synthesize_voice_note
 
 logger = logging.getLogger(__name__)
 
@@ -726,6 +728,33 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
+    if (
+        task.content_type == "text"
+        and task.text
+        and not task.image_data
+        and not task.document_data
+        and session_manager.get_topic_response_mode(
+            user_id,
+            task.thread_id,
+            chat_id=chat_id,
+        )
+        == "voice"
+    ):
+        try:
+            media_type, raw_bytes = await synthesize_voice_note(task.text)
+        except TtsError:
+            logger.warning("Voice synthesis failed for %s; falling back to text", wid, exc_info=True)
+        else:
+            await send_voice(
+                bot,
+                chat_id,
+                media_type,
+                raw_bytes,
+                **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            )
+            await _check_and_send_status(bot, user_id, wid, task.thread_id)
+            return
+
     first_part = True
     last_msg_id: int | None = None
     for part in task.parts:

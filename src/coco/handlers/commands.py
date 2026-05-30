@@ -27,6 +27,8 @@ _COMMAND_HANDLER_NAMES = {
     "goal_command",
     "model_command",
     "fast_command",
+    "coco_command",
+    "voice_command",
     "transcription_command",
     "update_command",
 }
@@ -426,6 +428,9 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     thread_id=codex_thread_id,
                     turn_id=active_turn_id,
                 )
+                import coco.bot as bot_mod
+
+                bot_mod._interrupted_codex_threads.add(codex_thread_id)
                 session_manager.clear_window_codex_turn(wid)
                 await safe_reply(update.message, "⎋ Interrupted active turn")
                 return
@@ -2216,6 +2221,203 @@ async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _sync_bot_globals()
+    """Show or assign the singleton `/coco` control topic."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not await _ensure_chat_allowed(update):
+        return
+    if not update.message:
+        return
+
+    thread_id = update.message.message_thread_id
+    if thread_id is None:
+        await safe_reply(update.message, "❌ Use `/coco` inside a named topic.")
+        return
+    chat_id = _scoped_chat_id(update)
+    if chat_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+
+    raw_args = _extract_command_args(update.message.text or "").strip()
+    if raw_args:
+        if not session_manager.is_coco_control_topic(
+            user.id,
+            thread_id,
+            chat_id=chat_id,
+        ):
+            await safe_reply(
+                update.message,
+                "❌ This topic is not the active CoCo control topic yet. Run `/coco` and confirm first.",
+            )
+            return
+        parts = raw_args.split(maxsplit=2)
+        subcommand = parts[0].strip().lower()
+        if subcommand == "topics":
+            inventory = _build_coco_topic_inventory_text(
+                current_user_id=user.id,
+                current_thread_id=thread_id,
+                current_chat_id=chat_id,
+            )
+            await safe_reply(update.message, inventory)
+            return
+        if subcommand in {"steer", "queue"}:
+            if len(parts) < 3:
+                await safe_reply(
+                    update.message,
+                    "Usage: `/coco steer <thread_id|name> <message>` or `/coco queue <thread_id|name> <message>`",
+                )
+                return
+            target = _resolve_coco_target_topic(
+                current_user_id=user.id,
+                current_thread_id=thread_id,
+                current_chat_id=chat_id,
+                raw_target=parts[1],
+            )
+            if target is None:
+                await safe_reply(update.message, f"❌ Unknown target topic `{parts[1]}`.")
+                return
+            target_user_id, target_chat_id, target_thread_id, target_binding = target
+            wid = session_manager.resolve_window_for_thread(
+                target_user_id,
+                target_thread_id,
+                chat_id=target_chat_id,
+            )
+            if not wid:
+                await safe_reply(update.message, "❌ Target topic is not bound to a session yet.")
+                return
+            payload_text = parts[2].strip()
+            if not payload_text:
+                await safe_reply(update.message, "❌ Message cannot be empty.")
+                return
+            if subcommand == "queue":
+                qsize = enqueue_queued_topic_input(
+                    target_user_id,
+                    target_thread_id,
+                    payload_text,
+                    update.message.chat_id,
+                    update.message.message_id,
+                )
+                await sync_queued_topic_dock(
+                    context.bot,
+                    target_user_id,
+                    target_thread_id,
+                    window_id=wid,
+                )
+                await safe_reply(
+                    update.message,
+                    f"✅ Queued topic `{target_thread_id}` (`{str(target_binding.display_name or target_thread_id)}`). Pending: `{qsize}`",
+                )
+                return
+            success, send_msg = await session_manager.send_topic_text_to_window(
+                user_id=target_user_id,
+                thread_id=target_thread_id,
+                chat_id=target_chat_id,
+                window_id=wid,
+                text=payload_text,
+                steer=True,
+            )
+            if not success:
+                await safe_reply(update.message, f"❌ {send_msg}")
+                return
+            await safe_reply(
+                update.message,
+                f"✅ Steered topic `{target_thread_id}` (`{str(target_binding.display_name or target_thread_id)}`).",
+            )
+            return
+        await safe_reply(
+            update.message,
+            "Usage: `/coco`, `/coco topics`, `/coco steer <thread_id|name> <message>`, or `/coco queue <thread_id|name> <message>`",
+        )
+        return
+
+    binding, suggested_workspace = _ensure_coco_control_workspace_binding(
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
+    current_control = session_manager.get_coco_control_topic()
+    is_current = session_manager.is_coco_control_topic(
+        user.id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    current_binding = None
+    if current_control is not None:
+        current_binding = session_manager.resolve_topic_binding(
+            current_control.user_id,
+            current_control.thread_id,
+            chat_id=current_control.chat_id or None,
+        )
+
+    await safe_reply(
+        update.message,
+        _build_coco_control_text(
+            current_user_id=user.id,
+            current_thread_id=thread_id,
+            current_chat_id=chat_id,
+            binding=binding,
+            current_control=current_control,
+            current_control_binding=current_binding,
+            suggested_workspace=suggested_workspace,
+            is_current=is_current,
+        ),
+        reply_markup=_build_coco_control_keyboard(is_current=is_current),
+    )
+
+
+def _build_coco_topic_inventory_text(
+    *,
+    current_user_id: int,
+    current_thread_id: int,
+    current_chat_id: int | None,
+) -> str:
+    lines = ["CoCo control topic inventory", ""]
+    for user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
+        if user_id != current_user_id:
+            continue
+        if chat_id != current_chat_id:
+            continue
+        if thread_id == current_thread_id:
+            continue
+        label = str(binding.display_name or "").strip() or f"thread-{thread_id}"
+        workspace = str(binding.cwd or "").strip() or "(no workspace)"
+        lines.append(f"- thread `{thread_id}` — `{label}` — `{workspace}`")
+    if len(lines) == 2:
+        lines.append("(no other topics found in this chat)")
+    return "\n".join(lines)
+
+
+def _resolve_coco_target_topic(
+    *,
+    current_user_id: int,
+    current_thread_id: int,
+    current_chat_id: int | None,
+    raw_target: str,
+) -> tuple[int, int | None, int, TopicBinding] | None:
+    normalized = raw_target.strip()
+    if not normalized:
+        return None
+    by_thread_id: int | None = None
+    try:
+        by_thread_id = int(normalized)
+    except ValueError:
+        by_thread_id = None
+    lowered = normalized.lower()
+    for user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
+        if user_id != current_user_id or chat_id != current_chat_id:
+            continue
+        if thread_id == current_thread_id:
+            continue
+        if by_thread_id is not None and thread_id == by_thread_id:
+            return user_id, chat_id, thread_id, binding
+        display_name = str(binding.display_name or "").strip().lower()
+        if display_name and display_name == lowered:
+            return user_id, chat_id, thread_id, binding
+    return None
+
+
 async def transcription_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_bot_globals()
     """Show fixed local transcription mode."""
@@ -2245,6 +2447,69 @@ async def transcription_command(update: Update, context: ContextTypes.DEFAULT_TY
             f"Resolved here: `{runtime.device} / {runtime.compute_type} / {runtime.model_name}`"
         ),
     )
+
+
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _sync_bot_globals()
+    """Show or change per-topic voice reply mode."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not await _ensure_chat_allowed(update):
+        return
+    if not update.message:
+        return
+
+    thread_id = update.message.message_thread_id
+    if thread_id is None:
+        await safe_reply(update.message, "❌ Use `/voice` inside a named topic.")
+        return
+    chat_id = _scoped_chat_id(update)
+    raw_args = _extract_command_args(update.message.text or "").strip().lower()
+
+    if not raw_args or raw_args == "status":
+        response_mode = session_manager.get_topic_response_mode(
+            user.id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        state_label = "ON" if response_mode == "voice" else "OFF"
+        await safe_reply(
+            update.message,
+            (
+                f"Voice replies for this topic are currently `{state_label}`.\n"
+                f"Default voice: `{get_default_tts_voice()}`\n"
+                f"Default speed: `{get_default_tts_speed():.1f}`"
+            ),
+        )
+        return
+
+    if raw_args not in {"on", "off"}:
+        await safe_reply(
+            update.message,
+            "Usage: `/voice`, `/voice status`, `/voice on`, or `/voice off`",
+        )
+        return
+
+    desired_mode = "voice" if raw_args == "on" else "text"
+    session_manager.set_topic_response_mode(
+        user.id,
+        thread_id,
+        chat_id=chat_id,
+        response_mode=desired_mode,
+    )
+    if desired_mode == "voice":
+        await safe_reply(
+            update.message,
+            (
+                "✅ Voice replies are now `ON` for this topic.\n"
+                f"Current default voice: `{get_default_tts_voice()}`\n"
+                f"Current default speed: `{get_default_tts_speed():.1f}`"
+            ),
+        )
+        return
+
+    await safe_reply(update.message, "✅ Voice replies are now `OFF` for this topic.")
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

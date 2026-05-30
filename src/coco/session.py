@@ -37,10 +37,14 @@ import aiofiles
 from .codex_app_server import CodexAppServerError, codex_app_server_client
 from .config import config
 from .node_registry import node_registry
+from .runtime_capabilities import (
+    get_transcription_runtime_summary,
+    get_tts_runtime_summary,
+)
 from .skills import SkillDefinition, discover_skills, resolve_skill_identifier
 from .telemetry import emit_telemetry
 from .transcript_parser import TranscriptParser
-from .utils import atomic_write_json
+from .utils import atomic_write_json, env_alias
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +185,7 @@ class TopicBinding:
     model_slug: str = ""
     reasoning_effort: str = ""
     service_tier: str = ""
+    response_mode: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -210,6 +215,8 @@ class TopicBinding:
             d["reasoning_effort"] = self.reasoning_effort
         if self.service_tier:
             d["service_tier"] = self.service_tier
+        if self.response_mode:
+            d["response_mode"] = self.response_mode
         return d
 
     @classmethod
@@ -242,6 +249,14 @@ class TopicBinding:
         )
         if service_tier not in CODEX_SERVICE_TIERS:
             service_tier = ""
+        raw_response_mode = data.get("response_mode", "")
+        response_mode = (
+            str(raw_response_mode).strip().lower()
+            if isinstance(raw_response_mode, str)
+            else ""
+        )
+        if response_mode not in {"text", "voice"}:
+            response_mode = ""
         if transport not in {
             TOPIC_BINDING_TRANSPORT_WINDOW,
             TOPIC_BINDING_TRANSPORT_CODEX_THREAD,
@@ -265,7 +280,38 @@ class TopicBinding:
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
+            response_mode=response_mode,
         )
+
+
+@dataclass
+class CocoControlTopic:
+    """Singleton CoCo control-topic assignment."""
+
+    user_id: int
+    thread_id: int
+    chat_id: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "user_id": self.user_id,
+            "thread_id": self.thread_id,
+        }
+        if self.chat_id:
+            payload["chat_id"] = self.chat_id
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CocoControlTopic | None":
+        try:
+            user_id = int(data.get("user_id", 0) or 0)
+            thread_id = int(data.get("thread_id", 0) or 0)
+            chat_id = int(data.get("chat_id", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if user_id <= 0 or thread_id <= 0:
+            return None
+        return cls(user_id=user_id, thread_id=thread_id, chat_id=chat_id)
 
 
 @dataclass
@@ -317,6 +363,8 @@ class SessionManager:
     default_approval_mode: str = ""
     # machine_id -> server-wide transcription profile selection
     machine_transcription_profiles: dict[str, str] = field(default_factory=dict)
+    # Singleton control-topic assignment for `/coco`.
+    coco_control_topic: CocoControlTopic | None = None
     # Per-window send/steer lock. Prevents concurrent turn mutations in one window.
     _window_send_locks: dict[str, asyncio.Lock] = field(
         default_factory=dict,
@@ -387,6 +435,8 @@ class SessionManager:
             state["default_approval_mode"] = self.default_approval_mode
         if self.machine_transcription_profiles:
             state["machine_transcription_profiles"] = self.machine_transcription_profiles
+        if self.coco_control_topic is not None:
+            state["coco_control_topic"] = self.coco_control_topic.to_dict()
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
 
@@ -462,6 +512,7 @@ class SessionManager:
                     model_slug=binding.model_slug,
                     reasoning_effort=binding.reasoning_effort,
                     service_tier=binding.service_tier,
+                    response_mode=binding.response_mode,
                 )
             if per_user:
                 combined[user_id] = per_user
@@ -667,6 +718,13 @@ class SessionManager:
                     if normalized_profile not in TRANSCRIPTION_PROFILES:
                         continue
                     self.machine_transcription_profiles[machine_id] = normalized_profile
+                raw_coco_control_topic = state.get("coco_control_topic")
+                if isinstance(raw_coco_control_topic, dict):
+                    self.coco_control_topic = CocoControlTopic.from_dict(
+                        raw_coco_control_topic
+                    )
+                else:
+                    self.coco_control_topic = None
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -709,6 +767,7 @@ class SessionManager:
                 self.group_chat_ids = {}
                 self.default_approval_mode = ""
                 self.machine_transcription_profiles = {}
+                self.coco_control_topic = None
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -1837,6 +1896,189 @@ class SessionManager:
         lines.append(text)
         return "\n".join(lines)
 
+    def _build_coco_operator_context(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+    ) -> str:
+        """Build a concise operator brief for the singleton `/coco` control topic."""
+        if not self.is_coco_control_topic(user_id, thread_id, chat_id=chat_id):
+            return ""
+
+        normalized_chat_id = int(chat_id or 0)
+        inventory: list[str] = []
+        for entry_user_id, entry_chat_id, entry_thread_id, binding in self.iter_topic_bindings():
+            if entry_user_id != user_id:
+                continue
+            if int(entry_chat_id or 0) != normalized_chat_id:
+                continue
+            if thread_id is not None and entry_thread_id == thread_id:
+                continue
+            label = binding.display_name.strip() or f"thread-{entry_thread_id}"
+            cwd = binding.cwd.strip() or "(no workspace)"
+            machine_name = (
+                binding.machine_display_name.strip()
+                or binding.machine_id.strip()
+                or "unknown"
+            )
+            sync_mode = self.get_topic_sync_mode(
+                entry_user_id,
+                entry_thread_id,
+                chat_id=entry_chat_id,
+            )
+            response_mode = self.get_topic_response_mode(
+                entry_user_id,
+                entry_thread_id,
+                chat_id=entry_chat_id,
+            )
+            turn_status = "idle"
+            window_id = binding.window_id.strip()
+            if window_id and self.get_window_codex_active_turn_id(window_id):
+                turn_status = "active"
+            inventory.append(
+                f"- thread `{entry_thread_id}`: `{label}` — "
+                f"machine `{machine_name}`, "
+                f"sync `{sync_mode}`, "
+                f"response `{response_mode}`, "
+                f"turn `{turn_status}`, "
+                f"workspace `{cwd}`"
+            )
+
+        lines = [
+            "[coco operator]",
+            "This topic is the singleton CoCo control topic.",
+            "You can inspect, summarize, and steer other topics in this chat.",
+            "When useful, answer from the control-plane perspective and suggest `/coco steer` or `/coco queue` targets explicitly.",
+        ]
+        if inventory:
+            lines.append("Current topic inventory:")
+            lines.extend(inventory)
+        else:
+            lines.append("Current topic inventory: no other bound topics yet.")
+        recent_activity = self._build_coco_recent_activity_summary(
+            user_id=user_id,
+            chat_id=normalized_chat_id,
+            current_thread_id=thread_id,
+        )
+        if recent_activity:
+            lines.append("Recent visible activity:")
+            lines.extend(recent_activity)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _telegram_memory_log_path() -> Path:
+        raw = env_alias("COCO_TELEGRAM_MEMORY_LOG_PATH")
+        if raw:
+            return Path(raw).expanduser()
+        return Path(__file__).resolve().parents[2] / "TELEGRAM_CHAT_MEMORY.jsonl"
+
+    @staticmethod
+    def _is_substantive_telegram_memory_text(text: str) -> bool:
+        value = " ".join(text.strip().split())
+        if not value:
+            return False
+        lowered = value.lower()
+        if lowered.startswith("⏳ working"):
+            return False
+        if lowered == "✅ process complete":
+            return False
+        return True
+
+    def _build_coco_recent_activity_summary(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        current_thread_id: int | None,
+    ) -> list[str]:
+        path = self._telegram_memory_log_path()
+        if not path.is_file():
+            return []
+
+        topic_labels: dict[int, str] = {}
+        for entry_user_id, entry_chat_id, entry_thread_id, binding in self.iter_topic_bindings():
+            if entry_user_id != user_id:
+                continue
+            if int(entry_chat_id or 0) != chat_id:
+                continue
+            if current_thread_id is not None and entry_thread_id == current_thread_id:
+                continue
+            topic_labels[entry_thread_id] = binding.display_name.strip() or f"thread-{entry_thread_id}"
+        if not topic_labels:
+            return []
+
+        recent_by_thread: dict[int, list[str]] = {tid: [] for tid in topic_labels}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
+        for raw_line in reversed(lines):
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if int(data.get("chat_id", 0) or 0) != chat_id:
+                continue
+            raw_thread_id = int(data.get("thread_id", 0) or 0)
+            if raw_thread_id not in recent_by_thread:
+                continue
+            direction = str(data.get("direction", "")).strip()
+            if direction == "in":
+                if int(data.get("from_user_id", 0) or 0) != user_id:
+                    continue
+                speaker = "User"
+            elif direction in {"out_send", "out_edit"}:
+                speaker = "CoCo"
+            else:
+                continue
+            text = str(data.get("text", "")).strip()
+            if not self._is_substantive_telegram_memory_text(text):
+                continue
+            if text.startswith("I’m ") and "Working" not in text and speaker == "CoCo":
+                text = text
+            bucket = recent_by_thread[raw_thread_id]
+            if len(bucket) >= 2:
+                continue
+            bucket.append(f"{speaker}: {text}")
+
+        summary_lines: list[str] = []
+        for thread_key in sorted(topic_labels):
+            entries = list(reversed(recent_by_thread.get(thread_key, [])))
+            if not entries:
+                continue
+            summary_lines.append(f"{topic_labels[thread_key]}: {' | '.join(entries)}")
+        return summary_lines
+
+    def _inject_topic_context(
+        self,
+        text: str,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+        apps: list[SkillDefinition],
+        codex_skills: list[SkillDefinition],
+    ) -> str:
+        """Inject all topic-scoped guidance before message delivery."""
+        enriched = self._inject_skill_context(
+            text,
+            apps=apps,
+            codex_skills=codex_skills,
+        )
+        operator_context = self._build_coco_operator_context(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        ).strip()
+        if not operator_context:
+            return enriched
+        return f"{operator_context}\n\n{enriched}"
+
     async def send_topic_text_to_window(
         self,
         *,
@@ -1851,6 +2093,11 @@ class SessionManager:
         """Send user/topic text with app/skill context applied."""
         machine_id = self.get_window_machine_id(window_id)
         local_machine_id, _local_machine_name = self._local_machine_identity()
+        operator_context = self._build_coco_operator_context(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        ).strip()
         if (
             thread_id is not None
             and self._codex_app_server_mode_enabled()
@@ -1890,7 +2137,7 @@ class SessionManager:
         codex_skills = self.resolve_thread_codex_skills(
             user_id, thread_id, chat_id=chat_id
         )
-        if not apps and not codex_skills:
+        if not apps and not codex_skills and not operator_context:
             if machine_id and machine_id != local_machine_id:
                 from .agent_rpc import agent_rpc_client
 
@@ -1967,6 +2214,8 @@ class SessionManager:
                 }
                 for skill in codex_skills
             ]
+            if operator_context:
+                inputs.insert(0, {"type": "text", "text": operator_context})
             if apps:
                 app_context = self._inject_skill_context(
                     "",
@@ -2042,8 +2291,11 @@ class SessionManager:
                 )
             return ok, msg
 
-        injected = self._inject_skill_context(
+        injected = self._inject_topic_context(
             text,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
             apps=apps,
             codex_skills=codex_skills,
         )
@@ -2115,6 +2367,48 @@ class SessionManager:
             return None
         return self.topic_bindings_v2.get(user_id, {}).get(slot_key)
 
+    def get_coco_control_topic(self) -> CocoControlTopic | None:
+        """Return the singleton `/coco` control-topic assignment."""
+        return self.coco_control_topic
+
+    def is_coco_control_topic(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> bool:
+        """Return whether one topic is the active `/coco` control topic."""
+        if thread_id is None or self.coco_control_topic is None:
+            return False
+        if self.coco_control_topic.user_id != user_id:
+            return False
+        if self.coco_control_topic.thread_id != thread_id:
+            return False
+        normalized_chat_id = int(chat_id or 0)
+        return self.coco_control_topic.chat_id == normalized_chat_id
+
+    def set_coco_control_topic(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> TopicBinding | None:
+        """Persist the singleton `/coco` control-topic assignment."""
+        if thread_id is None:
+            return None
+        binding = self.ensure_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if binding is None:
+            return None
+        self.coco_control_topic = CocoControlTopic(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=int(chat_id or 0),
+        )
+        self._save_state()
+        return binding
+
     def get_topic_model_selection(
         self,
         user_id: int,
@@ -2171,6 +2465,32 @@ class SessionManager:
             raw_service_tier = binding.service_tier.strip().lower()
             return raw_service_tier if raw_service_tier in CODEX_SERVICE_TIERS else ""
         return ""
+
+    def get_window_topic_response_mode(self, window_id: str) -> str:
+        """Return one persisted response mode for a window-bound topic."""
+        normalized_window_id = window_id.strip()
+        if not normalized_window_id:
+            return "text"
+        for _user_id, _chat_id, _thread_id, binding in self.iter_topic_bindings():
+            if binding.window_id.strip() != normalized_window_id:
+                continue
+            raw_response_mode = binding.response_mode.strip().lower()
+            return raw_response_mode if raw_response_mode in {"text", "voice"} else "text"
+        return "text"
+
+    def get_topic_response_mode(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> str:
+        """Return one persisted response mode for a specific topic binding."""
+        binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if binding is None:
+            return "text"
+        raw_response_mode = binding.response_mode.strip().lower()
+        return raw_response_mode if raw_response_mode in {"text", "voice"} else "text"
 
     def get_window_machine_id(self, window_id: str) -> str:
         """Return the bound machine id for a window-bound topic."""
@@ -2407,6 +2727,27 @@ class SessionManager:
         self._save_state()
         return True
 
+    def set_topic_response_mode(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+        response_mode: str = "",
+    ) -> bool:
+        """Persist the preferred reply modality for one topic."""
+        binding = self.ensure_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if binding is None:
+            return False
+        normalized = response_mode.strip().lower()
+        if normalized not in {"text", "voice"}:
+            normalized = "text"
+        if binding.response_mode == normalized:
+            return False
+        binding.response_mode = normalized
+        self._save_state()
+        return True
+
     def set_machine_transcription_profile_selection(
         self,
         machine_id: str,
@@ -2476,6 +2817,7 @@ class SessionManager:
         resolved_model_slug = existing.model_slug if existing else ""
         resolved_reasoning_effort = existing.reasoning_effort if existing else ""
         resolved_service_tier = existing.service_tier if existing else ""
+        resolved_response_mode = existing.response_mode if existing else ""
         binding = TopicBinding(
             transport=TOPIC_BINDING_TRANSPORT_CODEX_THREAD,
             chat_id=resolved_chat_id,
@@ -2490,6 +2832,7 @@ class SessionManager:
             model_slug=resolved_model_slug,
             reasoning_effort=resolved_reasoning_effort,
             service_tier=resolved_service_tier,
+            response_mode=resolved_response_mode,
         )
         self._set_topic_binding(
             user_id=user_id,
@@ -2548,6 +2891,7 @@ class SessionManager:
             model_slug=binding.model_slug,
             reasoning_effort=binding.reasoning_effort,
             service_tier=binding.service_tier,
+            response_mode=binding.response_mode,
         )
         if resolved.window_id:
             fallback = self._topic_binding_from_window(resolved.window_id)
@@ -3015,18 +3359,32 @@ class SessionManager:
         can_write: bool,
         approval_policy: str,
         session_start_reason: str = "",
+        tts_available: bool = False,
+        tts_default_voice: str = "",
+        tts_default_speed: float = 1.0,
+        transcription_runtime_label: str = "",
     ) -> str:
         """Build one short runtime context note to avoid stale read-only assumptions."""
         write_state = "enabled" if can_write else "disabled"
         session_reason_line = ""
         if session_start_reason:
             session_reason_line = f"Session start reason: {session_start_reason}\n"
+        transcription_line = ""
+        if transcription_runtime_label:
+            transcription_line = f"Speech-to-text: {transcription_runtime_label}\n"
+        tts_line = (
+            f"Text-to-speech: available (voice `{tts_default_voice}`, speed `{tts_default_speed:.1f}`)\n"
+            if tts_available
+            else "Text-to-speech: unavailable\n"
+        )
         return (
             "[coco runtime context]\n"
             f"Workspace: {workspace_path}\n"
             f"Filesystem write access: {write_state}\n"
             f"Approval policy: {approval_policy}\n"
             f"{session_reason_line}"
+            f"{transcription_line}"
+            f"{tts_line}"
             "Telegram attachments: to upload a workspace file for the user, "
             'append a standalone line exactly like '
             '<telegram-attachment path="relative/path.pdf" /> '
@@ -3525,11 +3883,22 @@ class SessionManager:
         session_start_reason = pending_session_start_reason
         if not session_start_reason and not had_thread_before and thread_id:
             session_start_reason = "fresh_start"
+        transcription_runtime = get_transcription_runtime_summary("compatible")
+        tts_runtime = get_tts_runtime_summary()
         runtime_hint = self._build_runtime_capability_hint(
             workspace_path=workspace_path,
             can_write=can_write,
             approval_policy=approval_policy,
             session_start_reason=session_start_reason,
+            tts_available=bool(tts_runtime.get("available")),
+            tts_default_voice=str(tts_runtime.get("default_voice", "")).strip(),
+            tts_default_speed=float(tts_runtime.get("default_speed", 1.0) or 1.0),
+            transcription_runtime_label=(
+                f"{transcription_runtime['mode']} -> "
+                f"{transcription_runtime['device']} / "
+                f"{transcription_runtime['compute_type']} / "
+                f"{transcription_runtime['model_name']}"
+            ),
         )
         normalized_inputs = self._normalize_app_server_inputs(inputs)
         turn_inputs = [{"type": "text", "text": runtime_hint}, *normalized_inputs]

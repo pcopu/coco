@@ -60,6 +60,12 @@ _VIDEO_EXTENSION_BY_MEDIA_TYPE = {
     "video/x-msvideo": ".avi",
     "video/mpeg": ".mpeg",
 }
+_VOICE_EXTENSION_BY_MEDIA_TYPE = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/ogg": ".ogg",
+}
 
 
 def _thread_id_from_kwargs(kwargs: dict[str, Any]) -> int | None:
@@ -241,6 +247,50 @@ async def send_documents(
         raise
     except Exception as e:
         logger.error("Failed to send document to %d: %s", chat_id, e)
+
+
+async def send_voice(
+    bot: Bot,
+    chat_id: int,
+    media_type: str,
+    raw_bytes: bytes,
+    **kwargs: Any,
+) -> None:
+    """Send one voice note to chat with audio/document fallback."""
+    extension = _VOICE_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
+    try:
+        await bot.send_voice(
+            chat_id=chat_id,
+            voice=io.BytesIO(raw_bytes),
+            filename=f"voice{extension}",
+            **kwargs,
+        )
+    except RetryAfter:
+        raise
+    except Exception as exc:
+        logger.warning("Voice send failed for %d; falling back to audio/document: %s", chat_id, exc)
+        try:
+            await bot.send_audio(
+                chat_id=chat_id,
+                audio=io.BytesIO(raw_bytes),
+                filename=f"voice{extension}",
+                **kwargs,
+            )
+        except RetryAfter:
+            raise
+        except Exception as audio_exc:
+            logger.warning("Audio fallback failed for %d; falling back to document: %s", chat_id, audio_exc)
+            try:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(raw_bytes),
+                    filename=f"voice{extension}",
+                    **kwargs,
+                )
+            except RetryAfter:
+                raise
+            except Exception as doc_exc:
+                logger.error("Failed to send voice fallback document to %d: %s", chat_id, doc_exc)
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:

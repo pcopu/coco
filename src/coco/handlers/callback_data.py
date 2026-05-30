@@ -38,6 +38,11 @@ CB_MODEL_SET = "md:set:"  # md:set:<model_slug>
 CB_MODEL_EFFORT_SET = "md:eff:"  # md:eff:<effort>
 CB_MODEL_REFRESH = "md:ref"
 
+# CoCo control topic
+CB_COCO_SET = "cc:set"
+CB_COCO_CANCEL = "cc:cancel"
+CB_COCO_REFRESH = "cc:ref"
+
 # Update panel
 CB_UPDATE_REFRESH = "up:ref"
 CB_UPDATE_RUN = "up:run"

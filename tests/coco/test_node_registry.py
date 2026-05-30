@@ -1,6 +1,7 @@
 import json
 
 from coco.node_registry import NODE_STATUS_OFFLINE, NODE_STATUS_ONLINE, NodeRegistry
+import coco.node_registry as node_registry_mod
 
 
 def test_note_heartbeat_marks_remote_node_online_and_persists(tmp_path):
@@ -90,3 +91,46 @@ def test_note_heartbeat_persists_rpc_endpoint_metadata(tmp_path):
     assert node is not None
     assert node.rpc_host == "100.90.80.70"
     assert node.rpc_port == 8787
+
+
+def test_ensure_local_node_includes_runtime_capabilities(tmp_path, monkeypatch):
+    registry = NodeRegistry(
+        state_file=tmp_path / "nodes.json",
+        offline_timeout_seconds=45.0,
+    )
+
+    monkeypatch.setattr(
+        node_registry_mod,
+        "config",
+        type(
+            "_Cfg",
+            (),
+            {
+                "node_registry_file": tmp_path / "nodes.json",
+                "node_offline_timeout": 45.0,
+                "machine_id": "local-node",
+                "machine_name": "Local Node",
+                "tailnet_name": "local.tail",
+                "rpc_advertise_host": "100.64.0.10",
+                "rpc_port": 8787,
+                "browse_root": "/repo",
+                "controller_capable": True,
+                "controller_active": True,
+                "preferred_controller": True,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        node_registry_mod,
+        "get_local_runtime_capabilities",
+        lambda *, controller_capable=False: [
+            "controller",
+            "monitor",
+            "transcription",
+            "tts",
+        ],
+    )
+
+    node = registry.ensure_local_node()
+
+    assert node.capabilities == ["controller", "monitor", "transcription", "tts"]

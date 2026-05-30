@@ -26,6 +26,8 @@ def main() -> None:
         "status",
         "model",
         "fast",
+        "coco",
+        "voice",
         "transcription",
         "update",
         "looper",

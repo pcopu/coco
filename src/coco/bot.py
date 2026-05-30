@@ -98,6 +98,9 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_COCO_CANCEL,
+    CB_COCO_REFRESH,
+    CB_COCO_SET,
     CB_MODEL_EFFORT_SET,
     CB_MODEL_REFRESH,
     CB_MODEL_SET,
@@ -190,8 +193,10 @@ from .handlers.run_watchdog import (
 )
 from .handlers.status_polling import emit_looper_tick, status_poll_loop
 from .session import (
+    CocoControlTopic,
     TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL,
     TOPIC_SYNC_MODE_TELEGRAM_LIVE,
+    TopicBinding,
     session_manager,
 )
 from .session_monitor import NewMessage, SessionMonitor
@@ -207,6 +212,8 @@ from .transcription import (
     transcribe_audio_file,
 )
 from .transcript_parser import TranscriptParser
+from .tts import get_default_tts_speed, get_default_tts_voice
+from .tts_runtime import ensure_tts_server_started, stop_tts_server
 from .utils import atomic_write_json, coco_dir, env_alias
 
 logger = logging.getLogger(__name__)
@@ -227,6 +234,10 @@ _turn_has_final_text: dict[str, bool] = {}
 # Track transient app-server turn failures that should trigger one guarded retry
 # after the failing turn fully completes.
 _pending_transient_app_server_errors: dict[str, tuple[str, str]] = {}
+# Threads explicitly interrupted via `/esc`; late assistant completions for these
+# threads should be ignored until the next started/completed notification clears
+# the marker.
+_interrupted_codex_threads: set[str] = set()
 
 # Prevent duplicate /restart handling races.
 _restart_requested = False
@@ -2318,6 +2329,163 @@ def _build_approvals_keyboard(
         rows.append(row)
 
     rows.append([InlineKeyboardButton("Refresh", callback_data=refresh_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _default_coco_control_workspace(
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+) -> Path:
+    base = (config.browse_root / "_coco").resolve()
+    if chat_id not in {None, 0}:
+        scope = f"chat-{abs(int(chat_id))}-thread-{thread_id}"
+    else:
+        scope = f"user-{user_id}-thread-{thread_id}"
+    return (base / scope).resolve()
+
+
+def _ensure_coco_control_workspace_binding(
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+) -> tuple[TopicBinding | None, str]:
+    binding = session_manager.ensure_topic_binding(user_id, thread_id, chat_id=chat_id)
+    if binding is None:
+        return None, ""
+
+    changed = False
+    workspace_dir = str(binding.cwd or "").strip()
+    if not workspace_dir:
+        workspace_path = _default_coco_control_workspace(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        workspace_dir = str(workspace_path)
+        binding.cwd = workspace_dir
+        changed = True
+    else:
+        try:
+            Path(workspace_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    if not str(binding.display_name or "").strip():
+        binding.display_name = "coco-control"
+        changed = True
+
+    window_id = str(binding.window_id or "").strip()
+    if window_id:
+        state = session_manager.get_window_state(window_id)
+        if workspace_dir and not state.cwd:
+            state.cwd = workspace_dir
+            changed = True
+        if binding.display_name and not state.window_name:
+            state.window_name = binding.display_name
+            changed = True
+
+    if changed:
+        session_manager._save_state()
+    return binding, workspace_dir
+
+
+def _format_coco_topic_label(
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+    current_user_id: int,
+    current_thread_id: int,
+    current_chat_id: int | None,
+) -> str:
+    if (
+        user_id == current_user_id
+        and thread_id == current_thread_id
+        and int(chat_id or 0) == int(current_chat_id or 0)
+    ):
+        return "this topic"
+    if chat_id not in {None, 0}:
+        return f"chat `{chat_id}` thread `{thread_id}`"
+    return f"user `{user_id}` thread `{thread_id}`"
+
+
+def _build_coco_control_text(
+    *,
+    current_user_id: int,
+    current_thread_id: int,
+    current_chat_id: int | None,
+    binding: TopicBinding | None,
+    current_control: CocoControlTopic | None,
+    current_control_binding: TopicBinding | None,
+    suggested_workspace: str,
+    is_current: bool,
+) -> str:
+    current_label = "(none)"
+    current_workspace = "(none)"
+    if current_control is not None:
+        current_label = _format_coco_topic_label(
+            user_id=current_control.user_id,
+            thread_id=current_control.thread_id,
+            chat_id=current_control.chat_id or None,
+            current_user_id=current_user_id,
+            current_thread_id=current_thread_id,
+            current_chat_id=current_chat_id,
+        )
+        current_workspace = (
+            str(current_control_binding.cwd).strip()
+            if current_control_binding is not None and str(current_control_binding.cwd).strip()
+            else "(none)"
+        )
+
+    this_workspace = (
+        str(binding.cwd).strip()
+        if binding is not None and str(binding.cwd).strip()
+        else suggested_workspace or "(none)"
+    )
+
+    lines = [
+        "CoCo Control Topic",
+        "",
+        f"Current CoCo topic: `{current_label}`",
+        f"Current CoCo workspace: `{current_workspace}`",
+        f"This topic workspace: `{this_workspace}`",
+        "",
+    ]
+    if is_current:
+        lines.extend(
+            [
+                "This topic is currently the singleton CoCo control topic.",
+                "It should be used as the management layer for other topics.",
+            ]
+        )
+    else:
+        if current_control is None:
+            lines.append("This will designate this topic as the singleton CoCo control topic.")
+        else:
+            lines.append("This will replace the current CoCo control topic.")
+        lines.extend(
+            [
+                "The CoCo control topic can inspect and steer other topics.",
+                "Continue?",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _build_coco_control_keyboard(*, is_current: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if not is_current:
+        rows.append(
+            [
+                InlineKeyboardButton("Set As CoCo", callback_data=CB_COCO_SET),
+                InlineKeyboardButton("Cancel", callback_data=CB_COCO_CANCEL),
+            ]
+        )
+    rows.append([InlineKeyboardButton("Refresh", callback_data=CB_COCO_REFRESH)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -7565,6 +7733,16 @@ async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await command_handlers.fast_command(update, context)
 
 
+async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from .handlers import commands as command_handlers
+    await command_handlers.coco_command(update, context)
+
+
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from .handlers import commands as command_handlers
+    await command_handlers.voice_command(update, context)
+
+
 async def transcription_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from .handlers import commands as command_handlers
     await command_handlers.transcription_command(update, context)
@@ -8295,6 +8473,7 @@ async def _forward_topic_text_message(
     thread_id: int | None,
     chat_id: int | None,
     text: str,
+    response_mode: str = "text",
 ) -> None:
     """Forward one text prompt through the normal topic/session path."""
     if thread_id is None:
@@ -8371,6 +8550,13 @@ async def _forward_topic_text_message(
             "❌ Session binding is incomplete. Send a message to start a new session.",
         )
         return
+
+    session_manager.set_topic_response_mode(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+        response_mode=response_mode,
+    )
 
     if session_manager.get_window_mention_only(wid):
         bot_username = _resolve_bot_username(context)
@@ -8552,6 +8738,7 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         thread_id=thread_id,
         chat_id=chat_id,
         text=prompt,
+        response_mode="voice",
     )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9090,6 +9277,76 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "History pagination is unavailable in app-server mode.",
             show_alert=True,
         )
+        return
+
+    elif data in {CB_COCO_SET, CB_COCO_CANCEL, CB_COCO_REFRESH}:
+        if cb_thread_id is None:
+            await query.answer("Use this inside a named topic.", show_alert=True)
+            return
+        if data == CB_COCO_CANCEL:
+            await safe_edit(query, "CoCo control-topic assignment canceled.", reply_markup=None)
+            await query.answer("Canceled")
+            return
+
+        binding, suggested_workspace = _ensure_coco_control_workspace_binding(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
+        )
+        current_control = session_manager.get_coco_control_topic()
+        current_binding = None
+        if current_control is not None:
+            current_binding = session_manager.resolve_topic_binding(
+                current_control.user_id,
+                current_control.thread_id,
+                chat_id=current_control.chat_id or None,
+            )
+
+        if data == CB_COCO_SET:
+            binding = session_manager.set_coco_control_topic(
+                user.id,
+                cb_thread_id,
+                chat_id=cb_chat_id,
+            )
+            current_control = session_manager.get_coco_control_topic()
+            current_binding = binding
+            await safe_edit(
+                query,
+                _build_coco_control_text(
+                    current_user_id=user.id,
+                    current_thread_id=cb_thread_id,
+                    current_chat_id=cb_chat_id,
+                    binding=binding,
+                    current_control=current_control,
+                    current_control_binding=current_binding,
+                    suggested_workspace=suggested_workspace,
+                    is_current=True,
+                ),
+                reply_markup=_build_coco_control_keyboard(is_current=True),
+            )
+            await query.answer("CoCo control topic set")
+            return
+
+        is_current = session_manager.is_coco_control_topic(
+            user.id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
+        await safe_edit(
+            query,
+            _build_coco_control_text(
+                current_user_id=user.id,
+                current_thread_id=cb_thread_id,
+                current_chat_id=cb_chat_id,
+                binding=binding,
+                current_control=current_control,
+                current_control_binding=current_binding,
+                suggested_workspace=suggested_workspace,
+                is_current=is_current,
+            ),
+            reply_markup=_build_coco_control_keyboard(is_current=is_current),
+        )
+        await query.answer("Refreshed")
         return
 
     # Directory browser handlers
@@ -12621,6 +12878,7 @@ async def _handle_codex_app_server_notification(
         turn = params.get("turn")
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if isinstance(thread_id, str) and isinstance(turn_id, str):
+            _interrupted_codex_threads.discard(thread_id)
             _pending_transient_app_server_errors.pop(thread_id, None)
             session_manager.set_codex_turn_for_thread(thread_id, turn_id)
             _turn_has_final_text[thread_id] = False
@@ -12639,6 +12897,7 @@ async def _handle_codex_app_server_notification(
             return
 
         had_final_text = _turn_has_final_text.pop(thread_id, False)
+        _interrupted_codex_threads.discard(thread_id)
         session_manager.set_codex_turn_for_thread(thread_id, "")
         transient_error = _pending_transient_app_server_errors.pop(thread_id, None)
         suppressed_topics: set[tuple[int, int | None]] = set()
@@ -12757,6 +13016,8 @@ async def _handle_codex_app_server_notification(
         item = params.get("item")
         if not isinstance(thread_id, str) or not isinstance(item, dict):
             return
+        if thread_id in _interrupted_codex_threads:
+            return
         item_type = item.get("type")
         if item_type != "agentMessage":
             return
@@ -12781,6 +13042,8 @@ async def _handle_codex_app_server_notification(
         thread_id = params.get("threadId")
         item = params.get("item")
         if not isinstance(thread_id, str) or not isinstance(item, dict):
+            return
+        if thread_id in _interrupted_codex_threads:
             return
         item_type = item.get("type")
         role = item.get("role")
@@ -13044,6 +13307,8 @@ async def post_init(application: Application) -> None:
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("status", "Show current Codex status panel"),
         BotCommand("model", "Show Codex model options/reasoning levels"),
+        BotCommand("coco", "Designate this topic as the CoCo control topic"),
+        BotCommand("voice", "Show/change voice reply mode for this topic"),
         BotCommand("transcription", "Show/change server transcription mode"),
         BotCommand("update", "Check CoCo/Codex updates and trigger safe upgrade"),
     ]
@@ -13079,6 +13344,10 @@ async def post_init(application: Application) -> None:
             )
 
     await session_manager.resolve_stale_ids()
+    try:
+        await ensure_tts_server_started()
+    except Exception as exc:
+        logger.warning("Managed local TTS startup failed: %s", exc)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
@@ -13313,6 +13582,7 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Session monitor stopped")
 
     await codex_app_server_client.stop()
+    await stop_tts_server()
 
 
 def create_bot() -> Application:
@@ -13347,6 +13617,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("goal", goal_command))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("fast", fast_command))
+    application.add_handler(CommandHandler("coco", coco_command))
+    application.add_handler(CommandHandler("voice", voice_command))
     application.add_handler(CommandHandler("transcription", transcription_command))
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

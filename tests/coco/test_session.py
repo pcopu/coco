@@ -25,6 +25,20 @@ def mgr(monkeypatch) -> SessionManager:
     return SessionManager()
 
 
+@pytest.fixture
+def telegram_memory_path(tmp_path, monkeypatch) -> Path:
+    memory_path = tmp_path / "TELEGRAM_CHAT_MEMORY.jsonl"
+    monkeypatch.setenv("COCO_TELEGRAM_MEMORY_LOG_PATH", str(memory_path))
+    return memory_path
+
+
+def _append_memory_entries(path: Path, entries: list[dict[str, object]]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry))
+            handle.write("\n")
+
+
 class TestThreadBindings:
     def test_bind_and_get(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "@1")
@@ -221,6 +235,21 @@ class TestTopicBindingsV2:
             mgr.get_machine_transcription_profile_selection("local-node")
             == "compatible"
         )
+
+    def test_topic_response_mode_roundtrip(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+
+        changed = mgr.set_topic_response_mode(
+            100,
+            1,
+            response_mode="voice",
+        )
+
+        binding = mgr.resolve_topic_binding(100, 1)
+        assert changed is True
+        assert binding is not None
+        assert binding.response_mode == "voice"
+        assert mgr.get_topic_response_mode(100, 1) == "voice"
 
     def test_bind_topic_to_codex_thread_preserves_topic_model_selection(
         self, mgr: SessionManager
@@ -649,9 +678,15 @@ class TestRuntimeCapabilityHint:
             workspace_path="/tmp/demo",
             can_write=True,
             approval_policy="on-request",
+            tts_available=True,
+            tts_default_voice="F2",
+            tts_default_speed=1.4,
+            transcription_runtime_label="compatible -> cpu / int8 / base",
         )
 
         assert "Workspace: /tmp/demo" in hint
+        assert "Speech-to-text: compatible -> cpu / int8 / base" in hint
+        assert "Text-to-speech: available (voice `F2`, speed `1.4`)" in hint
         assert "<telegram-attachment path=" in hint
         assert ".pdf" in hint
         assert ".txt" in hint
@@ -766,6 +801,42 @@ class TestWindowState:
         mgr.clear_window_session("@1")
         assert mgr.get_window_state("@1").session_id == ""
         assert mgr.get_window_mention_only("@1") is True
+
+
+class TestCocoControlTopic:
+    def test_set_and_get_coco_control_topic_roundtrip(self, mgr: SessionManager) -> None:
+        mgr.ensure_topic_binding(100, 7, chat_id=-100123)
+
+        binding = mgr.set_coco_control_topic(100, 7, chat_id=-100123)
+
+        assert binding is not None
+        assert mgr.is_coco_control_topic(100, 7, chat_id=-100123) is True
+        control_topic = mgr.get_coco_control_topic()
+        assert control_topic is not None
+        assert control_topic.user_id == 100
+        assert control_topic.chat_id == -100123
+        assert control_topic.thread_id == 7
+
+    def test_coco_control_topic_persists_across_save_and_load(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(session_mod.config, "state_file", tmp_path / "state.json")
+        monkeypatch.setattr(session_mod.config, "sessions_path", tmp_path / "sessions")
+        monkeypatch.setattr(session_mod.config, "machine_id", "local-node")
+        monkeypatch.setattr(session_mod.config, "machine_name", "Local Node")
+        monkeypatch.setattr(session_mod.node_registry, "get_node", lambda _mid: None)
+
+        mgr = SessionManager()
+        mgr.ensure_topic_binding(100, 9, chat_id=-100123)
+        mgr.set_coco_control_topic(100, 9, chat_id=-100123)
+
+        reloaded = SessionManager()
+        control_topic = reloaded.get_coco_control_topic()
+
+        assert control_topic is not None
+        assert control_topic.user_id == 100
+        assert control_topic.chat_id == -100123
+        assert control_topic.thread_id == 9
 
 
 class TestResolveWindowForThread:
@@ -2087,3 +2158,196 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
     assert "app `demo`" in injected
     assert "skill `reviewer`" in injected
     assert injected.endswith("hello world")
+
+
+@pytest.mark.asyncio
+async def test_send_topic_text_to_window_injects_coco_operator_context_for_app_server(
+    mgr: SessionManager,
+    monkeypatch,
+    telegram_memory_path: Path,
+):
+    _append_memory_entries(
+        telegram_memory_path,
+        [
+            {
+                "ts_utc": "2026-05-30T12:40:00+00:00",
+                "direction": "in",
+                "chat_id": -100123,
+                "thread_id": 8,
+                "from_user_id": 100,
+                "text": "The PDF flow is still broken",
+            },
+            {
+                "ts_utc": "2026-05-30T12:41:00+00:00",
+                "direction": "out_send",
+                "chat_id": -100123,
+                "thread_id": 8,
+                "text": "I’m tracing the document handler now.",
+            },
+        ],
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    mgr.bind_thread(100, 5, "@1")
+    mgr.bind_thread(100, 8, "@8")
+    mgr.bind_thread(100, 9, "@9")
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=5,
+        chat_id=-100123,
+        codex_thread_id="thread-5",
+        window_id="@1",
+        cwd="/env/_coco/chat-100123-thread-5",
+        display_name="coco-control",
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=8,
+        chat_id=-100123,
+        codex_thread_id="thread-8",
+        window_id="@8",
+        cwd="/env/fmwblog",
+        display_name="fmwblog",
+        machine_id="remote-node",
+        machine_display_name="Browse Node",
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=9,
+        chat_id=-100123,
+        codex_thread_id="thread-9",
+        window_id="@9",
+        cwd="/env/bottleshot",
+        display_name="bottleshot",
+    )
+    mgr.set_coco_control_topic(100, 5, chat_id=-100123)
+    mgr.set_topic_sync_mode(100, 8, session_mod.TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL, chat_id=-100123)
+    mgr.set_topic_response_mode(100, 8, chat_id=-100123, response_mode="voice")
+    mgr.set_window_codex_active_turn_id("@8", "turn-8")
+
+    captured: dict[str, object] = {}
+
+    async def _send_inputs_to_window(
+        window_id: str,
+        inputs: list[dict[str, object]],
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+    ):
+        captured["window_id"] = window_id
+        captured["inputs"] = inputs
+        captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
+
+    ok, _msg = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=5,
+        chat_id=-100123,
+        window_id="@1",
+        text="What is happening right now?",
+        steer=False,
+    )
+
+    assert ok is True
+    inputs = captured["inputs"]
+    assert isinstance(inputs, list)
+    assert inputs[0]["type"] == "text"
+    operator_text = str(inputs[0]["text"])
+    assert "[coco operator]" in operator_text
+    assert "This topic is the singleton CoCo control topic." in operator_text
+    assert "You can inspect, summarize, and steer other topics in this chat." in operator_text
+    assert "thread `8`: `fmwblog` — machine `Browse Node`, sync `host_follow_final`, response `voice`, turn `active`, workspace `/env/fmwblog`" in operator_text
+    assert "thread `9`: `bottleshot` — machine `" in operator_text
+    assert "sync `telegram_live`" in operator_text
+    assert "response `text`" in operator_text
+    assert "Recent visible activity:" in operator_text
+    assert "fmwblog: User: The PDF flow is still broken | CoCo: I’m tracing the document handler now." in operator_text
+    assert inputs[1] == {"type": "text", "text": "What is happening right now?"}
+
+
+@pytest.mark.asyncio
+async def test_send_topic_text_to_window_injects_coco_operator_context_for_legacy_mode(
+    mgr: SessionManager,
+    monkeypatch,
+    telegram_memory_path: Path,
+):
+    _append_memory_entries(
+        telegram_memory_path,
+        [
+            {
+                "ts_utc": "2026-05-30T12:40:00+00:00",
+                "direction": "in",
+                "chat_id": -100123,
+                "thread_id": 8,
+                "from_user_id": 100,
+                "text": "The PDF flow is still broken",
+            },
+            {
+                "ts_utc": "2026-05-30T12:41:00+00:00",
+                "direction": "out_send",
+                "chat_id": -100123,
+                "thread_id": 8,
+                "text": "I’m tracing the document handler now.",
+            },
+        ],
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: False)
+    mgr.bind_thread(100, 5, "@1")
+    mgr.bind_thread(100, 8, "@8")
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=5,
+        chat_id=-100123,
+        codex_thread_id="thread-5",
+        window_id="@1",
+        cwd="/env/_coco/chat-100123-thread-5",
+        display_name="coco-control",
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=8,
+        chat_id=-100123,
+        codex_thread_id="thread-8",
+        window_id="@8",
+        cwd="/env/fmwblog",
+        display_name="fmwblog",
+    )
+    mgr.set_coco_control_topic(100, 5, chat_id=-100123)
+    mgr.set_topic_response_mode(100, 8, chat_id=-100123, response_mode="voice")
+
+    captured: dict[str, object] = {}
+
+    async def _send_to_window(
+        window_id: str,
+        text: str,
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+    ):
+        _ = steer
+        _ = force_new_turn
+        captured["window_id"] = window_id
+        captured["text"] = text
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+    ok, _msg = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=5,
+        chat_id=-100123,
+        window_id="@1",
+        text="Summarize the active topics.",
+        steer=False,
+    )
+
+    assert ok is True
+    injected = str(captured["text"])
+    assert "[coco operator]" in injected
+    assert "thread `8`: `fmwblog` — machine `" in injected
+    assert "response `voice`" in injected
+    assert "Recent visible activity:" in injected
+    assert "fmwblog: User: The PDF flow is still broken | CoCo: I’m tracing the document handler now." in injected
+    assert injected.endswith("Summarize the active topics.")

@@ -31,6 +31,8 @@ CLI_COMMAND_NAMES = {
     "goal",
     "model",
     "fast",
+    "coco",
+    "voice",
     "transcription",
     "update",
     "looper",

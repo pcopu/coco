@@ -1,5 +1,8 @@
-"""Tests for inbound Telegram document/PDF handling."""
+"""Tests for inbound Telegram document handling."""
 
+import io
+import tarfile
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,10 +127,188 @@ async def test_document_handler_downloads_pdf_and_forwards_topic_text(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_document_handler_rejects_non_pdf_documents(monkeypatch, tmp_path):
+async def test_document_handler_extracts_zip_and_forwards_directory(monkeypatch, tmp_path):
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("report/data.txt", "hello")
+
+    update, tg_file = _make_document_update(
+        file_name="bundle.zip",
+        mime_type="application/zip",
+        caption="Analyze this bundle",
+    )
+    tg_file.payload = zip_buffer.getvalue()
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[dict[str, object]] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(
+        *,
+        message,
+        context,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None,
+        text: str,
+    ) -> None:
+        forwarded.append(
+            {
+                "message": message,
+                "context": context,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "chat_id": chat_id,
+                "text": text,
+            }
+        )
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message, raising=False)
+
+    await bot.document_handler(update, context)
+
+    assert update.message.chat.actions == [ChatAction.TYPING]
+    assert len(tg_file.paths) == 1
+    saved_zip = tg_file.paths[0]
+    extracted_dir = tmp_path / f"{saved_zip.stem}_unpacked"
+    assert saved_zip.exists()
+    assert (extracted_dir / "report" / "data.txt").read_text(encoding="utf-8") == "hello"
+    assert replies == []
+    assert len(forwarded) == 1
+    assert "Analyze this bundle" in forwarded[0]["text"]
+    assert str(extracted_dir) in forwarded[0]["text"]
+    assert str(saved_zip) in forwarded[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_document_handler_forwards_text_like_document(monkeypatch, tmp_path):
+    update, tg_file = _make_document_update(
+        file_name="brief.md",
+        mime_type="text/markdown",
+        caption="Use this note",
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[dict[str, object]] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(
+        *,
+        message,
+        context,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None,
+        text: str,
+    ) -> None:
+        forwarded.append({"text": text, "thread_id": thread_id, "chat_id": chat_id})
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message, raising=False)
+
+    await bot.document_handler(update, context)
+
+    assert replies == []
+    assert len(tg_file.paths) == 1
+    assert len(forwarded) == 1
+    assert "Use this note" in forwarded[0]["text"]
+    assert str(tg_file.paths[0]) in forwarded[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_document_handler_forwards_office_document(monkeypatch, tmp_path):
     update, tg_file = _make_document_update(
         file_name="notes.docx",
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        caption="Review this",
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[str] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs["text"])
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message, raising=False)
+
+    await bot.document_handler(update, context)
+
+    assert replies == []
+    assert len(tg_file.paths) == 1
+    assert len(forwarded) == 1
+    assert "Review this" in forwarded[0]
+    assert str(tg_file.paths[0]) in forwarded[0]
+
+
+@pytest.mark.asyncio
+async def test_document_handler_extracts_tgz_and_forwards_directory(monkeypatch, tmp_path):
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w:gz") as archive:
+        payload = b"hello tar"
+        info = tarfile.TarInfo("bundle/data.txt")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    update, tg_file = _make_document_update(
+        file_name="bundle.tgz",
+        mime_type="application/gzip",
+        caption="Use tgz",
+    )
+    tg_file.payload = tar_buffer.getvalue()
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[str] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs["text"])
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message, raising=False)
+
+    await bot.document_handler(update, context)
+
+    saved_archive = tg_file.paths[0]
+    extracted_dir = tmp_path / f"{saved_archive.stem}_unpacked"
+    assert replies == []
+    assert (extracted_dir / "bundle" / "data.txt").read_text(encoding="utf-8") == "hello tar"
+    assert len(forwarded) == 1
+    assert str(extracted_dir) in forwarded[0]
+    assert str(saved_archive) in forwarded[0]
+
+
+@pytest.mark.asyncio
+async def test_document_handler_rejects_unsupported_document(monkeypatch, tmp_path):
+    update, tg_file = _make_document_update(
+        file_name="malware.exe",
+        mime_type="application/octet-stream",
     )
     context = SimpleNamespace(bot=object(), user_data={})
     replies: list[str] = []
@@ -140,7 +321,7 @@ async def test_document_handler_rejects_non_pdf_documents(monkeypatch, tmp_path)
         replies.append(text)
 
     async def _unexpected_forward(**_kwargs):
-        raise AssertionError("non-pdf document should not be forwarded")
+        raise AssertionError("unsupported document should not be forwarded")
 
     monkeypatch.setattr(bot, "safe_reply", _safe_reply)
     monkeypatch.setattr(bot, "_forward_topic_text_message", _unexpected_forward, raising=False)
@@ -149,5 +330,5 @@ async def test_document_handler_rejects_non_pdf_documents(monkeypatch, tmp_path)
 
     assert tg_file.paths == []
     assert replies == [
-        "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, or PDF documents."
+        "⚠ This file type is not supported yet. Send text, photos, voice notes, audio files, supported documents, or supported archives."
     ]

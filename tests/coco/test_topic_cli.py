@@ -187,14 +187,22 @@ def test_topic_cli_json_includes_capabilities_and_state(monkeypatch, capsys):
     )
     monkeypatch.setattr(
         topic_cli,
-        "resolve_transcription_runtime",
-        lambda profile="": SimpleNamespace(
-            profile="compatible",
-            device="cpu",
-            compute_type="int8",
-            model_name="base",
-            gpu_available=False,
-        ),
+        "get_transcription_runtime_summary",
+        lambda profile="compatible": {
+            "mode": "compatible",
+            "device": "cpu",
+            "compute_type": "int8",
+            "model_name": "base",
+        },
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "get_tts_runtime_summary",
+        lambda: {
+            "available": True,
+            "default_voice": "F2",
+            "default_speed": 1.4,
+        },
     )
     monkeypatch.setattr(topic_cli, "get_looper_state", lambda **_kwargs: looper_state)
     monkeypatch.setattr(
@@ -246,12 +254,101 @@ def test_topic_cli_json_includes_capabilities_and_state(monkeypatch, capsys):
         "compute_type": "int8",
         "model_name": "base",
     }
+    assert payload["tts"] == {
+        "available": True,
+        "default_voice": "F2",
+        "default_speed": 1.4,
+    }
     apps = {app["name"]: app for app in payload["apps"]}
     assert apps["looper"]["enabled"] is True
     assert apps["looper"]["state"]["plan_path"] == "plans/ship.md"
     assert apps["autoresearch"]["enabled"] is True
     assert apps["autoresearch"]["state"]["outcome"] == "Close more inbound leads"
     assert apps["personality"]["enabled"] is False
+
+
+def test_topic_cli_renders_tts_summary(monkeypatch, capsys):
+    binding = TopicBinding(
+        chat_id=-100123,
+        thread_id=77,
+        window_id="@77",
+        cwd="/repo/project",
+        display_name="fmw-x",
+    )
+
+    monkeypatch.setattr(
+        topic_cli.app_cli,
+        "_resolve_topic_target",
+        lambda **_kwargs: topic_cli.app_cli.TopicTarget(
+            user_id=1147817421,
+            chat_id=-100123,
+            thread_id=77,
+            binding=binding,
+        ),
+    )
+    monkeypatch.setattr(topic_cli.session_manager, "discover_skill_catalog", lambda: {})
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "get_window_state",
+        lambda _wid: WindowState(cwd="/repo/project", window_name="fmw-x", mention_only=False),
+    )
+    monkeypatch.setattr(topic_cli.session_manager, "get_window_mention_only", lambda _wid: False)
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "get_topic_model_selection",
+        lambda *_args, **_kwargs: ("gpt-5.5", "medium"),
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "get_topic_service_tier_selection",
+        lambda *_args, **_kwargs: "flex",
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "get_transcription_runtime_summary",
+        lambda profile="compatible": {
+            "mode": "compatible",
+            "device": "cpu",
+            "compute_type": "int8",
+            "model_name": "base",
+        },
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "get_tts_runtime_summary",
+        lambda: {
+            "available": True,
+            "default_voice": "M3",
+            "default_speed": 1.4,
+        },
+    )
+    monkeypatch.setattr(topic_cli, "get_looper_state", lambda **_kwargs: None)
+    monkeypatch.setattr(topic_cli, "get_autoresearch_state", lambda *_args, **_kwargs: None)
+
+    code = topic_cli.main(
+        [
+            "--user-id",
+            "1147817421",
+            "--chat-id",
+            "-100123",
+            "--thread-id",
+            "77",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "TTS: `available` -> `M3 @ 1.4x`" in out
 
 
 def test_topic_cli_send_text_dispatches_to_bound_topic(monkeypatch, capsys):

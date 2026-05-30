@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import config
+from .runtime_capabilities import get_local_runtime_capabilities
 from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -190,7 +191,9 @@ class NodeRegistry:
             rpc_port=config.rpc_port,
             is_local=is_local,
             browse_roots=[str(config.browse_root)],
-            capabilities=["controller", "monitor"],
+            capabilities=get_local_runtime_capabilities(
+                controller_capable=config.controller_capable,
+            ),
             controller_capable=config.controller_capable,
             controller_active=config.controller_active,
             preferred_controller=config.preferred_controller,

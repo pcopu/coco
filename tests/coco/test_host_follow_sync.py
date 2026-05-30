@@ -36,6 +36,14 @@ async def test_handle_new_message_consumes_expected_transcript_user_echo(
     mgr.register_expected_transcript_user_echo("@1", "expected transcript text")
 
     monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    async def _shadow_passthrough(**_kwargs):
+        return False
+
+    monkeypatch.setattr(
+        bot,
+        "_handle_shadow_transcript_message_for_topic",
+        _shadow_passthrough,
+    )
     monkeypatch.setattr(bot, "session_manager", mgr)
 
     events: list[str] = []
@@ -147,6 +155,56 @@ async def test_handle_new_message_routes_only_final_text_in_host_follow_mode(
     assert finalized == [(1, "@1", 10, True)]
     assert delivered == ["host final answer"]
     assert mgr.is_window_external_turn_active("@1") is False
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_host_follow_final_preserves_voice_mode_binding(
+    monkeypatch, mgr: SessionManager
+):
+    mgr.bind_topic_to_codex_thread(
+        user_id=1,
+        thread_id=10,
+        codex_thread_id="thread-1",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    mgr.set_topic_response_mode(1, 10, response_mode="voice")
+
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    monkeypatch.setattr(bot, "session_manager", mgr)
+    monkeypatch.setattr(bot, "note_run_activity", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "build_response_parts", lambda text, *_args, **_kwargs: [text])
+    monkeypatch.setattr(bot, "consume_looper_completion_keyword", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+
+    async def _enqueue_progress_finalize(*_args, **_kwargs):
+        return None
+
+    async def _enqueue_content_message(**_kwargs):
+        return None
+
+    async def _update_offset(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_progress_finalize)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content_message)
+    monkeypatch.setattr(bot, "_update_user_read_offset_for_window", _update_offset)
+
+    await bot.handle_new_message(
+        NewMessage(
+            session_id="thread-1",
+            text="host final voice answer",
+            is_complete=True,
+            content_type="text",
+            role="assistant",
+            source="transcript",
+        ),
+        SimpleNamespace(),
+    )
+
+    assert mgr.get_topic_response_mode(1, 10) == "voice"
 
 
 @pytest.mark.asyncio

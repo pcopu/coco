@@ -249,6 +249,38 @@ async def test_raw_response_unknown_phase_stays_progress(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_raw_response_completed_ignores_late_text_after_interrupt(monkeypatch):
+    handled = []
+
+    async def _handle_new_message(msg, _bot):
+        handled.append(msg)
+
+    monkeypatch.setattr(bot, "handle_new_message", _handle_new_message)
+    bot._interrupted_codex_threads.add("th-interrupted")
+    bot._turn_has_final_text.pop("th-interrupted", None)
+
+    try:
+        await bot._handle_codex_app_server_notification(
+            "rawResponseItem/completed",
+            {
+                "threadId": "th-interrupted",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final",
+                    "content": [{"type": "output_text", "text": "late final text"}],
+                },
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard("th-interrupted")
+
+    assert handled == []
+    assert bot._turn_has_final_text.get("th-interrupted") is None
+
+
+@pytest.mark.asyncio
 async def test_raw_response_image_generation_routes_image_output(monkeypatch):
     handled = []
 

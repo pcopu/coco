@@ -19,6 +19,18 @@ def test_create_bot_registers_status_but_not_usage_command():
     assert "usage" not in commands
 
 
+def test_create_bot_registers_document_handler_for_pdf_and_zip():
+    app = bot.create_bot()
+    document_filters = [
+        str(handler.filters)
+        for handler in app.handlers.get(0, [])
+        if getattr(getattr(handler, "callback", None), "__name__", "") == "document_handler"
+    ]
+
+    assert len(document_filters) == 1
+    assert "filters.Document.ALL" in document_filters[0]
+
+
 @pytest.mark.asyncio
 async def test_post_init_does_not_publish_usage_command(monkeypatch):
     published = []

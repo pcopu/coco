@@ -99,8 +99,10 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
         thread_id: int | None,
         chat_id: int | None,
         text: str,
+        response_mode: str = "",
     ) -> None:
         assert replies == ["voice transcript"]
+        assert response_mode == "voice"
         forwarded.append(
             {
                 "message": message,
@@ -109,6 +111,7 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
                 "thread_id": thread_id,
                 "chat_id": chat_id,
                 "text": text,
+                "response_mode": response_mode,
             }
         )
 
@@ -135,6 +138,7 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
             "thread_id": 77,
             "chat_id": -100123,
             "text": "voice transcript",
+            "response_mode": "voice",
         }
     ]
 
