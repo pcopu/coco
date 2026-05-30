@@ -130,7 +130,31 @@ def test_ensure_local_node_includes_runtime_capabilities(tmp_path, monkeypatch):
             "tts",
         ],
     )
+    monkeypatch.setattr(
+        node_registry_mod,
+        "get_local_runtime_summary",
+        lambda *, controller_capable=False: {
+            "capabilities": [
+                "controller",
+                "monitor",
+                "transcription",
+                "tts",
+            ],
+            "transcription": {"mode": "compatible", "model_name": "base"},
+            "tts": {"available": True, "default_voice": "F2", "default_speed": 1.4},
+        },
+    )
 
     node = registry.ensure_local_node()
 
     assert node.capabilities == ["controller", "monitor", "transcription", "tts"]
+    assert node.runtime == {
+        "capabilities": [
+            "controller",
+            "monitor",
+            "transcription",
+            "tts",
+        ],
+        "transcription": {"mode": "compatible", "model_name": "base"},
+        "tts": {"available": True, "default_voice": "F2", "default_speed": 1.4},
+    }

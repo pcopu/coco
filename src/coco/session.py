@@ -386,6 +386,11 @@ class SessionManager:
         init=False,
         repr=False,
     )
+    _next_topic_response_mode: dict[tuple[int, int, int], str] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -1950,7 +1955,9 @@ class SessionManager:
             "[coco operator]",
             "This topic is the singleton CoCo control topic.",
             "You can inspect, summarize, and steer other topics in this chat.",
-            "When useful, answer from the control-plane perspective and suggest `/coco steer` or `/coco queue` targets explicitly.",
+            "Answer from the control-plane perspective by default.",
+            "If the user clearly names another topic, explicit phrases like `tell <topic> to ...`, `ask <topic> to ...`, or `queue for <topic>: ...` are routed as cross-topic actions.",
+            "Prefer safe, reversible orchestration and explain cross-topic actions before or while taking them.",
         ]
         if inventory:
             lines.append("Current topic inventory:")
@@ -2747,6 +2754,71 @@ class SessionManager:
         binding.response_mode = normalized
         self._save_state()
         return True
+
+    def set_next_topic_response_mode(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+        response_mode: str = "",
+    ) -> bool:
+        """Set one non-persistent reply mode override for the next topic response."""
+        try:
+            normalized_thread_id = int(thread_id or 0)
+        except (TypeError, ValueError):
+            normalized_thread_id = 0
+        if normalized_thread_id <= 0:
+            return False
+        normalized_chat_id = int(chat_id or 0)
+        normalized = response_mode.strip().lower()
+        if normalized not in {"text", "voice"}:
+            self._next_topic_response_mode.pop(
+                (int(user_id), normalized_chat_id, normalized_thread_id),
+                None,
+            )
+            return False
+        key = (int(user_id), normalized_chat_id, normalized_thread_id)
+        if self._next_topic_response_mode.get(key) == normalized:
+            return False
+        self._next_topic_response_mode[key] = normalized
+        return True
+
+    def peek_next_topic_response_mode(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> str:
+        """Return one pending non-persistent reply mode override, if any."""
+        try:
+            normalized_thread_id = int(thread_id or 0)
+        except (TypeError, ValueError):
+            return ""
+        if normalized_thread_id <= 0:
+            return ""
+        key = (int(user_id), int(chat_id or 0), normalized_thread_id)
+        raw = self._next_topic_response_mode.get(key, "").strip().lower()
+        return raw if raw in {"text", "voice"} else ""
+
+    def consume_next_topic_response_mode(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> str:
+        """Consume and return one pending non-persistent reply mode override."""
+        try:
+            normalized_thread_id = int(thread_id or 0)
+        except (TypeError, ValueError):
+            return ""
+        if normalized_thread_id <= 0:
+            return ""
+        key = (int(user_id), int(chat_id or 0), normalized_thread_id)
+        raw = self._next_topic_response_mode.pop(key, "").strip().lower()
+        return raw if raw in {"text", "voice"} else ""
 
     def set_machine_transcription_profile_selection(
         self,

@@ -100,9 +100,11 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
         chat_id: int | None,
         text: str,
         response_mode: str = "",
+        persist_response_mode: bool = True,
     ) -> None:
         assert replies == ["voice transcript"]
         assert response_mode == "voice"
+        assert persist_response_mode is True
         forwarded.append(
             {
                 "message": message,
@@ -112,6 +114,7 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
                 "chat_id": chat_id,
                 "text": text,
                 "response_mode": response_mode,
+                "persist_response_mode": persist_response_mode,
             }
         )
 
@@ -139,8 +142,67 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
             "chat_id": -100123,
             "text": "voice transcript",
             "response_mode": "voice",
+            "persist_response_mode": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_audio_handler_coco_control_voice_skips_transcript_echo_and_injects_control_prompt(
+    monkeypatch, tmp_path
+):
+    update, tg_file = _make_voice_update()
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[dict[str, object]] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot,
+        "begin_transcription_bootstrap",
+        lambda profile="": None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot,
+        "transcribe_audio_file",
+        lambda _path, *, profile="": "what is happening in bottleshot",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda _uid, tid, *, chat_id=None: tid == 77 and chat_id == -100123,
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(
+        bot,
+        "_forward_topic_text_message",
+        _forward_topic_text_message,
+        raising=False,
+    )
+
+    await bot.audio_handler(update, context)
+
+    assert len(tg_file.paths) == 1
+    assert not tg_file.paths[0].exists()
+    assert replies == []
+    assert len(forwarded) == 1
+    assert forwarded[0]["response_mode"] == "voice"
+    assert forwarded[0]["persist_response_mode"] is False
+    forwarded_text = str(forwarded[0]["text"])
+    assert "[coco voice note]" in forwarded_text
+    assert "Prefer a concise spoken control-room reply." in forwarded_text
+    assert forwarded_text.endswith("what is happening in bottleshot")
 
 
 @pytest.mark.asyncio

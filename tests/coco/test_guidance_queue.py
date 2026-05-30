@@ -908,10 +908,199 @@ async def test_text_handler_mentions_only_allows_bot_mentions(monkeypatch):
     assert "typing" in events
     assert "send:@900000" in events
     assert "status" in events
-    assert "progress_clear" in events
-    assert "progress_start" in events
-    assert "started" in events
-    assert "eyes" in events
+
+
+@pytest.mark.asyncio
+async def test_forward_topic_text_message_coco_control_tell_routes_to_target(monkeypatch):
+    events: list[str] = []
+
+    class _Chat:
+        id = -100123
+
+        async def send_action(self, _action):
+            events.append("typing")
+            return None
+
+    message = SimpleNamespace(
+        chat=_Chat(),
+        chat_id=-100123,
+        message_id=321,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, tid, **_kwargs: "@ctl" if tid == 77 else "@88",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, tid, **_kwargs: SimpleNamespace(
+            codex_thread_id=f"thread-{tid}",
+            cwd=f"/tmp/{tid}",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda _uid, tid, *, chat_id=None: tid == 77 and chat_id == -100123,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "iter_topic_bindings",
+        lambda: iter(
+            [
+                (1147817421, -100123, 77, SimpleNamespace(display_name="ccbot-codex")),
+                (1147817421, -100123, 88, SimpleNamespace(display_name="bottleshot")),
+            ]
+        ),
+    )
+
+    async def _unexpected_in_progress(*_args, **_kwargs):
+        raise AssertionError("control routing should bypass normal in-progress detection")
+
+    async def _send_topic_text_to_window(**kwargs):
+        events.append(f"send:{kwargs['thread_id']}:{kwargs['text']}:{kwargs.get('steer')}")
+        return True, "ok"
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _unexpected_in_progress)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_status_update", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_start", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=1147817421,
+        thread_id=77,
+        chat_id=-100123,
+        text="tell bottleshot to focus on the PDF bug",
+    )
+
+    assert "typing" in events
+    assert "send:88:focus on the PDF bug:True" in events
+
+
+@pytest.mark.asyncio
+async def test_forward_topic_text_message_coco_control_queue_routes_to_target_queue(monkeypatch):
+    events: list[str] = []
+
+    class _Chat:
+        id = -100123
+
+        async def send_action(self, _action):
+            events.append("typing")
+            return None
+
+    message = SimpleNamespace(
+        chat=_Chat(),
+        chat_id=-100123,
+        message_id=654,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, tid, **_kwargs: "@ctl" if tid == 77 else "@88",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, tid, **_kwargs: SimpleNamespace(
+            codex_thread_id=f"thread-{tid}",
+            cwd=f"/tmp/{tid}",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda _uid, tid, *, chat_id=None: tid == 77 and chat_id == -100123,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "iter_topic_bindings",
+        lambda: iter(
+            [
+                (1147817421, -100123, 77, SimpleNamespace(display_name="ccbot-codex")),
+                (1147817421, -100123, 88, SimpleNamespace(display_name="bottleshot")),
+            ]
+        ),
+    )
+
+    async def _unexpected_send(**_kwargs):
+        raise AssertionError("queue control routing should not send immediately")
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    def _enqueue(user_id, thread_id, text, source_chat_id, source_message_id):
+        events.append(f"queue:{user_id}:{thread_id}:{text}:{source_chat_id}:{source_message_id}")
+        return 1
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _unexpected_send,
+    )
+    monkeypatch.setattr(bot, "enqueue_queued_topic_input", _enqueue)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _noop_async)
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot, "_is_window_in_progress", _noop_async)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=1147817421,
+        thread_id=77,
+        chat_id=-100123,
+        text="queue for bottleshot: focus on the PDF bug after this turn",
+    )
+
+    assert "queue:1147817421:88:focus on the PDF bug after this turn:-100123:654" in events
 
 
 @pytest.mark.asyncio

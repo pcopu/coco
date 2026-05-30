@@ -69,6 +69,7 @@ class MessageTask:
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
     document_data: list[tuple[str, bytes]] | None = None  # Explicit Telegram docs
+    response_mode_override: str = ""
     # For progress_finalize tasks: "full" keeps accumulated body, "compact" keeps marker only.
     finalize_mode: str = "full"
 
@@ -434,6 +435,7 @@ async def _merge_content_tasks(
             thread_id=first.thread_id,
             image_data=first.image_data,
             document_data=first.document_data,
+            response_mode_override=first.response_mode_override,
         ),
         merge_count,
     )
@@ -733,12 +735,18 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         and task.text
         and not task.image_data
         and not task.document_data
-        and session_manager.get_topic_response_mode(
-            user_id,
-            task.thread_id,
-            chat_id=chat_id,
+        and (
+            (
+                task.response_mode_override.strip().lower()
+                if task.response_mode_override.strip().lower() in {"text", "voice"}
+                else session_manager.get_topic_response_mode(
+                    user_id,
+                    task.thread_id,
+                    chat_id=chat_id,
+                )
+            )
+            == "voice"
         )
-        == "voice"
     ):
         try:
             media_type, raw_bytes = await synthesize_voice_note(task.text)
@@ -1288,6 +1296,7 @@ async def enqueue_content_message(
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
     document_data: list[tuple[str, bytes]] | None = None,
+    response_mode_override: str = "",
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -1308,6 +1317,7 @@ async def enqueue_content_message(
         thread_id=thread_id,
         image_data=image_data,
         document_data=document_data,
+        response_mode_override=response_mode_override,
     )
     queue.put_nowait(task)
 

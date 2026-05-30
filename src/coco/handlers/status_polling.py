@@ -242,6 +242,7 @@ async def _probe_stale_nodes(
         except (TypeError, ValueError):
             rpc_port = int(node.rpc_port)
         capabilities = payload.get("capabilities", node.capabilities)
+        runtime = payload.get("runtime", node.runtime)
         browse_roots = payload.get("browse_roots", node.browse_roots)
         agent_version = str(payload.get("agent_version", node.agent_version)).strip()
         controller_capable = bool(payload.get("controller_capable", node.controller_capable))
@@ -257,6 +258,7 @@ async def _probe_stale_nodes(
             is_local=False,
             browse_roots=list(browse_roots) if isinstance(browse_roots, list) else list(node.browse_roots),
             capabilities=list(capabilities) if isinstance(capabilities, list) else list(node.capabilities),
+            runtime=dict(runtime) if isinstance(runtime, dict) else dict(node.runtime),
             agent_version=agent_version,
             controller_capable=controller_capable,
             controller_active=controller_active,

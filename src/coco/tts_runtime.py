@@ -50,6 +50,10 @@ def _tts_command_override() -> str:
     return env_alias("COCO_TTS_COMMAND", default="").strip()
 
 
+def _tts_install_command_override() -> str:
+    return env_alias("COCO_TTS_INSTALL_COMMAND", default="").strip()
+
+
 def _parsed_tts_base_url():
     return urlparse(_tts_base_url())
 
@@ -102,14 +106,39 @@ def _resolve_tts_command() -> list[str]:
     ]
 
 
-def is_tts_runtime_available() -> bool:
-    """Return whether this machine can satisfy local TTS requests."""
-    if not _tts_base_url():
-        return False
+def _resolve_tts_install_command() -> list[str]:
+    override = _tts_install_command_override()
+    if override:
+        return shlex.split(override)
 
-    if not _is_local_managed_base_url():
-        return True
+    virtual_env = env_alias("VIRTUAL_ENV", default="").strip()
+    if virtual_env:
+        venv_python = Path(virtual_env) / "bin" / "python"
+    else:
+        venv_python = Path(sys.prefix) / "bin" / "python"
 
+    if shutil.which("uv"):
+        python_value = str(venv_python) if venv_python.exists() else sys.executable
+        return [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            python_value,
+            "supertonic[serve]",
+        ]
+
+    python_bin = str(venv_python) if venv_python.exists() else sys.executable
+    return [
+        python_bin,
+        "-m",
+        "pip",
+        "install",
+        "supertonic[serve]",
+    ]
+
+
+def _tts_binary_exists() -> bool:
     command = _resolve_tts_command()
     if not command:
         return False
@@ -119,6 +148,44 @@ def is_tts_runtime_available() -> bool:
     if "/" in binary:
         return Path(binary).exists()
     return shutil.which(binary) is not None
+
+
+def _install_tts_runtime_sync() -> tuple[bool, str]:
+    try:
+        argv = _resolve_tts_install_command()
+    except ValueError as exc:
+        return False, f"invalid TTS install command syntax: {exc}"
+    if not argv:
+        return False, "no TTS install command available"
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=900.0,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return False, str(exc)
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except OSError as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or f"exit {proc.returncode}"
+    return True, ""
+
+
+def is_tts_runtime_available() -> bool:
+    """Return whether this machine can satisfy local TTS requests."""
+    if not _tts_base_url():
+        return False
+
+    if not _is_local_managed_base_url():
+        return True
+
+    return _tts_binary_exists()
 
 
 async def is_tts_server_healthy() -> bool:
@@ -140,6 +207,13 @@ async def ensure_tts_server_started() -> None:
 
     if await is_tts_server_healthy():
         return
+
+    if not _tts_binary_exists():
+        ok, detail = await asyncio.to_thread(_install_tts_runtime_sync)
+        if not ok:
+            raise RuntimeError(f"managed TTS bootstrap failed: {detail}")
+        if not _tts_binary_exists():
+            raise RuntimeError("managed TTS bootstrap completed but supertonic is still unavailable")
 
     if _tts_server_process is None or _tts_server_process.poll() is not None:
         command = _resolve_tts_command()

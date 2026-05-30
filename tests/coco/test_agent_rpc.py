@@ -200,3 +200,39 @@ async def test_agent_rpc_probe_workspace_write_access_round_trip(tmp_path):
         assert payload["write_error"] == ""
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_ping_includes_runtime_summary(monkeypatch):
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    monkeypatch.setattr(
+        "coco.agent_rpc.node_registry.ensure_local_node",
+        lambda now=None: SimpleNamespace(
+            to_dict=lambda: {
+                "machine_id": "local-node",
+                "display_name": "Local Node",
+                "capabilities": ["monitor", "tts"],
+                "runtime": {
+                    "tts": {"available": True, "default_voice": "F2", "default_speed": 1.4},
+                },
+            }
+        ),
+    )
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        host, port = server.bound_address()
+        node_registry.note_heartbeat(
+            machine_id="ping-node",
+            display_name="Ping Node",
+            transport="agent_rpc",
+            rpc_host=host,
+            rpc_port=port,
+            is_local=False,
+            now=100.0,
+        )
+        client = AgentRpcClient(shared_secret="rpc-secret")
+        payload = await client.ping("ping-node")
+        assert payload["runtime"]["tts"]["default_voice"] == "F2"
+        assert payload["runtime"]["tts"]["default_speed"] == 1.4
+    finally:
+        await server.stop()

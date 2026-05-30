@@ -218,6 +218,15 @@ from .utils import atomic_write_json, coco_dir, env_alias
 
 logger = logging.getLogger(__name__)
 
+_COCO_CONTROL_TELL_RE = re.compile(
+    r"^\s*(?:(?:tell|ask)\s+(?P<target>.+?)\s+to|(?:send\s+to|steer)\s+(?P<target_alt>.+?)\s*:)\s*(?P<message>.+?)\s*$",
+    re.IGNORECASE,
+)
+_COCO_CONTROL_QUEUE_RE = re.compile(
+    r"^\s*queue(?:\s+for)?\s+(?P<target>.+?)\s*:\s*(?P<message>.+?)\s*$",
+    re.IGNORECASE,
+)
+
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
 
@@ -8053,6 +8062,19 @@ def _build_audio_prompt(*, transcript: str, caption: str | None) -> str:
     return transcript_text
 
 
+def _build_coco_control_audio_prompt(*, transcript: str, caption: str | None) -> str:
+    """Build one control-topic-specific prompt for voice-note command-center use."""
+    lines = [
+        "[coco voice note]",
+        "The user sent this as a voice note to the CoCo control topic.",
+        "Prefer a concise spoken control-room reply.",
+        "If the user is clearly directing another topic, use the topic name explicitly in your plan or action phrasing.",
+        "",
+    ]
+    lines.append(_build_audio_prompt(transcript=transcript, caption=caption))
+    return "\n".join(lines)
+
+
 def _resolve_codex_exec_binary() -> str | None:
     """Resolve executable used for Codex CLI resume bridge."""
     try:
@@ -8474,6 +8496,7 @@ async def _forward_topic_text_message(
     chat_id: int | None,
     text: str,
     response_mode: str = "text",
+    persist_response_mode: bool = True,
 ) -> None:
     """Forward one text prompt through the normal topic/session path."""
     if thread_id is None:
@@ -8551,12 +8574,76 @@ async def _forward_topic_text_message(
         )
         return
 
-    session_manager.set_topic_response_mode(
-        user_id,
-        thread_id,
-        chat_id=chat_id,
-        response_mode=response_mode,
-    )
+    if persist_response_mode:
+        session_manager.set_topic_response_mode(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+            response_mode=response_mode,
+        )
+    else:
+        session_manager.set_next_topic_response_mode(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+            response_mode=response_mode,
+        )
+
+    if session_manager.is_coco_control_topic(user_id, thread_id, chat_id=chat_id):
+        control_action = _parse_coco_control_action(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=text,
+        )
+        if control_action is not None:
+            action, target_thread_id, target_label, payload_text = control_action
+            target_wid = session_manager.get_window_for_thread(
+                user_id,
+                target_thread_id,
+                chat_id=chat_id,
+            )
+            if target_wid is None:
+                await safe_reply(
+                    message,
+                    f"❌ Topic `{target_label}` is not bound to a session yet.",
+                )
+                return
+            if action == "queue":
+                source_chat_id = getattr(message, "chat_id", None)
+                chat = getattr(message, "chat", None)
+                if source_chat_id is None and chat is not None:
+                    source_chat_id = getattr(chat, "id", None)
+                enqueue_queued_topic_input(
+                    user_id,
+                    target_thread_id,
+                    payload_text,
+                    source_chat_id,
+                    message.message_id,
+                )
+                await _set_hourglass_reaction(message)
+                await sync_queued_topic_dock(
+                    context.bot,
+                    user_id,
+                    target_thread_id,
+                    window_id=target_wid,
+                )
+                return
+
+            await message.chat.send_action(ChatAction.TYPING)
+            success, send_msg = await session_manager.send_topic_text_to_window(
+                user_id=user_id,
+                thread_id=target_thread_id,
+                chat_id=chat_id,
+                window_id=target_wid,
+                text=payload_text,
+                steer=True,
+            )
+            if not success:
+                await safe_reply(message, f"❌ {send_msg}")
+                return
+            await _set_eyes_reaction(message)
+            return
 
     if session_manager.get_window_mention_only(wid):
         bot_username = _resolve_bot_username(context)
@@ -8639,6 +8726,70 @@ async def _forward_topic_text_message(
     await _set_eyes_reaction(message)
 
 
+def _resolve_coco_control_target_topic(
+    *,
+    current_user_id: int,
+    current_thread_id: int,
+    current_chat_id: int | None,
+    raw_target: str,
+) -> tuple[int, str] | None:
+    normalized = raw_target.strip()
+    if not normalized:
+        return None
+    by_thread_id: int | None
+    try:
+        by_thread_id = int(normalized)
+    except ValueError:
+        by_thread_id = None
+    lowered = normalized.lower()
+    for user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
+        if user_id != current_user_id or chat_id != current_chat_id:
+            continue
+        if thread_id == current_thread_id:
+            continue
+        label = str(getattr(binding, "display_name", "") or "").strip() or f"thread-{thread_id}"
+        if by_thread_id is not None and thread_id == by_thread_id:
+            return thread_id, label
+        if label.lower() == lowered:
+            return thread_id, label
+    return None
+
+
+def _parse_coco_control_action(
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+    text: str,
+) -> tuple[str, int, str, str] | None:
+    for action, pattern in (
+        ("queue", _COCO_CONTROL_QUEUE_RE),
+        ("steer", _COCO_CONTROL_TELL_RE),
+    ):
+        match = pattern.match(text)
+        if not match:
+            continue
+        target_raw = str(
+            match.groupdict().get("target")
+            or match.groupdict().get("target_alt")
+            or ""
+        ).strip()
+        payload_text = str(match.group("message") or "").strip()
+        if not target_raw or not payload_text:
+            return None
+        resolved = _resolve_coco_control_target_topic(
+            current_user_id=user_id,
+            current_thread_id=thread_id,
+            current_chat_id=chat_id,
+            raw_target=target_raw,
+        )
+        if resolved is None:
+            return None
+        target_thread_id, target_label = resolved
+        return action, target_thread_id, target_label, payload_text
+    return None
+
+
 async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Telegram voice/audio messages with local transcription."""
     chat = update.effective_chat
@@ -8719,7 +8870,16 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except OSError:
         logger.debug("Failed to delete temporary audio file %s", file_path)
 
-    await safe_reply(message, transcript)
+    is_coco_control_voice = bool(
+        thread_id is not None
+        and session_manager.is_coco_control_topic(
+            user.id,
+            thread_id,
+            chat_id=chat_id,
+        )
+    )
+    if not is_coco_control_voice:
+        await safe_reply(message, transcript)
 
     if complete_transcription_bootstrap(bootstrap_handle, success=True):
         await safe_reply(
@@ -8727,10 +8887,16 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "✅ Local transcription is ready. The model finished downloading and the first transcription is complete.",
         )
 
-    prompt = _build_audio_prompt(
-        transcript=transcript,
-        caption=getattr(message, "caption", None),
-    )
+    if is_coco_control_voice:
+        prompt = _build_coco_control_audio_prompt(
+            transcript=transcript,
+            caption=getattr(message, "caption", None),
+        )
+    else:
+        prompt = _build_audio_prompt(
+            transcript=transcript,
+            caption=getattr(message, "caption", None),
+        )
     await _forward_topic_text_message(
         message=message,
         context=context,
@@ -8739,6 +8905,7 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         chat_id=chat_id,
         text=prompt,
         response_mode="voice",
+        persist_response_mode=not is_coco_control_voice,
     )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12979,6 +13146,11 @@ async def _handle_codex_app_server_notification(
                         "text",
                         "assistant",
                     )
+                    response_mode_override = session_manager.consume_next_topic_response_mode(
+                        user_id,
+                        bound_thread_id,
+                        chat_id=bound_chat_id,
+                    )
                     await enqueue_content_message(
                         bot=bot,
                         user_id=user_id,
@@ -12987,6 +13159,7 @@ async def _handle_codex_app_server_notification(
                         content_type="text",
                         text=fallback_note,
                         thread_id=bound_thread_id,
+                        response_mode_override=response_mode_override,
                     )
             should_dispatch = queued_topic_input_count(user_id, bound_thread_id) > 0 and (
                 dispatch_after_completion or missing_final_text
@@ -13211,6 +13384,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                         thread_id=thread_id,
                     )
             else:
+                response_mode_override = ""
                 if is_final_assistant_text:
                     # Keep process message and mark it complete before final answer message.
                     await enqueue_progress_finalize(
@@ -13232,6 +13406,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                             window_id=wid,
                             assistant_text=delivery_text,
                         )
+                        response_mode_override = session_manager.consume_next_topic_response_mode(
+                            user_id,
+                            thread_id,
+                            chat_id=chat_id,
+                        )
 
             # Enqueue content message task
             # Note: tool_result editing is handled inside _process_content_task
@@ -13247,6 +13426,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     thread_id=thread_id,
                     image_data=combined_image_data,
                     document_data=document_data,
+                    response_mode_override=response_mode_override,
                 )
                 if looper_completed_state is not None:
                     await safe_send(
@@ -13487,6 +13667,8 @@ async def post_init(application: Application) -> None:
             for item in params.get("capabilities", [])
             if isinstance(item, str) and item.strip()
         ]
+        raw_runtime = params.get("runtime", {})
+        runtime = dict(raw_runtime) if isinstance(raw_runtime, dict) else {}
         agent_version = str(params.get("agent_version", "")).strip()
         rpc_host = str(params.get("rpc_host", "")).strip()
         rpc_port_raw = params.get("rpc_port", 0)
@@ -13504,6 +13686,7 @@ async def post_init(application: Application) -> None:
             is_local=False,
             browse_roots=browse_roots,
             capabilities=capabilities,
+            runtime=runtime,
             agent_version=agent_version,
             controller_capable=bool(params.get("controller_capable", False)),
             controller_active=bool(params.get("controller_active", False)),

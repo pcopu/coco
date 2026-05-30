@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import config
-from .runtime_capabilities import get_local_runtime_capabilities
+from .runtime_capabilities import get_local_runtime_capabilities, get_local_runtime_summary
 from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ class NodeRecord:
     last_seen_ts: float = 0.0
     browse_roots: list[str] = field(default_factory=list)
     capabilities: list[str] = field(default_factory=list)
+    runtime: dict[str, Any] = field(default_factory=dict)
     agent_version: str = ""
     transport: str = "local"
     rpc_host: str = ""
@@ -67,6 +68,8 @@ class NodeRecord:
             payload["browse_roots"] = list(self.browse_roots)
         if self.capabilities:
             payload["capabilities"] = list(self.capabilities)
+        if self.runtime:
+            payload["runtime"] = dict(self.runtime)
         if self.agent_version:
             payload["agent_version"] = self.agent_version
         return payload
@@ -86,6 +89,8 @@ class NodeRecord:
             for cap in data.get("capabilities", [])
             if isinstance(cap, str) and str(cap).strip()
         ]
+        raw_runtime = data.get("runtime", {})
+        runtime = dict(raw_runtime) if isinstance(raw_runtime, dict) else {}
         try:
             last_seen_ts = float(data.get("last_seen_ts", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -98,6 +103,7 @@ class NodeRecord:
             last_seen_ts=last_seen_ts,
             browse_roots=browse_roots,
             capabilities=capabilities,
+            runtime=runtime,
             agent_version=str(data.get("agent_version", "")).strip(),
             transport=str(data.get("transport", "local")).strip() or "local",
             rpc_host=str(data.get("rpc_host", "")).strip(),
@@ -194,6 +200,9 @@ class NodeRegistry:
             capabilities=get_local_runtime_capabilities(
                 controller_capable=config.controller_capable,
             ),
+            runtime=get_local_runtime_summary(
+                controller_capable=config.controller_capable,
+            ),
             controller_capable=config.controller_capable,
             controller_active=config.controller_active,
             preferred_controller=config.preferred_controller,
@@ -212,6 +221,7 @@ class NodeRegistry:
         is_local: bool,
         browse_roots: list[str] | None = None,
         capabilities: list[str] | None = None,
+        runtime: dict[str, Any] | None = None,
         agent_version: str = "",
         controller_capable: bool = False,
         controller_active: bool = False,
@@ -233,6 +243,7 @@ class NodeRegistry:
             last_seen_ts=timestamp,
             browse_roots=list(browse_roots or []),
             capabilities=list(capabilities or []),
+            runtime=dict(runtime or {}),
             agent_version=agent_version.strip(),
             transport=transport.strip() or "local",
             rpc_host=rpc_host.strip(),

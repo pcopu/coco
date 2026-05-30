@@ -251,6 +251,21 @@ class TestTopicBindingsV2:
         assert binding.response_mode == "voice"
         assert mgr.get_topic_response_mode(100, 1) == "voice"
 
+    def test_next_topic_response_mode_is_one_shot(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+
+        changed = mgr.set_next_topic_response_mode(
+            100,
+            1,
+            response_mode="voice",
+        )
+
+        assert changed is True
+        assert mgr.peek_next_topic_response_mode(100, 1) == "voice"
+        assert mgr.consume_next_topic_response_mode(100, 1) == "voice"
+        assert mgr.peek_next_topic_response_mode(100, 1) == ""
+        assert mgr.get_topic_response_mode(100, 1) == "text"
+
     def test_bind_topic_to_codex_thread_preserves_topic_model_selection(
         self, mgr: SessionManager
     ) -> None:

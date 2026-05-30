@@ -53,3 +53,21 @@ def get_tts_runtime_summary() -> dict[str, Any]:
         "default_voice": get_default_tts_voice(),
         "default_speed": float(get_default_tts_speed()),
     }
+
+
+def get_local_runtime_summary(*, controller_capable: bool = False) -> dict[str, Any]:
+    """Return one compact machine-level runtime summary for node heartbeats."""
+    summary: dict[str, Any] = {
+        "capabilities": get_local_runtime_capabilities(
+            controller_capable=controller_capable,
+        ),
+        "tts": get_tts_runtime_summary(),
+    }
+    try:
+        summary["transcription"] = get_transcription_runtime_summary()
+    except Exception as exc:
+        summary["transcription"] = {
+            "available": False,
+            "error": str(exc),
+        }
+    return summary
