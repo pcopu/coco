@@ -36,6 +36,7 @@ from .message_sender import (
     NO_LINK_PREVIEW,
     send_documents,
     send_photo,
+    send_video,
     send_voice,
     send_with_fallback,
 )
@@ -69,6 +70,7 @@ class MessageTask:
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
     document_data: list[tuple[str, bytes]] | None = None  # Explicit Telegram docs
+    video_data: list[tuple[str, bytes]] | None = None  # Explicit Telegram videos
     response_mode_override: str = ""
     # For progress_finalize tasks: "full" keeps accumulated body, "compact" keeps marker only.
     finalize_mode: str = "full"
@@ -371,6 +373,8 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
         return False
     if base.document_data or candidate.document_data:
         return False
+    if base.video_data or candidate.video_data:
+        return False
     return True
 
 
@@ -435,6 +439,7 @@ async def _merge_content_tasks(
             thread_id=first.thread_id,
             image_data=first.image_data,
             document_data=first.document_data,
+            video_data=first.video_data,
             response_mode_override=first.response_mode_override,
         ),
         merge_count,
@@ -662,6 +667,25 @@ async def _send_task_documents(bot: Bot, chat_id: int, task: MessageTask) -> Non
     )
 
 
+async def _send_task_videos(bot: Bot, chat_id: int, task: MessageTask) -> None:
+    """Send videos attached to a task, if any."""
+    if not task.video_data:
+        return
+    logger.info(
+        "Sending %d video(s) in thread %s",
+        len(task.video_data),
+        task.thread_id,
+    )
+    for media_type, raw_bytes in task.video_data:
+        await send_video(
+            bot,
+            chat_id,
+            media_type,
+            raw_bytes,
+            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
+
+
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Process a content message task."""
     wid = task.window_id or ""
@@ -694,6 +718,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 )
                 await _send_task_images(bot, chat_id, task)
                 await _send_task_documents(bot, chat_id, task)
+                await _send_task_videos(bot, chat_id, task)
                 await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
@@ -721,6 +746,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     )
                     await _send_task_images(bot, chat_id, task)
                     await _send_task_documents(bot, chat_id, task)
+                    await _send_task_videos(bot, chat_id, task)
                     await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
@@ -735,6 +761,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         and task.text
         and not task.image_data
         and not task.document_data
+        and not task.video_data
         and (
             (
                 task.response_mode_override.strip().lower()
@@ -799,6 +826,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
     await _send_task_documents(bot, chat_id, task)
+    await _send_task_videos(bot, chat_id, task)
 
     # 5. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
@@ -1296,6 +1324,7 @@ async def enqueue_content_message(
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
     document_data: list[tuple[str, bytes]] | None = None,
+    video_data: list[tuple[str, bytes]] | None = None,
     response_mode_override: str = "",
 ) -> None:
     """Enqueue a content message task."""
@@ -1317,6 +1346,7 @@ async def enqueue_content_message(
         thread_id=thread_id,
         image_data=image_data,
         document_data=document_data,
+        video_data=video_data,
         response_mode_override=response_mode_override,
     )
     queue.put_nowait(task)

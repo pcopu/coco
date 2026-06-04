@@ -314,6 +314,35 @@ async def test_raw_response_image_generation_routes_image_output(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_raw_response_image_generation_progress_marks_pending_thread(monkeypatch):
+    handled = []
+
+    async def _handle_new_message(msg, _bot):
+        handled.append(msg)
+
+    monkeypatch.setattr(bot, "handle_new_message", _handle_new_message)
+    bot._pending_image_generation_threads.discard("th-img-progress")
+
+    await bot._handle_codex_app_server_notification(
+        "rawResponseItem/completed",
+        {
+            "threadId": "th-img-progress",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "image generation"}],
+            },
+        },
+        bot=object(),
+    )
+
+    assert len(handled) == 1
+    assert handled[0].content_type == "progress"
+    assert "th-img-progress" in bot._pending_image_generation_threads
+
+
+@pytest.mark.asyncio
 async def test_turn_completed_finalizes_progress_and_clears_active_turn(monkeypatch):
     set_turn_calls: list[tuple[str, str]] = []
     completed: list[dict[str, object]] = []
@@ -715,3 +744,103 @@ async def test_turn_completed_skips_warning_after_image_only_tool_result(monkeyp
 
     assert finalized == [(10, "@1", 111, True)]
     assert final_content == []
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_waits_for_late_image_generation_result(monkeypatch):
+    finalized: list[tuple[int, str, int | None, bool]] = []
+    final_content: list[dict[str, object]] = []
+    slept: list[float] = []
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+        finalized.append((user_id, window_id, thread_id, compact))
+
+    async def _enqueue_content(**kwargs):
+        final_content.append(kwargs)
+
+    async def _sleep(delay: float):
+        slept.append(delay)
+        bot._turn_has_final_text["th-late-image"] = True
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_finalize)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", lambda **_kwargs: None)
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+
+    bot._turn_has_final_text["th-late-image"] = False
+    bot._pending_image_generation_threads.add("th-late-image")
+    await bot._handle_codex_app_server_notification(
+        "turn/completed",
+        {"threadId": "th-late-image", "turn": {"status": "completed"}},
+        bot=object(),
+    )
+
+    assert slept == [bot._IMAGE_GENERATION_COMPLETION_GRACE_SECONDS]
+    assert finalized == [(10, "@1", 111, True)]
+    assert final_content == []
+    assert "th-late-image" not in bot._pending_image_generation_threads
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_image_generation_still_warns_after_grace_when_no_result(monkeypatch):
+    finalized: list[tuple[int, str, int | None, bool]] = []
+    final_content: list[dict[str, object]] = []
+    slept: list[float] = []
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot,
+        "get_progress_text",
+        lambda *_args, **_kwargs: "   ",
+    )
+
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+        finalized.append((user_id, window_id, thread_id, compact))
+
+    async def _enqueue_content(**kwargs):
+        final_content.append(kwargs)
+
+    async def _sleep(delay: float):
+        slept.append(delay)
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_finalize)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", lambda **_kwargs: None)
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+
+    bot._turn_has_final_text["th-image-empty"] = False
+    bot._pending_image_generation_threads.add("th-image-empty")
+    await bot._handle_codex_app_server_notification(
+        "turn/completed",
+        {"threadId": "th-image-empty", "turn": {"status": "completed"}},
+        bot=object(),
+    )
+
+    assert slept == [bot._IMAGE_GENERATION_COMPLETION_GRACE_SECONDS]
+    assert finalized == [(10, "@1", 111, True)]
+    assert len(final_content) == 1
+    assert "without a final assistant response" in final_content[0]["text"]

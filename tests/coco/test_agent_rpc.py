@@ -236,3 +236,59 @@ async def test_agent_rpc_ping_includes_runtime_summary(monkeypatch):
         assert payload["runtime"]["tts"]["default_speed"] == 1.4
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_thread_goal_round_trip(monkeypatch):
+    async def _fake_goal_get(*, thread_id: str):
+        assert thread_id == "thread-1"
+        return {"goal": {"objective": "Ship it", "status": "active"}}
+
+    async def _fake_goal_set(*, thread_id: str, goal: str):
+        assert thread_id == "thread-1"
+        assert goal == "Ship it"
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    async def _fake_goal_clear(*, thread_id: str):
+        assert thread_id == "thread-1"
+        return {"cleared": True}
+
+    monkeypatch.setattr(
+        "coco.agent_rpc.codex_app_server_client.thread_goal_get",
+        _fake_goal_get,
+    )
+    monkeypatch.setattr(
+        "coco.agent_rpc.codex_app_server_client.thread_goal_set",
+        _fake_goal_set,
+    )
+    monkeypatch.setattr(
+        "coco.agent_rpc.codex_app_server_client.thread_goal_clear",
+        _fake_goal_clear,
+    )
+
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        host, port = server.bound_address()
+        node_registry.note_heartbeat(
+            machine_id="goal-node",
+            display_name="Goal Node",
+            transport="agent_rpc",
+            rpc_host=host,
+            rpc_port=port,
+            is_local=False,
+            now=100.0,
+        )
+        client = AgentRpcClient(shared_secret="rpc-secret")
+        payload = await client.thread_goal_get("goal-node", thread_id="thread-1")
+        assert payload["goal"]["objective"] == "Ship it"
+        payload = await client.thread_goal_set(
+            "goal-node",
+            thread_id="thread-1",
+            goal="Ship it",
+        )
+        assert payload["goal"]["status"] == "active"
+        payload = await client.thread_goal_clear("goal-node", thread_id="thread-1")
+        assert payload["cleared"] is True
+    finally:
+        await server.stop()

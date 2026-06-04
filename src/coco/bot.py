@@ -240,6 +240,10 @@ _update_check_task: asyncio.Task | None = None
 # output should also suppress the misleading "no final assistant response"
 # fallback on turn completion.
 _turn_has_final_text: dict[str, bool] = {}
+# Threads that appear to be in image-generation flow and may deliver their
+# terminal artifact slightly after `turn/completed`.
+_pending_image_generation_threads: set[str] = set()
+_IMAGE_GENERATION_COMPLETION_GRACE_SECONDS = 1.5
 # Track transient app-server turn failures that should trigger one guarded retry
 # after the failing turn fully completes.
 _pending_transient_app_server_errors: dict[str, tuple[str, str]] = {}
@@ -4001,6 +4005,15 @@ _ALLOWED_TELEGRAM_IMAGE_TYPES = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
 }
+_ALLOWED_TELEGRAM_VIDEO_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+}
 _TELEGRAM_ATTACHMENT_MAX_BYTES = 45 * 1024 * 1024
 
 
@@ -4113,17 +4126,59 @@ def _resolve_telegram_image_attachment(
         return None
 
 
+def _resolve_telegram_video_attachment(
+    *,
+    workspace_dir: str,
+    raw_path: str,
+) -> tuple[str, bytes] | None:
+    """Resolve one explicit Telegram video attachment inside the workspace."""
+    resolved = _resolve_telegram_attachment_path(
+        workspace_dir=workspace_dir,
+        raw_path=raw_path,
+    )
+    if resolved is None:
+        return None
+    media_type = _ALLOWED_TELEGRAM_VIDEO_TYPES.get(resolved.suffix.lower())
+    if not media_type:
+        return None
+    if not resolved.is_file():
+        logger.warning("Rejected Telegram attachment missing file: %s", resolved)
+        return None
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        return None
+    if size > _TELEGRAM_ATTACHMENT_MAX_BYTES:
+        logger.warning(
+            "Rejected Telegram attachment exceeding size limit: %s (%d bytes)",
+            resolved,
+            size,
+        )
+        return None
+    try:
+        return media_type, resolved.read_bytes()
+    except OSError:
+        logger.warning("Failed reading Telegram attachment file: %s", resolved)
+        return None
+
+
 def _extract_telegram_attachments(
     text: str,
     *,
     workspace_dir: str | None,
-) -> tuple[str, list[tuple[str, bytes]] | None, list[tuple[str, bytes]] | None]:
+) -> tuple[
+    str,
+    list[tuple[str, bytes]] | None,
+    list[tuple[str, bytes]] | None,
+    list[tuple[str, bytes]] | None,
+]:
     """Strip explicit Telegram attachment tags and load allowed images/documents."""
     if not text:
-        return text, None, None
+        return text, None, None, None
 
     image_attachments: list[tuple[str, bytes]] = []
     document_attachments: list[tuple[str, bytes]] = []
+    video_attachments: list[tuple[str, bytes]] = []
 
     def _replace(match: re.Match[str]) -> str:
         if workspace_dir:
@@ -4135,6 +4190,13 @@ def _extract_telegram_attachments(
             if image_resolved is not None:
                 image_attachments.append(image_resolved)
                 return ""
+            video_resolved = _resolve_telegram_video_attachment(
+                workspace_dir=workspace_dir,
+                raw_path=raw_path,
+            )
+            if video_resolved is not None:
+                video_attachments.append(video_resolved)
+                return ""
             resolved = _resolve_telegram_document_attachment(
                 workspace_dir=workspace_dir,
                 raw_path=raw_path,
@@ -4145,7 +4207,12 @@ def _extract_telegram_attachments(
 
     stripped = _TELEGRAM_ATTACHMENT_TAG_RE.sub(_replace, text)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-    return stripped, image_attachments or None, document_attachments or None
+    return (
+        stripped,
+        image_attachments or None,
+        document_attachments or None,
+        video_attachments or None,
+    )
 
 
 async def _extract_telegram_attachments_for_window(
@@ -4153,10 +4220,15 @@ async def _extract_telegram_attachments_for_window(
     *,
     workspace_dir: str | None,
     window_id: str,
-) -> tuple[str, list[tuple[str, bytes]] | None, list[tuple[str, bytes]] | None]:
+) -> tuple[
+    str,
+    list[tuple[str, bytes]] | None,
+    list[tuple[str, bytes]] | None,
+    list[tuple[str, bytes]] | None,
+]:
     """Strip explicit Telegram attachment tags for local or remote workspaces."""
     if not text:
-        return text, None, None
+        return text, None, None, None
     machine_id = session_manager.get_window_machine_id(window_id)
     local_machine_id, _local_machine_name = _local_machine_identity()
     if not machine_id or machine_id == local_machine_id:
@@ -4172,7 +4244,7 @@ async def _extract_telegram_attachments_for_window(
     ]
     stripped = re.sub(r"\n{3,}", "\n\n", _TELEGRAM_ATTACHMENT_TAG_RE.sub("", text)).strip()
     if not raw_paths or not workspace_dir:
-        return stripped, None, None
+        return stripped, None, None, None
 
     from .agent_rpc import agent_rpc_client
 
@@ -4189,9 +4261,10 @@ async def _extract_telegram_attachments_for_window(
             workspace_dir,
             exc,
         )
-        attachments = {"images": [], "documents": []}
+        attachments = {"images": [], "documents": [], "videos": []}
     image_attachments = attachments.get("images")
     document_attachments = attachments.get("documents")
+    video_attachments = attachments.get("videos")
     return (
         stripped,
         image_attachments if isinstance(image_attachments, list) and image_attachments else None,
@@ -4200,6 +4273,7 @@ async def _extract_telegram_attachments_for_window(
             if isinstance(document_attachments, list) and document_attachments
             else None
         ),
+        video_attachments if isinstance(video_attachments, list) and video_attachments else None,
     )
 
 
@@ -7898,7 +7972,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ This media type is not supported yet. Send text, photos, voice notes, audio files, PDF documents, or ZIP archives.",
+        "⚠ This media type is not supported yet. Send text, photos, videos, voice notes, audio files, PDF documents, or ZIP archives.",
     )
 
 
@@ -7913,6 +7987,10 @@ _AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 # --- Document directory for incoming PDF/ZIP media ---
 _DOCUMENTS_DIR = coco_dir() / "documents"
 _DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Video directory for incoming videos ---
+_VIDEOS_DIR = coco_dir() / "videos"
+_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-topic lock for Codex image resume submissions: (user_id, thread_id) -> lock
 _photo_resume_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -7939,6 +8017,31 @@ _DOCUMENT_BINARY_EXTENSIONS = {
     ".docx",
     ".xlsx",
     ".pptx",
+}
+_DOCUMENT_IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+}
+_DOCUMENT_AUDIO_EXTENSIONS = {
+    ".flac",
+    ".mp3",
+    ".m4a",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+}
+_DOCUMENT_VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".webm",
+    ".mkv",
 }
 _ARCHIVE_EXTENSIONS = {
     ".zip",
@@ -7977,6 +8080,24 @@ def _pick_audio_suffix(media: object) -> str:
     return mime_map.get(mime_type, ".ogg")
 
 
+def _pick_video_suffix(media: object) -> str:
+    """Infer a useful local file extension for Telegram video media."""
+    file_name = str(getattr(media, "file_name", "") or "").strip()
+    if file_name:
+        suffix = Path(file_name).suffix.strip().lower()
+        if suffix:
+            return suffix
+
+    mime_type = str(getattr(media, "mime_type", "") or "").strip().lower()
+    mime_map = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+    }
+    return mime_map.get(mime_type, ".mp4")
+
+
 def _pick_document_suffix(media: object) -> str:
     """Infer a useful local file extension for Telegram documents."""
     file_name = str(getattr(media, "file_name", "") or "").strip()
@@ -7995,6 +8116,38 @@ def _pick_document_suffix(media: object) -> str:
         return ".zip"
     if mime_type in {"application/gzip", "application/x-gzip"}:
         return ".tgz"
+    if mime_type in {"image/png"}:
+        return ".png"
+    if mime_type in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+    if mime_type == "image/webp":
+        return ".webp"
+    if mime_type == "image/gif":
+        return ".gif"
+    if mime_type == "image/bmp":
+        return ".bmp"
+    if mime_type in {"image/tiff", "image/tif"}:
+        return ".tiff"
+    if mime_type == "audio/flac":
+        return ".flac"
+    if mime_type in {"audio/mp3", "audio/mpeg"}:
+        return ".mp3"
+    if mime_type == "audio/mp4":
+        return ".m4a"
+    if mime_type in {"audio/ogg", "audio/opus"}:
+        return ".ogg"
+    if mime_type == "audio/wav":
+        return ".wav"
+    if mime_type == "audio/webm":
+        return ".webm"
+    if mime_type == "video/mp4":
+        return ".mp4"
+    if mime_type == "video/quicktime":
+        return ".mov"
+    if mime_type == "video/webm":
+        return ".webm"
+    if mime_type == "video/x-matroska":
+        return ".mkv"
     return ".bin"
 
 
@@ -8002,6 +8155,15 @@ def _build_document_prompt(*, file_path: Path, caption: str | None) -> str:
     """Build prompt text for an inbound Telegram document."""
     caption_text = (caption or "").strip()
     base = f"User uploaded a document: {file_path}"
+    if caption_text:
+        return f"{caption_text}\n\n{base}"
+    return base
+
+
+def _build_video_prompt(*, file_path: Path, caption: str | None) -> str:
+    """Build prompt text for an inbound Telegram video."""
+    caption_text = (caption or "").strip()
+    base = f"User uploaded a video: {file_path}"
     if caption_text:
         return f"{caption_text}\n\n{base}"
     return base
@@ -8046,6 +8208,21 @@ def _extract_tar_archive(archive_path: Path, destination_dir: Path) -> None:
 def _is_supported_document_suffix(suffix: str) -> bool:
     normalized = suffix.strip().lower()
     return normalized in (_DOCUMENT_TEXT_EXTENSIONS | _DOCUMENT_BINARY_EXTENSIONS)
+
+
+def _is_supported_image_document_suffix(suffix: str) -> bool:
+    normalized = suffix.strip().lower()
+    return normalized in _DOCUMENT_IMAGE_EXTENSIONS
+
+
+def _is_supported_audio_document_suffix(suffix: str) -> bool:
+    normalized = suffix.strip().lower()
+    return normalized in _DOCUMENT_AUDIO_EXTENSIONS
+
+
+def _is_supported_video_document_suffix(suffix: str) -> bool:
+    normalized = suffix.strip().lower()
+    return normalized in _DOCUMENT_VIDEO_EXTENSIONS
 
 
 def _is_supported_archive_suffix(suffix: str) -> bool:
@@ -8437,7 +8614,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     suffix = _pick_document_suffix(document)
     is_archive = _is_supported_archive_suffix(suffix)
     is_document = _is_supported_document_suffix(suffix)
-    if not is_document and not is_archive:
+    is_image_document = _is_supported_image_document_suffix(suffix)
+    is_audio_document = _is_supported_audio_document_suffix(suffix)
+    is_video_document = _is_supported_video_document_suffix(suffix)
+    if not is_document and not is_archive and not is_image_document and not is_audio_document and not is_video_document:
         await safe_reply(
             message,
             "⚠ This file type is not supported yet. Send text, photos, voice notes, audio files, supported documents, or supported archives.",
@@ -8454,6 +8634,43 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await tg_file.download_to_drive(file_path)
 
     await message.chat.send_action(ChatAction.TYPING)
+    if is_audio_document:
+        prompt_text = _build_document_prompt(file_path=file_path, caption=message.caption)
+        await _forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=prompt_text,
+        )
+        return
+
+    if is_image_document:
+        prompt_text = _pick_image_prompt(message.caption)
+        text_to_send = f"{prompt_text}\n\n(image attached: {file_path})"
+        await _forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=text_to_send,
+        )
+        return
+
+    if is_video_document:
+        prompt_text = _build_video_prompt(file_path=file_path, caption=message.caption)
+        await _forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=prompt_text,
+        )
+        return
+
     prompt_text = _build_document_prompt(file_path=file_path, caption=message.caption)
     if is_archive:
         extracted_dir = _DOCUMENTS_DIR / f"{file_path.stem}_unpacked"
@@ -8477,6 +8694,49 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             extracted_dir=extracted_dir,
             caption=message.caption,
         )
+    await _forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        text=prompt_text,
+    )
+
+
+async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram videos by saving locally and forwarding a path hint."""
+    chat = update.effective_chat
+    if not _is_chat_allowed(chat):
+        if update.message:
+            await safe_reply(update.message, "❌ This group is not allowed to use this bot.")
+        return
+
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    video = getattr(message, "video", None)
+    if video is None:
+        return
+
+    thread_id = _get_thread_id(update)
+    chat_id = _group_chat_id(chat)
+    if chat_id is not None and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+
+    tg_file = await video.get_file()
+    file_path = _VIDEOS_DIR / f"{int(time.time())}_{video.file_unique_id}{_pick_video_suffix(video)}"
+    await tg_file.download_to_drive(file_path)
+
+    await message.chat.send_action(ChatAction.TYPING)
+    prompt_text = _build_video_prompt(file_path=file_path, caption=message.caption)
     await _forward_topic_text_message(
         message=message,
         context=context,
@@ -12537,6 +12797,17 @@ def _extract_app_server_response_item_images(
     return [("image/png", raw_bytes)]
 
 
+def _looks_like_image_generation_progress(text: str) -> bool:
+    """Return whether progress text indicates an image-generation run."""
+    normalized = " ".join(text.lower().split())
+    return normalized in {
+        "image generation",
+        "generating image",
+        "image generation...",
+        "generating image...",
+    } or "image generation" in normalized
+
+
 def _is_transient_app_server_turn_error(message: str, details: str = "") -> bool:
     """Return whether an app-server error message looks like a transient run failure."""
     text = " ".join(part.strip() for part in (message, details) if part.strip()).lower()
@@ -13047,6 +13318,7 @@ async def _handle_codex_app_server_notification(
         if isinstance(thread_id, str) and isinstance(turn_id, str):
             _interrupted_codex_threads.discard(thread_id)
             _pending_transient_app_server_errors.pop(thread_id, None)
+            _pending_image_generation_threads.discard(thread_id)
             session_manager.set_codex_turn_for_thread(thread_id, turn_id)
             _turn_has_final_text[thread_id] = False
         return
@@ -13063,8 +13335,19 @@ async def _handle_codex_app_server_notification(
                 session_manager.set_codex_turn_for_thread(thread_id, turn_id)
             return
 
-        had_final_text = _turn_has_final_text.pop(thread_id, False)
+        pending_image_generation = thread_id in _pending_image_generation_threads
+        had_final_text = _turn_has_final_text.get(thread_id, False)
+        if (
+            not had_final_text
+            and pending_image_generation
+            and isinstance(status, str)
+            and status == "completed"
+        ):
+            await asyncio.sleep(_IMAGE_GENERATION_COMPLETION_GRACE_SECONDS)
+            had_final_text = _turn_has_final_text.get(thread_id, False)
+        _turn_has_final_text.pop(thread_id, None)
         _interrupted_codex_threads.discard(thread_id)
+        _pending_image_generation_threads.discard(thread_id)
         session_manager.set_codex_turn_for_thread(thread_id, "")
         transient_error = _pending_transient_app_server_errors.pop(thread_id, None)
         suppressed_topics: set[tuple[int, int | None]] = set()
@@ -13227,8 +13510,11 @@ async def _handle_codex_app_server_notification(
             content_type = TranscriptParser.assistant_phase_to_content_type(
                 item.get("phase")
             )
+            if content_type == "progress" and _looks_like_image_generation_progress(text):
+                _pending_image_generation_threads.add(thread_id)
             if content_type == "text":
                 _turn_has_final_text[thread_id] = True
+                _pending_image_generation_threads.discard(thread_id)
             await handle_new_message(
                 NewMessage(
                     session_id=thread_id,
@@ -13246,6 +13532,7 @@ async def _handle_codex_app_server_notification(
         if not image_data:
             return
         _turn_has_final_text[thread_id] = True
+        _pending_image_generation_threads.discard(thread_id)
         await handle_new_message(
             NewMessage(
                 session_id=thread_id,
@@ -13311,6 +13598,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         delivery_text = msg.text
         attachment_image_data: list[tuple[str, bytes]] | None = None
         document_data: list[tuple[str, bytes]] | None = None
+        video_data: list[tuple[str, bytes]] | None = None
         if msg.role == "assistant" and msg.is_complete and msg.content_type == "text":
             workspace_dir = _resolve_workspace_dir_for_window(
                 user_id=user_id,
@@ -13322,6 +13610,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 delivery_text,
                 attachment_image_data,
                 document_data,
+                video_data,
             ) = await _extract_telegram_attachments_for_window(
                 msg.text,
                 workspace_dir=workspace_dir,
@@ -13338,7 +13627,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             if not combined_image_data:
                 combined_image_data = None
 
-        has_visible_nontext_output = bool(combined_image_data or document_data)
+        has_visible_nontext_output = bool(combined_image_data or document_data or video_data)
         if (
             msg.role == "assistant"
             and msg.is_complete
@@ -13426,6 +13715,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     thread_id=thread_id,
                     image_data=combined_image_data,
                     document_data=document_data,
+                    video_data=video_data,
                     response_mode_override=response_mode_override,
                 )
                 if looper_completed_state is not None:
@@ -13823,6 +14113,7 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to assistant
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    application.add_handler(MessageHandler(filters.VIDEO, video_handler))
     # Supported documents/archives: download and forward local file path to assistant
     application.add_handler(
         MessageHandler(filters.Document.ALL, document_handler)

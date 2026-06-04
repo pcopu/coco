@@ -45,6 +45,18 @@ class _FakeDocument:
         return self._tg_file
 
 
+class _FakeVideo:
+    file_unique_id = "video-123"
+
+    def __init__(self, tg_file: _FakeTelegramFile, *, file_name: str, mime_type: str) -> None:
+        self._tg_file = tg_file
+        self.file_name = file_name
+        self.mime_type = mime_type
+
+    async def get_file(self):
+        return self._tg_file
+
+
 def _make_document_update(*, file_name: str, mime_type: str, caption: str | None = None):
     chat = _FakeChat()
     tg_file = _FakeTelegramFile(b"%PDF-1.7 test")
@@ -56,6 +68,27 @@ def _make_document_update(*, file_name: str, mime_type: str, caption: str | None
         chat=chat,
         chat_id=chat.id,
         message_id=999,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1147817421),
+        effective_message=message,
+        effective_chat=chat,
+        message=message,
+    )
+    return update, tg_file
+
+
+def _make_video_update(*, file_name: str, mime_type: str, caption: str | None = None):
+    chat = _FakeChat()
+    tg_file = _FakeTelegramFile(b"MP4 test")
+    message = SimpleNamespace(
+        text=None,
+        caption=caption,
+        video=_FakeVideo(tg_file, file_name=file_name, mime_type=mime_type),
+        message_thread_id=77,
+        chat=chat,
+        chat_id=chat.id,
+        message_id=998,
     )
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=1147817421),
@@ -262,6 +295,73 @@ async def test_document_handler_forwards_office_document(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_document_handler_forwards_image_document(monkeypatch, tmp_path):
+    update, tg_file = _make_document_update(
+        file_name="image.png",
+        mime_type="image/png",
+        caption="Look at this image",
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[str] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs["text"])
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message, raising=False)
+
+    await bot.document_handler(update, context)
+
+    assert replies == []
+    assert len(tg_file.paths) == 1
+    assert len(forwarded) == 1
+    assert "Look at this image" in forwarded[0]
+    assert str(tg_file.paths[0]) in forwarded[0]
+    assert "(image attached:" in forwarded[0]
+
+
+@pytest.mark.asyncio
+async def test_document_handler_forwards_audio_document_as_file_path(monkeypatch, tmp_path):
+    update, tg_file = _make_document_update(
+        file_name="meditation.wav",
+        mime_type="audio/wav",
+        caption="Use this audio",
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[str] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs["text"])
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message, raising=False)
+
+    await bot.document_handler(update, context)
+
+    assert tg_file.paths[0].exists() is True
+    assert replies == []
+    assert len(forwarded) == 1
+    assert "Use this audio" in forwarded[0]
+    assert str(tg_file.paths[0]) in forwarded[0]
+
+
+@pytest.mark.asyncio
 async def test_document_handler_extracts_tgz_and_forwards_directory(monkeypatch, tmp_path):
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w:gz") as archive:
@@ -332,3 +432,63 @@ async def test_document_handler_rejects_unsupported_document(monkeypatch, tmp_pa
     assert replies == [
         "⚠ This file type is not supported yet. Send text, photos, voice notes, audio files, supported documents, or supported archives."
     ]
+
+
+@pytest.mark.asyncio
+async def test_video_handler_downloads_video_and_forwards_topic_text(monkeypatch, tmp_path):
+    update, tg_file = _make_video_update(
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+        caption="Please review this",
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[dict[str, object]] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_VIDEOS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(
+        *,
+        message,
+        context,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None,
+        text: str,
+    ) -> None:
+        forwarded.append(
+            {
+                "message": message,
+                "context": context,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "chat_id": chat_id,
+                "text": text,
+            }
+        )
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(
+        bot,
+        "_forward_topic_text_message",
+        _forward_topic_text_message,
+        raising=False,
+    )
+
+    await bot.video_handler(update, context)
+
+    assert update.message.chat.actions == [ChatAction.TYPING]
+    assert len(tg_file.paths) == 1
+    saved_path = tg_file.paths[0]
+    assert saved_path.exists()
+    assert replies == []
+    assert len(forwarded) == 1
+    assert forwarded[0]["thread_id"] == 77
+    assert forwarded[0]["chat_id"] == -100123
+    assert "Please review this" in forwarded[0]["text"]
+    assert str(saved_path) in forwarded[0]["text"]

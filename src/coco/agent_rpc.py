@@ -37,6 +37,15 @@ ALLOWED_TELEGRAM_IMAGE_TYPES = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
 }
+ALLOWED_TELEGRAM_VIDEO_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+}
 TELEGRAM_ATTACHMENT_MAX_BYTES = 45 * 1024 * 1024
 _remote_restart_requested = False
 _COCO_SELF_UPDATE_COMMAND_ENV = "COCO_SELF_UPDATE_COMMAND"
@@ -133,6 +142,34 @@ def _resolve_image_attachment(
     if resolved is None:
         return None
     media_type = ALLOWED_TELEGRAM_IMAGE_TYPES.get(resolved.suffix.lower())
+    if not media_type:
+        return None
+    if not resolved.is_file():
+        return None
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        return None
+    if size > TELEGRAM_ATTACHMENT_MAX_BYTES:
+        return None
+    try:
+        return media_type, resolved.read_bytes()
+    except OSError:
+        return None
+
+
+def _resolve_video_attachment(
+    *,
+    workspace_dir: str,
+    raw_path: str,
+) -> tuple[str, bytes] | None:
+    resolved = _resolve_attachment_path(
+        workspace_dir=workspace_dir,
+        raw_path=raw_path,
+    )
+    if resolved is None:
+        return None
+    media_type = ALLOWED_TELEGRAM_VIDEO_TYPES.get(resolved.suffix.lower())
     if not media_type:
         return None
     if not resolved.is_file():
@@ -258,6 +295,9 @@ class AgentRpcServer:
         self._server.register("agent/read_documents", self._read_documents)
         self._server.register("agent/resume_latest", self._resume_latest)
         self._server.register("agent/resume_thread", self._resume_thread)
+        self._server.register("agent/thread_goal_get", self._thread_goal_get)
+        self._server.register("agent/thread_goal_set", self._thread_goal_set)
+        self._server.register("agent/thread_goal_clear", self._thread_goal_clear)
         self._server.register("agent/send_inputs", self._send_inputs)
         self._server.register("agent/run_update", self._run_update)
 
@@ -441,6 +481,7 @@ class AgentRpcServer:
             raise ClusterRpcError("paths must be a list")
         documents: list[dict[str, str]] = []
         images: list[dict[str, str]] = []
+        videos: list[dict[str, str]] = []
         for raw_path in raw_paths:
             if not isinstance(raw_path, str):
                 continue
@@ -451,6 +492,19 @@ class AgentRpcServer:
             if image_resolved is not None:
                 media_type, raw_bytes = image_resolved
                 images.append(
+                    {
+                        "media_type": media_type,
+                        "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    }
+                )
+                continue
+            video_resolved = _resolve_video_attachment(
+                workspace_dir=workspace_dir,
+                raw_path=raw_path,
+            )
+            if video_resolved is not None:
+                media_type, raw_bytes = video_resolved
+                videos.append(
                     {
                         "media_type": media_type,
                         "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
@@ -470,7 +524,7 @@ class AgentRpcServer:
                     "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
                 }
             )
-        return {"documents": documents, "images": images}
+        return {"documents": documents, "images": images, "videos": videos}
 
     async def _read_documents(self, params: dict[str, Any]) -> dict[str, Any]:
         result = await self._read_attachments(params)
@@ -507,6 +561,39 @@ class AgentRpcServer:
             "model_slug": model_slug,
             "reasoning_effort": reasoning_effort,
         }
+
+    async def _thread_goal_get(self, params: dict[str, Any]) -> dict[str, Any]:
+        thread_id = str(params.get("thread_id", "")).strip()
+        if not thread_id:
+            raise ClusterRpcError("thread_id is required")
+        result = await codex_app_server_client.thread_goal_get(thread_id=thread_id)
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid goal get response")
+        return result
+
+    async def _thread_goal_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        thread_id = str(params.get("thread_id", "")).strip()
+        goal = str(params.get("goal", "")).strip()
+        if not thread_id:
+            raise ClusterRpcError("thread_id is required")
+        if not goal:
+            raise ClusterRpcError("goal is required")
+        result = await codex_app_server_client.thread_goal_set(
+            thread_id=thread_id,
+            goal=goal,
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid goal set response")
+        return result
+
+    async def _thread_goal_clear(self, params: dict[str, Any]) -> dict[str, Any]:
+        thread_id = str(params.get("thread_id", "")).strip()
+        if not thread_id:
+            raise ClusterRpcError("thread_id is required")
+        result = await codex_app_server_client.thread_goal_clear(thread_id=thread_id)
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid goal clear response")
+        return result
 
     async def _send_inputs(self, params: dict[str, Any]) -> dict[str, Any]:
         window_id = str(params.get("window_id", "")).strip()
@@ -858,9 +945,25 @@ class AgentRpcClient:
                 except Exception:
                     continue
 
+        resolved_videos: list[tuple[str, bytes]] = []
+        videos = result.get("videos", [])
+        if isinstance(videos, list):
+            for item in videos:
+                if not isinstance(item, dict):
+                    continue
+                media_type = item.get("media_type")
+                data_b64 = item.get("data_b64")
+                if not isinstance(media_type, str) or not isinstance(data_b64, str):
+                    continue
+                try:
+                    resolved_videos.append((media_type, base64.b64decode(data_b64)))
+                except Exception:
+                    continue
+
         return {
             "documents": resolved_documents,
             "images": resolved_images,
+            "videos": resolved_videos,
         }
 
     async def ensure_thread(
@@ -958,6 +1061,58 @@ class AgentRpcClient:
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid send response")
+        return result
+
+    async def thread_goal_get(
+        self,
+        machine_id: str,
+        *,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/thread_goal_get",
+            params={"thread_id": thread_id},
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid goal get response")
+        return result
+
+    async def thread_goal_set(
+        self,
+        machine_id: str,
+        *,
+        thread_id: str,
+        goal: str,
+    ) -> dict[str, Any]:
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/thread_goal_set",
+            params={"thread_id": thread_id, "goal": goal},
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid goal set response")
+        return result
+
+    async def thread_goal_clear(
+        self,
+        machine_id: str,
+        *,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/thread_goal_clear",
+            params={"thread_id": thread_id},
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid goal clear response")
         return result
 
     async def run_update(

@@ -424,6 +424,68 @@ async def test_handle_new_message_extracts_hidden_image_attachments(
 
 
 @pytest.mark.asyncio
+async def test_handle_new_message_extracts_hidden_video_attachments(
+    monkeypatch, mgr: SessionManager, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    clip = workspace / "clip.mp4"
+    clip.write_bytes(b"MP4-preview")
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=1,
+        thread_id=10,
+        codex_thread_id="thread-1",
+        window_id="@1",
+        cwd=str(workspace),
+        display_name="demo",
+    )
+    mgr.get_window_state("@1").cwd = str(workspace)
+
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    monkeypatch.setattr(bot, "session_manager", mgr)
+    monkeypatch.setattr(bot, "note_run_activity", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "consume_looper_completion_keyword", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+
+    delivered: list[dict[str, object]] = []
+
+    async def _enqueue_progress_finalize(*_args, **_kwargs):
+        return None
+
+    async def _enqueue_content_message(**kwargs):
+        delivered.append(kwargs)
+
+    async def _update_offset(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_progress_finalize)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content_message)
+    monkeypatch.setattr(bot, "_update_user_read_offset_for_window", _update_offset)
+
+    await bot.handle_new_message(
+        NewMessage(
+            session_id="thread-1",
+            text=(
+                "Attached the preview video.\n"
+                '<telegram-attachment path="clip.mp4" />'
+            ),
+            is_complete=True,
+            content_type="text",
+            role="assistant",
+            source="app_server",
+        ),
+        SimpleNamespace(),
+    )
+
+    assert delivered[0]["text"] == "Attached the preview video."
+    assert delivered[0]["video_data"] == [("video/mp4", b"MP4-preview")]
+    assert delivered[0]["image_data"] is None
+    assert delivered[0]["document_data"] is None
+
+
+@pytest.mark.asyncio
 async def test_handle_new_message_extracts_hidden_remote_document_attachments(
     monkeypatch, mgr: SessionManager
 ):
@@ -570,6 +632,83 @@ async def test_handle_new_message_extracts_hidden_remote_image_attachments(
 
     assert delivered[0]["text"] == "Final answer"
     assert delivered[0]["image_data"] == [("image/webp", b"remote-webp")]
+    assert delivered[0]["document_data"] is None
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_extracts_hidden_remote_video_attachments(
+    monkeypatch, mgr: SessionManager
+):
+    mgr.bind_topic_to_codex_thread(
+        user_id=1,
+        thread_id=10,
+        codex_thread_id="thread-1",
+        window_id="@1",
+        cwd="/srv/demo",
+        display_name="demo",
+        machine_id="remote-node",
+        machine_display_name="Remote Node",
+    )
+
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    monkeypatch.setattr(bot, "session_manager", mgr)
+    monkeypatch.setattr(bot, "note_run_activity", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "build_response_parts", lambda text, *_args, **_kwargs: [text])
+    monkeypatch.setattr(bot, "consume_looper_completion_keyword", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "_resolve_workspace_dir_for_window", lambda **_kwargs: "/srv/demo")
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+
+    async def _read_attachments(
+        machine_id: str,
+        *,
+        workspace_dir: str,
+        paths: list[str],
+    ):
+        assert machine_id == "remote-node"
+        assert workspace_dir == "/srv/demo"
+        assert paths == ["clip.mp4"]
+        return {
+            "documents": [],
+            "images": [],
+            "videos": [("video/mp4", b"REMOTE-MP4")],
+        }
+
+    monkeypatch.setattr("coco.agent_rpc.agent_rpc_client.read_attachments", _read_attachments)
+
+    delivered: list[dict[str, object]] = []
+
+    async def _enqueue_content_message(**kwargs):
+        delivered.append(kwargs)
+
+    async def _enqueue_progress_finalize(*_args, **_kwargs):
+        return None
+
+    async def _update_offset(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content_message)
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_progress_finalize)
+    monkeypatch.setattr(bot, "_update_user_read_offset_for_window", _update_offset)
+
+    await bot.handle_new_message(
+        NewMessage(
+            session_id="thread-1",
+            text=(
+                "Final answer\n"
+                '<telegram-attachment path="clip.mp4" />'
+            ),
+            is_complete=True,
+            content_type="text",
+            role="assistant",
+            source="app_server",
+        ),
+        SimpleNamespace(),
+    )
+
+    assert delivered[0]["text"] == "Final answer"
+    assert delivered[0]["video_data"] == [("video/mp4", b"REMOTE-MP4")]
+    assert delivered[0]["image_data"] is None
     assert delivered[0]["document_data"] is None
 
 

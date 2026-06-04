@@ -31,6 +31,18 @@ def test_create_bot_registers_document_handler_for_pdf_and_zip():
     assert "filters.Document.ALL" in document_filters[0]
 
 
+def test_create_bot_registers_video_handler():
+    app = bot.create_bot()
+    video_filters = [
+        str(handler.filters)
+        for handler in app.handlers.get(0, [])
+        if getattr(getattr(handler, "callback", None), "__name__", "") == "video_handler"
+    ]
+
+    assert len(video_filters) == 1
+    assert "filters.VIDEO" in video_filters[0]
+
+
 @pytest.mark.asyncio
 async def test_post_init_does_not_publish_usage_command(monkeypatch):
     published = []

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import coco.agent_rpc as agent_rpc_mod
 import coco.session as session_mod
 from coco.node_registry import NodeRegistry
 from coco.session import (
@@ -660,7 +661,7 @@ async def test_set_topic_goal_creates_thread_for_window_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_get_topic_goal_rejects_remote_machine_binding(
+async def test_get_topic_goal_reads_remote_machine_binding(
     mgr: SessionManager, monkeypatch
 ) -> None:
     monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local Node"))
@@ -676,15 +677,100 @@ async def test_get_topic_goal_rejects_remote_machine_binding(
         machine_display_name="Remote Node",
     )
 
+    async def _thread_goal_get(machine_id: str, *, thread_id: str):
+        assert machine_id == "remote-node"
+        assert thread_id == "thread-1"
+        return {"goal": {"objective": "Remote goal", "status": "active"}}
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "thread_goal_get", _thread_goal_get)
+
     ok, payload, message = await mgr.get_topic_goal(
         user_id=100,
         thread_id=1,
         chat_id=-100123,
     )
 
-    assert ok is False
-    assert payload is None
-    assert "Remote" in message or "remote" in message
+    assert ok is True
+    assert payload == {"goal": {"objective": "Remote goal", "status": "active"}}
+    assert message == ""
+
+
+@pytest.mark.asyncio
+async def test_set_topic_goal_creates_remote_thread_when_missing(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local Node"))
+    mgr.bind_thread(100, 1, "@1", window_name="proj")
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="placeholder",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote Node",
+    )
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    binding.codex_thread_id = ""
+    mgr.set_window_codex_thread_id("@1", "")
+
+    async def _resume_latest(
+        machine_id: str,
+        *,
+        window_id: str,
+        cwd: str,
+        window_name: str = "",
+        approval_mode: str = "",
+    ):
+        assert machine_id == "remote-node"
+        assert window_id == "@1"
+        assert cwd == "/tmp/proj"
+        _ = window_name, approval_mode
+        return {"thread_id": ""}
+
+    async def _ensure_thread(
+        machine_id: str,
+        *,
+        window_id: str,
+        cwd: str,
+        window_name: str = "",
+        approval_mode: str = "",
+        model_slug: str = "",
+        reasoning_effort: str = "",
+        service_tier: str = "",
+    ):
+        assert machine_id == "remote-node"
+        assert window_id == "@1"
+        assert cwd == "/tmp/proj"
+        _ = window_name, approval_mode, model_slug, reasoning_effort, service_tier
+        return {"thread_id": "remote-thread-1"}
+
+    async def _thread_goal_set(machine_id: str, *, thread_id: str, goal: str):
+        assert machine_id == "remote-node"
+        assert thread_id == "remote-thread-1"
+        assert goal == "Ship remote goal"
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "ensure_thread", _ensure_thread)
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "thread_goal_set", _thread_goal_set)
+
+    ok, payload, message = await mgr.set_topic_goal(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        goal_text="Ship remote goal",
+    )
+
+    assert ok is True
+    assert payload == {"goal": {"objective": "Ship remote goal", "status": "active"}}
+    assert message == ""
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    assert binding.codex_thread_id == "remote-thread-1"
 
 
 class TestRuntimeCapabilityHint:

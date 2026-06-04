@@ -45,3 +45,45 @@ async def test_process_content_task_sends_document_attachments(monkeypatch):
     assert document_sends == [
         (-100123, [("report.pdf", b"%PDF-1.7")], {"message_thread_id": 77})
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_content_task_sends_video_attachments(monkeypatch):
+    text_sends: list[tuple[int, str, dict[str, object]]] = []
+    video_sends: list[tuple[int, str, bytes, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _user_id, _thread_id: -100123,
+    )
+
+    async def _send_with_fallback(_bot, chat_id, text, **kwargs):
+        text_sends.append((chat_id, text, kwargs))
+        return SimpleNamespace(message_id=321)
+
+    async def _send_video(_bot, chat_id, media_type, raw_bytes, **kwargs):
+        video_sends.append((chat_id, media_type, raw_bytes, kwargs))
+
+    async def _check_status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send_with_fallback)
+    monkeypatch.setattr(mq, "send_video", _send_video)
+    monkeypatch.setattr(mq, "_check_and_send_status", _check_status)
+
+    task = mq.MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["Video attached"],
+        content_type="text",
+        thread_id=77,
+        video_data=[("video/mp4", b"MP4DATA")],
+    )
+
+    await mq._process_content_task(object(), 1, task)
+
+    assert text_sends == [(-100123, "Video attached", {"message_thread_id": 77})]
+    assert video_sends == [
+        (-100123, "video/mp4", b"MP4DATA", {"message_thread_id": 77})
+    ]

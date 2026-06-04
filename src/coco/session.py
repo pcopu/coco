@@ -2536,9 +2536,7 @@ class SessionManager:
 
         local_machine_id, _local_machine_name = self._local_machine_identity()
         machine_id = binding.machine_id.strip()
-        if machine_id and machine_id != local_machine_id:
-            machine_name = binding.machine_display_name.strip() or machine_id
-            return "", f"Goals are not supported for topics bound to remote machine `{machine_name}` yet."
+        is_remote = bool(machine_id and machine_id != local_machine_id)
 
         window_id = binding.window_id.strip()
         codex_thread_id = binding.codex_thread_id.strip()
@@ -2557,6 +2555,73 @@ class SessionManager:
         cwd = binding.cwd.strip() or state.cwd.strip()
         if not cwd:
             return "", "No workspace is bound to this topic yet. Run `/start` or `/folder` first."
+
+        if is_remote:
+            from .agent_rpc import agent_rpc_client
+
+            machine_name = binding.machine_display_name.strip() or machine_id
+            try:
+                resumed = await agent_rpc_client.resume_latest(
+                    machine_id,
+                    window_id=window_id,
+                    cwd=cwd,
+                    window_name=binding.display_name.strip() or state.window_name.strip(),
+                    approval_mode=state.approval_mode.strip(),
+                )
+            except Exception as e:
+                logger.debug(
+                    "Remote goal thread resume skipped for %s (%s on %s): %s",
+                    window_id,
+                    self.get_display_name(window_id),
+                    machine_name,
+                    e,
+                )
+                resumed = {}
+
+            resumed_thread_id = str(resumed.get("thread_id", "")).strip() if isinstance(resumed, dict) else ""
+            if resumed_thread_id:
+                self.bind_topic_to_codex_thread(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    chat_id=chat_id,
+                    codex_thread_id=resumed_thread_id,
+                    cwd=cwd,
+                    display_name=binding.display_name.strip() or self.get_display_name(window_id),
+                    window_id=window_id,
+                    machine_id=machine_id,
+                    machine_display_name=machine_name,
+                )
+                return resumed_thread_id, ""
+
+            try:
+                ensured = await agent_rpc_client.ensure_thread(
+                    machine_id,
+                    window_id=window_id,
+                    cwd=cwd,
+                    window_name=binding.display_name.strip() or state.window_name.strip(),
+                    approval_mode=state.approval_mode.strip(),
+                    model_slug=binding.model_slug.strip(),
+                    reasoning_effort=binding.reasoning_effort.strip(),
+                    service_tier=binding.service_tier.strip(),
+                )
+            except Exception as e:
+                return "", self._format_goal_transport_error(e)
+
+            ensured_thread_id = str(ensured.get("thread_id", "")).strip() if isinstance(ensured, dict) else ""
+            if not ensured_thread_id:
+                return "", f"Failed to create a Codex thread on remote machine `{machine_name}`."
+            self.bind_topic_to_codex_thread(
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                codex_thread_id=ensured_thread_id,
+                cwd=cwd,
+                display_name=binding.display_name.strip() or self.get_display_name(window_id),
+                window_id=window_id,
+                machine_id=machine_id,
+                machine_display_name=machine_name,
+            )
+            return ensured_thread_id, ""
 
         lock = self._get_window_send_lock(window_id)
         async with lock:
@@ -2604,9 +2669,20 @@ class SessionManager:
         if not codex_thread_id:
             return False, None, error
         try:
-            payload = await codex_app_server_client.thread_goal_get(
-                thread_id=codex_thread_id
-            )
+            binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+            machine_id = binding.machine_id.strip() if binding else ""
+            local_machine_id, _local_machine_name = self._local_machine_identity()
+            if machine_id and machine_id != local_machine_id:
+                from .agent_rpc import agent_rpc_client
+
+                payload = await agent_rpc_client.thread_goal_get(
+                    machine_id,
+                    thread_id=codex_thread_id,
+                )
+            else:
+                payload = await codex_app_server_client.thread_goal_get(
+                    thread_id=codex_thread_id
+                )
         except Exception as e:
             return False, None, self._format_goal_transport_error(e)
         return True, payload, ""
@@ -2632,10 +2708,22 @@ class SessionManager:
         if not codex_thread_id:
             return False, None, error
         try:
-            payload = await codex_app_server_client.thread_goal_set(
-                thread_id=codex_thread_id,
-                goal=normalized_goal_text,
-            )
+            binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+            machine_id = binding.machine_id.strip() if binding else ""
+            local_machine_id, _local_machine_name = self._local_machine_identity()
+            if machine_id and machine_id != local_machine_id:
+                from .agent_rpc import agent_rpc_client
+
+                payload = await agent_rpc_client.thread_goal_set(
+                    machine_id,
+                    thread_id=codex_thread_id,
+                    goal=normalized_goal_text,
+                )
+            else:
+                payload = await codex_app_server_client.thread_goal_set(
+                    thread_id=codex_thread_id,
+                    goal=normalized_goal_text,
+                )
         except Exception as e:
             return False, None, self._format_goal_transport_error(e)
         return True, payload, ""
@@ -2657,9 +2745,20 @@ class SessionManager:
         if not codex_thread_id:
             return False, None, error
         try:
-            payload = await codex_app_server_client.thread_goal_clear(
-                thread_id=codex_thread_id
-            )
+            binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+            machine_id = binding.machine_id.strip() if binding else ""
+            local_machine_id, _local_machine_name = self._local_machine_identity()
+            if machine_id and machine_id != local_machine_id:
+                from .agent_rpc import agent_rpc_client
+
+                payload = await agent_rpc_client.thread_goal_clear(
+                    machine_id,
+                    thread_id=codex_thread_id,
+                )
+            else:
+                payload = await codex_app_server_client.thread_goal_clear(
+                    thread_id=codex_thread_id
+                )
         except Exception as e:
             return False, None, self._format_goal_transport_error(e)
         return True, payload, ""
