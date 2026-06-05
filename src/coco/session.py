@@ -61,6 +61,10 @@ APP_SERVER_NO_ACTIVE_TURN_RE = re.compile(
     r"\bno active turn to steer\b",
     re.IGNORECASE,
 )
+APP_SERVER_NO_GOAL_EXISTS_RE = re.compile(
+    r"\bno goal exists\b",
+    re.IGNORECASE,
+)
 STATE_SCHEMA_VERSION = 6
 TOPIC_BINDING_TRANSPORT_WINDOW = "window"
 TOPIC_BINDING_TRANSPORT_CODEX_THREAD = "codex_thread"
@@ -2525,6 +2529,7 @@ class SessionManager:
         thread_id: int | None,
         chat_id: int | None = None,
         create: bool = False,
+        force_refresh: bool = False,
     ) -> tuple[str, str]:
         """Resolve the native Codex thread id for one topic goal operation."""
         if thread_id is None:
@@ -2542,7 +2547,7 @@ class SessionManager:
         codex_thread_id = binding.codex_thread_id.strip()
         if not codex_thread_id and window_id:
             codex_thread_id = self.get_window_codex_thread_id(window_id)
-        if codex_thread_id:
+        if codex_thread_id and not force_refresh:
             return codex_thread_id, ""
 
         if not create:
@@ -2626,8 +2631,10 @@ class SessionManager:
         lock = self._get_window_send_lock(window_id)
         async with lock:
             existing_thread_id = self.get_window_codex_thread_id(window_id)
-            if existing_thread_id:
+            if existing_thread_id and not force_refresh:
                 return existing_thread_id, ""
+            if force_refresh and existing_thread_id:
+                self.set_window_codex_thread_id(window_id, "")
 
             resumed_thread_id = ""
             try:
@@ -2707,24 +2714,47 @@ class SessionManager:
         )
         if not codex_thread_id:
             return False, None, error
-        try:
-            binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
-            machine_id = binding.machine_id.strip() if binding else ""
-            local_machine_id, _local_machine_name = self._local_machine_identity()
+        binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        machine_id = binding.machine_id.strip() if binding else ""
+        local_machine_id, _local_machine_name = self._local_machine_identity()
+
+        async def _send_goal(target_thread_id: str) -> dict[str, Any]:
             if machine_id and machine_id != local_machine_id:
                 from .agent_rpc import agent_rpc_client
 
-                payload = await agent_rpc_client.thread_goal_set(
+                return await agent_rpc_client.thread_goal_set(
                     machine_id,
-                    thread_id=codex_thread_id,
+                    thread_id=target_thread_id,
                     goal=normalized_goal_text,
                 )
-            else:
-                payload = await codex_app_server_client.thread_goal_set(
-                    thread_id=codex_thread_id,
-                    goal=normalized_goal_text,
-                )
+            return await codex_app_server_client.thread_goal_set(
+                thread_id=target_thread_id,
+                goal=normalized_goal_text,
+            )
+
+        try:
+            payload = await _send_goal(codex_thread_id)
         except Exception as e:
+            if self._is_missing_goal_error(e):
+                logger.warning(
+                    "Goal update hit missing goal state for thread %s; refreshing topic thread and retrying once",
+                    codex_thread_id,
+                )
+                refreshed_thread_id, refresh_error = await self.resolve_goal_thread_for_topic(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    chat_id=chat_id,
+                    create=True,
+                    force_refresh=True,
+                )
+                if refreshed_thread_id and refreshed_thread_id != codex_thread_id:
+                    try:
+                        payload = await _send_goal(refreshed_thread_id)
+                    except Exception as retry_err:
+                        return False, None, self._format_goal_transport_error(retry_err)
+                    return True, payload, ""
+                if refresh_error:
+                    return False, None, refresh_error
             return False, None, self._format_goal_transport_error(e)
         return True, payload, ""
 
@@ -3843,6 +3873,11 @@ class SessionManager:
     def _is_no_active_turn_error(err: Exception) -> bool:
         """Return whether app-server rejected a stale turn/steer request."""
         return bool(APP_SERVER_NO_ACTIVE_TURN_RE.search(str(err)))
+
+    @staticmethod
+    def _is_missing_goal_error(err: Exception) -> bool:
+        """Return whether app-server rejected a goal update because no goal exists."""
+        return bool(APP_SERVER_NO_GOAL_EXISTS_RE.search(str(err)))
 
     async def _retry_send_after_missing_codex_thread(
         self,

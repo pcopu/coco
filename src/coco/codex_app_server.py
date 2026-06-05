@@ -696,7 +696,7 @@ class CodexAppServerClient:
     ) -> dict[str, Any]:
         params = {
             "threadId": thread_id,
-            "goal": goal,
+            "objective": goal,
         }
         result = await self.request("thread/goal/set", params, timeout=60.0)
         return result if isinstance(result, dict) else {}

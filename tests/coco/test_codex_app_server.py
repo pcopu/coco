@@ -230,7 +230,7 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
     )
     assert calls[6] == (
         "thread/goal/set",
-        {"threadId": "th_main", "goal": "Ship the feature"},
+        {"threadId": "th_main", "objective": "Ship the feature"},
         60.0,
     )
     assert calls[7] == (

@@ -661,6 +661,65 @@ async def test_set_topic_goal_creates_thread_for_window_when_missing(
 
 
 @pytest.mark.asyncio
+async def test_set_topic_goal_retries_after_missing_goal_error_on_stale_thread(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_thread(100, 1, "@1", window_name="proj")
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-stale",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.get_window_state("@1").cwd = "/tmp/proj"
+    mgr.set_window_codex_thread_id("@1", "thread-stale")
+    set_calls: list[tuple[str, str]] = []
+    resume_calls: list[tuple[str, str]] = []
+
+    async def _resume_latest_codex_session_for_window(*, window_id: str, cwd: str):
+        resume_calls.append((window_id, cwd))
+        mgr.set_window_codex_thread_id(window_id, "thread-fresh")
+        return "thread-fresh"
+
+    async def _thread_goal_set(*, thread_id: str, goal: str):
+        set_calls.append((thread_id, goal))
+        if thread_id == "thread-stale":
+            raise session_mod.CodexAppServerError(
+                f"cannot update goal for thread {thread_id}: no goal exists"
+            )
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    monkeypatch.setattr(
+        mgr,
+        "resume_latest_codex_session_for_window",
+        _resume_latest_codex_session_for_window,
+    )
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_goal_set", _thread_goal_set)
+
+    ok, payload, message = await mgr.set_topic_goal(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        goal_text="Ship the goal feature",
+    )
+
+    assert ok is True
+    assert payload == {"goal": {"objective": "Ship the goal feature", "status": "active"}}
+    assert message == ""
+    assert set_calls == [
+        ("thread-stale", "Ship the goal feature"),
+        ("thread-fresh", "Ship the goal feature"),
+    ]
+    assert resume_calls == [("@1", "/tmp/proj")]
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-fresh"
+
+
+@pytest.mark.asyncio
 async def test_get_topic_goal_reads_remote_machine_binding(
     mgr: SessionManager, monkeypatch
 ) -> None:
