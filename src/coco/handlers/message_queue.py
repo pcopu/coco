@@ -969,6 +969,10 @@ async def _convert_status_to_content(
             raise
         except Exception as e:
             logger.debug(f"Failed to convert status to content: {e}")
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
             # Message might be deleted or too old, caller will send new message
             return None
 

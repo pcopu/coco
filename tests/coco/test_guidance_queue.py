@@ -317,6 +317,44 @@ async def test_progress_finalize_clears_tracking_when_all_edits_fail(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_convert_status_to_content_deletes_orphan_when_all_edits_fail(monkeypatch):
+    user_id = 101
+    thread_id = 102
+    skey = (user_id, thread_id)
+    mq._status_msg_info[skey] = (7006, "@12", "waiting")
+    deleted: list[tuple[int, int]] = []
+    edit_attempts: list[int] = []
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs):
+            edit_attempts.append(1)
+            raise Exception("message can't be edited")
+
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            deleted.append((chat_id, message_id))
+            return True
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100905,
+    )
+
+    converted = await mq._convert_status_to_content(
+        _Bot(),
+        user_id,
+        thread_id,
+        "@12",
+        "real content",
+    )
+
+    assert converted is None
+    assert len(edit_attempts) == 2
+    assert deleted == [(-100905, 7006)]
+    assert skey not in mq._status_msg_info
+
+
+@pytest.mark.asyncio
 async def test_enqueue_progress_update_coalesces_trailing_pending_updates():
     user_id = 201
     thread_id = 202
