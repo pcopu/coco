@@ -209,7 +209,9 @@ async def test_status_poll_loop_app_server_only_runs_watchdog_without_legacy(mon
     )
     monkeypatch.setattr(status_polling, "prune_run_watch_topics", lambda _topics: None)
     monkeypatch.setattr(status_polling, "prune_looper_topics", lambda _topics: None)
-    monkeypatch.setattr(status_polling, "get_message_queue", lambda _uid: None)
+    async def _no_pending(_uid: int) -> set[int]:
+        return set()
+    monkeypatch.setattr(status_polling, "get_pending_delivery_topics", _no_pending)
     monkeypatch.setattr(
         status_polling.time,
         "monotonic",
@@ -280,7 +282,9 @@ async def test_status_poll_loop_topic_deleted_in_app_server_only_skips_legacy_ki
     )
     monkeypatch.setattr(status_polling, "prune_run_watch_topics", lambda _topics: None)
     monkeypatch.setattr(status_polling, "prune_looper_topics", lambda _topics: None)
-    monkeypatch.setattr(status_polling, "get_message_queue", lambda _uid: None)
+    async def _no_pending(_uid: int) -> set[int]:
+        return set()
+    monkeypatch.setattr(status_polling, "get_pending_delivery_topics", _no_pending)
     monkeypatch.setattr(status_polling, "TOPIC_CHECK_INTERVAL", 0.0)
     monkeypatch.setattr(status_polling.time, "monotonic", lambda: 1.0)
     monkeypatch.setattr(status_polling.session_manager, "resolve_chat_id", lambda _u, _t: -100)
@@ -334,3 +338,71 @@ async def test_status_poll_loop_topic_deleted_in_app_server_only_skips_legacy_ki
 
     assert unbound == [(1, 10)]
     assert cleared == [(1, 10)]
+
+
+@pytest.mark.asyncio
+async def test_status_poll_loop_skips_only_busy_topic_not_all_user_topics(monkeypatch):
+    events: list[str] = []
+
+    monkeypatch.setattr(status_polling.config, "session_provider", "codex")
+    monkeypatch.setattr(status_polling.config, "runtime_mode", "app_server_only")
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "iter_topic_window_bindings",
+        lambda: [(1, 10, "@busy"), (1, 11, "@idle")],
+    )
+    monkeypatch.setattr(status_polling, "prune_run_watch_topics", lambda _topics: None)
+    monkeypatch.setattr(status_polling, "prune_looper_topics", lambda _topics: None)
+    monkeypatch.setattr(status_polling, "TOPIC_CHECK_INTERVAL", 60.0)
+    monkeypatch.setattr(status_polling.time, "monotonic", lambda: 0.0)
+
+    pending_calls: list[int] = []
+    async def _get_pending_delivery_topics(uid: int) -> set[int]:
+        pending_calls.append(uid)
+        return {10}
+
+    monkeypatch.setattr(
+        status_polling,
+        "get_pending_delivery_topics",
+        _get_pending_delivery_topics,
+    )
+
+    async def _emit_watchdog(_bot, *, user_id: int, thread_id: int | None, window_id: str):
+        _ = user_id, thread_id
+        events.append(f"watchdog:{window_id}")
+
+    async def _emit_looper(_bot, *, user_id: int, thread_id: int | None, window_id: str):
+        _ = user_id, thread_id
+        events.append(f"looper:{window_id}")
+
+    async def _emit_personality(_bot, *, user_id: int, thread_id: int | None, window_id: str):
+        _ = user_id, thread_id
+        events.append(f"personality:{window_id}")
+
+    async def _emit_autoresearch(_bot, *, user_id: int, thread_id: int | None, window_id: str):
+        _ = user_id, thread_id
+        events.append(f"autoresearch:{window_id}")
+
+    monkeypatch.setattr(status_polling, "_emit_due_run_watchdog_checks", _emit_watchdog)
+    monkeypatch.setattr(status_polling, "_emit_due_looper_prompt", _emit_looper)
+    monkeypatch.setattr(status_polling, "_emit_due_personality_delivery", _emit_personality)
+    monkeypatch.setattr(status_polling, "_emit_due_autoresearch_delivery", _emit_autoresearch)
+
+    async def _cancel_sleep(_seconds: float):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(status_polling.asyncio, "sleep", _cancel_sleep)
+
+    class _Bot:
+        async def unpin_all_forum_topic_messages(self, **_kwargs):
+            raise AssertionError("topic probe should not run")
+
+    with pytest.raises(asyncio.CancelledError):
+        await status_polling.status_poll_loop(_Bot())
+
+    assert all("@busy" not in event for event in events)
+    assert "watchdog:@idle" in events
+    assert "looper:@idle" in events
+    assert "personality:@idle" in events
+    assert "autoresearch:@idle" in events
+    assert pending_calls == [1]

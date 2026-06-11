@@ -1,9 +1,11 @@
 """Unit tests for SessionMonitor JSONL reading and offset handling."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+import coco.session as session_module
 from coco.monitor_state import TrackedSession
 from coco.session_monitor import SessionMonitor
 
@@ -93,3 +95,84 @@ class TestReadNewLinesOffsetRecovery:
         # Should reset offset to 0 and read the line
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
+
+
+@pytest.mark.asyncio
+async def test_monitor_loop_retries_startup_autodiscover_failure(monkeypatch, tmp_path):
+    monitor = SessionMonitor(
+        projects_path=tmp_path / "projects",
+        state_file=tmp_path / "monitor_state.json",
+        poll_interval=0.01,
+    )
+    monitor._running = True
+
+    events: list[str] = []
+    autodiscover_calls = 0
+
+    async def _fake_autodiscover_sessions_for_bound_windows():
+        nonlocal autodiscover_calls
+        autodiscover_calls += 1
+        events.append(f"autodiscover:{autodiscover_calls}")
+        if autodiscover_calls == 1:
+            raise RuntimeError("startup autodiscover failed")
+
+    async def _fake_cleanup_all_stale_sessions():
+        events.append("cleanup")
+
+    async def _fake_load_current_session_map():
+        events.append("load_map")
+        return {}
+
+    async def _fake_detect_and_cleanup_changes():
+        events.append("detect")
+        return {}
+
+    async def _fake_check_for_updates(active_session_ids):
+        assert active_session_ids == set()
+        events.append("check_updates")
+        return []
+
+    sleep_calls = 0
+    monotonic_values = iter([100.0, 100.5, 101.0])
+    last_monotonic = 101.0
+
+    async def _fake_sleep(_seconds: float):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 3:
+            monitor._running = False
+        return None
+
+    monkeypatch.setattr(
+        session_module,
+        "session_manager",
+        SimpleNamespace(
+            autodiscover_sessions_for_bound_windows=(
+                _fake_autodiscover_sessions_for_bound_windows
+            )
+        ),
+    )
+    monkeypatch.setattr(monitor, "_cleanup_all_stale_sessions", _fake_cleanup_all_stale_sessions)
+    monkeypatch.setattr(monitor, "_load_current_session_map", _fake_load_current_session_map)
+    monkeypatch.setattr(monitor, "_detect_and_cleanup_changes", _fake_detect_and_cleanup_changes)
+    monkeypatch.setattr(monitor, "check_for_updates", _fake_check_for_updates)
+    monkeypatch.setattr("coco.session_monitor.asyncio.sleep", _fake_sleep)
+    monkeypatch.setattr(
+        "coco.session_monitor.time.monotonic",
+        lambda: next(monotonic_values, last_monotonic),
+    )
+
+    await monitor._monitor_loop()
+
+    assert events == [
+        "autodiscover:1",
+        "detect",
+        "check_updates",
+        "detect",
+        "check_updates",
+        "autodiscover:2",
+        "cleanup",
+        "load_map",
+        "detect",
+        "check_updates",
+    ]

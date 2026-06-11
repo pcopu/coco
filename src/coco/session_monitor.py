@@ -478,21 +478,34 @@ class SessionMonitor:
         # Deferred import to avoid circular dependency (cached once)
         from .session import session_manager
 
-        # Prime autodiscovery for providers without hooks (e.g. Codex).
-        await session_manager.autodiscover_sessions_for_bound_windows()
-        # Clean up all stale sessions on startup
-        await self._cleanup_all_stale_sessions()
-        # Initialize last known session_map
-        self._last_session_map = await self._load_current_session_map()
         autodiscover_interval = max(60.0, self.poll_interval)
-        next_autodiscover_at = time.monotonic() + autodiscover_interval
+        startup_retry_interval = min(5.0, max(1.0, self.poll_interval))
+        next_autodiscover_at = 0.0
+        startup_complete = False
 
         while self._running:
             try:
+                loop_now = time.monotonic()
+                if not startup_complete and loop_now >= next_autodiscover_at:
+                    try:
+                        # Prime autodiscovery and stale-session cleanup before
+                        # the steady-state poller starts. If startup work
+                        # fails, keep the monitor alive and continue polling
+                        # with the best currently-known session map while
+                        # retrying startup refresh on later cycles.
+                        await session_manager.autodiscover_sessions_for_bound_windows()
+                        await self._cleanup_all_stale_sessions()
+                        self._last_session_map = await self._load_current_session_map()
+                        next_autodiscover_at = loop_now + autodiscover_interval
+                        startup_complete = True
+                    except Exception as e:
+                        next_autodiscover_at = loop_now + startup_retry_interval
+                        logger.error("Session monitor startup refresh failed: %s", e)
+
                 # Keep window->session map fresh without rescanning all Codex
                 # transcripts on every short poll cycle.
-                if time.monotonic() >= next_autodiscover_at:
-                    next_autodiscover_at = time.monotonic() + autodiscover_interval
+                if startup_complete and loop_now >= next_autodiscover_at:
+                    next_autodiscover_at = loop_now + autodiscover_interval
                     await session_manager.autodiscover_sessions_for_bound_windows()
 
                 # Detect session_map changes and cleanup replaced/removed sessions

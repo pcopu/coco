@@ -11,6 +11,7 @@ import coco.codex_app_server as cas
 
 class _FakeProc:
     def __init__(self) -> None:
+        self.pid = 4242
         self.returncode = None
         self.stdin = SimpleNamespace()
         self.stdout = SimpleNamespace()
@@ -236,6 +237,186 @@ async def test_successful_ensure_started_clears_persisted_failure_state(monkeypa
     await client.ensure_started()
 
     assert not failure_file.exists()
+
+
+def test_reap_stale_local_app_server_processes_only_kills_owned_pids(monkeypatch, tmp_path):
+    client = cas.CodexAppServerClient()
+    owned_pids_dir = tmp_path / "owned-pids"
+    owned_pids_dir.mkdir()
+    (owned_pids_dir / "101.pid").write_text("", encoding="utf-8")
+    (owned_pids_dir / "303.pid").write_text("", encoding="utf-8")
+    killed: list[int] = []
+
+    proc_result = SimpleNamespace(
+        stdout=(
+            "101 1 codex app-server --listen stdio://\n"
+            "202 999 codex app-server --listen stdio://\n"
+            "303 1 python other.py\n"
+        )
+    )
+
+    monkeypatch.setattr(cas, "_APP_SERVER_OWNED_PIDS_DIR", owned_pids_dir)
+    monkeypatch.setattr(
+        cas.subprocess,
+        "run",
+        lambda *_args, **_kwargs: proc_result,
+    )
+    monkeypatch.setattr(cas.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    client._reap_stale_local_app_server_processes()
+
+    assert killed == [101]
+    assert sorted(path.name for path in owned_pids_dir.iterdir()) == ["101.pid"]
+
+
+def test_reap_stale_local_app_server_processes_skips_pid_reuse_marker(monkeypatch, tmp_path):
+    client = cas.CodexAppServerClient()
+    owned_pids_dir = tmp_path / "owned-pids"
+    owned_pids_dir.mkdir()
+    (owned_pids_dir / "101.pid").write_text("old-start", encoding="utf-8")
+    killed: list[int] = []
+
+    proc_result = SimpleNamespace(stdout="101 1 codex app-server --listen stdio://\n")
+
+    monkeypatch.setattr(cas, "_APP_SERVER_OWNED_PIDS_DIR", owned_pids_dir)
+    monkeypatch.setattr(
+        cas.subprocess,
+        "run",
+        lambda *_args, **_kwargs: proc_result,
+    )
+    monkeypatch.setattr(
+        client,
+        "_read_process_identity",
+        lambda pid: "new-start" if pid == 101 else "",
+    )
+    monkeypatch.setattr(cas.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    client._reap_stale_local_app_server_processes()
+
+    assert killed == []
+    assert list(owned_pids_dir.iterdir()) == []
+
+
+def test_reap_stale_local_app_server_processes_falls_back_to_orphaned_unmarked_pids(
+    monkeypatch, tmp_path
+):
+    client = cas.CodexAppServerClient()
+    owned_pids_dir = tmp_path / "owned-pids"
+    killed: list[int] = []
+
+    proc_result = SimpleNamespace(
+        stdout=(
+            "101 1 codex app-server --listen stdio://\n"
+            "202 999 codex app-server --listen stdio://\n"
+        )
+    )
+
+    monkeypatch.setattr(cas, "_APP_SERVER_OWNED_PIDS_DIR", owned_pids_dir)
+    monkeypatch.setattr(
+        cas.subprocess,
+        "run",
+        lambda *_args, **_kwargs: proc_result,
+    )
+    monkeypatch.setattr(cas.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    client._reap_stale_local_app_server_processes()
+
+    assert killed == [101]
+
+
+def test_reap_stale_local_app_server_processes_skips_live_owned_pid_and_unowned_orphan(
+    monkeypatch, tmp_path
+):
+    client = cas.CodexAppServerClient()
+    owned_pids_dir = tmp_path / "owned-pids"
+    owned_pids_dir.mkdir()
+    (owned_pids_dir / "303.pid").write_text(
+        json.dumps({"identity": "", "owner_pid": 777}),
+        encoding="utf-8",
+    )
+    killed: list[int] = []
+
+    proc_result = SimpleNamespace(
+        stdout=(
+            "101 1 codex app-server --listen stdio://\n"
+            "303 777 codex app-server --listen stdio://\n"
+        )
+    )
+
+    monkeypatch.setattr(cas, "_APP_SERVER_OWNED_PIDS_DIR", owned_pids_dir)
+    monkeypatch.setattr(
+        cas.subprocess,
+        "run",
+        lambda *_args, **_kwargs: proc_result,
+    )
+    monkeypatch.setattr(cas.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    client._reap_stale_local_app_server_processes()
+
+    assert killed == []
+    assert sorted(path.name for path in owned_pids_dir.iterdir()) == ["303.pid"]
+
+
+def test_reap_stale_local_app_server_processes_reaps_current_runtime_owned_child(
+    monkeypatch, tmp_path
+):
+    client = cas.CodexAppServerClient()
+    owned_pids_dir = tmp_path / "owned-pids"
+    owned_pids_dir.mkdir()
+    (owned_pids_dir / "101.pid").write_text(
+        json.dumps({"identity": "", "owner_pid": 555}),
+        encoding="utf-8",
+    )
+    killed: list[int] = []
+
+    proc_result = SimpleNamespace(stdout="101 555 codex app-server --listen stdio://\n")
+
+    monkeypatch.setattr(cas, "_APP_SERVER_OWNED_PIDS_DIR", owned_pids_dir)
+    monkeypatch.setattr(
+        cas.subprocess,
+        "run",
+        lambda *_args, **_kwargs: proc_result,
+    )
+    monkeypatch.setattr(cas.os, "kill", lambda pid, _sig: killed.append(pid))
+    monkeypatch.setattr(cas.os, "getpid", lambda: 555)
+
+    client._reap_stale_local_app_server_processes()
+
+    assert killed == [101]
+
+
+def test_reap_stale_local_app_server_processes_reaps_orphan_with_current_runtime_marker(
+    monkeypatch, tmp_path
+):
+    client = cas.CodexAppServerClient()
+    client._proc = SimpleNamespace(pid=303)
+    owned_pids_dir = tmp_path / "owned-pids"
+    owned_pids_dir.mkdir()
+    (owned_pids_dir / "303.pid").write_text(
+        json.dumps({"identity": "", "owner_pid": 555}),
+        encoding="utf-8",
+    )
+    killed: list[int] = []
+
+    proc_result = SimpleNamespace(
+        stdout=(
+            "101 1 codex app-server --listen stdio://\n"
+            "303 555 codex app-server --listen stdio://\n"
+        )
+    )
+
+    monkeypatch.setattr(cas, "_APP_SERVER_OWNED_PIDS_DIR", owned_pids_dir)
+    monkeypatch.setattr(
+        cas.subprocess,
+        "run",
+        lambda *_args, **_kwargs: proc_result,
+    )
+    monkeypatch.setattr(cas.os, "kill", lambda pid, _sig: killed.append(pid))
+    monkeypatch.setattr(cas.os, "getpid", lambda: 555)
+
+    client._reap_stale_local_app_server_processes()
+
+    assert killed == [101]
 
 
 @pytest.mark.asyncio

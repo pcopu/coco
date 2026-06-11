@@ -1,9 +1,11 @@
 """Tests for steer/queued message helper state."""
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
+from telegram.error import RetryAfter
 
 import coco.bot as bot
 import coco.handlers.message_queue as mq
@@ -374,6 +376,93 @@ async def test_enqueue_progress_update_keeps_non_progress_tail():
     finally:
         mq._message_queues.pop(user_id, None)
         mq._queue_locks.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_message_queue_worker_retries_content_after_retry_after(monkeypatch):
+    user_id = 301
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    attempts: list[str] = []
+    current_time = {"value": 100.0}
+
+    async def _fake_process_content_task(_bot, _user_id: int, _task: mq.MessageTask):
+        attempts.append("content")
+        if len(attempts) == 1:
+            raise RetryAfter(1)
+
+    async def _fake_sleep(seconds: float):
+        current_time["value"] += seconds
+
+    monkeypatch.setattr(mq, "_process_content_task", _fake_process_content_task)
+    monkeypatch.setattr(mq.time, "monotonic", lambda: current_time["value"])
+    monkeypatch.setattr(mq.asyncio, "sleep", _fake_sleep)
+
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))  # type: ignore[arg-type]
+    await queue.put(
+        mq.MessageTask(
+            task_type="content",
+            window_id="@301",
+            thread_id=301,
+            parts=["hello"],
+        )
+    )
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=1)
+        assert attempts == ["content", "content"]
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._flood_until.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_message_queue_worker_retries_progress_finalize_after_long_retry_after(monkeypatch):
+    user_id = 302
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    attempts: list[str] = []
+    current_time = {"value": 200.0}
+
+    async def _fake_finalize(_bot, _user_id: int, _task: mq.MessageTask):
+        attempts.append("finalize")
+        if len(attempts) == 1:
+            raise RetryAfter(mq.FLOOD_CONTROL_MAX_WAIT + 5)
+
+    async def _fake_sleep(seconds: float):
+        current_time["value"] += seconds
+
+    monkeypatch.setattr(mq, "_process_progress_finalize_task", _fake_finalize)
+    monkeypatch.setattr(mq.time, "monotonic", lambda: current_time["value"])
+    monkeypatch.setattr(mq.asyncio, "sleep", _fake_sleep)
+
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))  # type: ignore[arg-type]
+    await queue.put(
+        mq.MessageTask(
+            task_type="progress_finalize",
+            window_id="@302",
+            thread_id=302,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=1)
+        assert attempts == ["finalize", "finalize"]
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._flood_until.pop(user_id, None)
 
 
 @pytest.mark.asyncio

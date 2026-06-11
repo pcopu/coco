@@ -80,6 +80,7 @@ class MessageTask:
 _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
 _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
+_active_delivery_topics: dict[int, set[int]] = {}
 
 # Map (tool_use_id, user_id, thread_id_or_0) -> telegram message_id
 # for editing tool_use messages with results
@@ -122,6 +123,27 @@ QUEUE_DOCK_MAX_VISIBLE_ITEMS = 6
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
     return _message_queues.get(user_id)
+
+
+async def get_pending_delivery_topics(user_id: int) -> set[int]:
+    """Return topic ids with in-flight or queued delivery work for one user."""
+    pending_topics = set(_active_delivery_topics.get(user_id, set()))
+
+    queue = _message_queues.get(user_id)
+    lock = _queue_locks.get(user_id)
+    if queue is None or lock is None:
+        return pending_topics
+
+    async with lock:
+        pending_topics.update((task.thread_id or 0) for task in getattr(queue, "_queue", ()))
+    return pending_topics
+
+
+async def topic_has_pending_delivery(user_id: int, thread_id: int | None) -> bool:
+    """Return whether a topic has in-flight or queued delivery work."""
+    tid = thread_id or 0
+    pending_topics = await get_pending_delivery_topics(user_id)
+    return tid in pending_topics
 
 
 def _topic_key(user_id: int, thread_id: int | None) -> tuple[int, int]:
@@ -356,6 +378,25 @@ def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
     return items
 
 
+def _task_survives_flood_pause(task_type: str) -> bool:
+    """Return whether a queued task should wait out flood control."""
+    return task_type in {"content", "status_clear", "progress_clear", "progress_finalize"}
+
+
+async def _requeue_task_front(
+    queue: asyncio.Queue[MessageTask],
+    lock: asyncio.Lock,
+    task: MessageTask,
+) -> None:
+    """Requeue one in-flight task at the front while preserving queue counters."""
+    async with lock:
+        retained = _inspect_queue(queue)
+        queue.put_nowait(task)
+        for item in retained:
+            queue.put_nowait(item)
+            queue.task_done()
+
+
 def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
     if base.window_id != candidate.window_id:
@@ -455,19 +496,23 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
     while True:
         try:
             task = await queue.get()
+            topic_key = task.thread_id or 0
+            _active_delivery_topics.setdefault(user_id, set()).add(topic_key)
             try:
                 # Flood control: drop status, wait for content
                 flood_end = _flood_until.get(user_id, 0)
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
-                        if task.task_type != "content":
+                        if not _task_survives_flood_pause(task.task_type):
                             # Status is ephemeral — safe to drop
                             continue
-                        # Content is actual assistant output — wait then send
+                        # Delivery/finalization tasks should wait out the
+                        # flood-control window instead of being dropped.
                         logger.debug(
-                            "Flood controlled: waiting %.0fs for content (user %d)",
+                            "Flood controlled: waiting %.0fs for %s (user %d)",
                             remaining,
+                            task.task_type,
                             user_id,
                         )
                         await asyncio.sleep(remaining)
@@ -504,24 +549,37 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     if isinstance(e.retry_after, int)
                     else int(e.retry_after.total_seconds())
                 )
+                _flood_until[user_id] = max(
+                    _flood_until.get(user_id, 0.0),
+                    time.monotonic() + retry_secs,
+                )
+                if _task_survives_flood_pause(task.task_type):
+                    await _requeue_task_front(queue, lock, task)
                 if retry_secs > FLOOD_CONTROL_MAX_WAIT:
-                    _flood_until[user_id] = time.monotonic() + retry_secs
                     logger.warning(
                         "Flood control for user %d: retry_after=%ds, "
-                        "pausing queue until ban expires",
+                        "pausing queue until ban expires (task=%s retry=%s)",
                         user_id,
                         retry_secs,
+                        task.task_type,
+                        _task_survives_flood_pause(task.task_type),
                     )
                 else:
                     logger.warning(
-                        "Flood control for user %d: waiting %ds",
+                        "Flood control for user %d: waiting %ds (task=%s retry=%s)",
                         user_id,
                         retry_secs,
+                        task.task_type,
+                        _task_survives_flood_pause(task.task_type),
                     )
-                    await asyncio.sleep(retry_secs)
             except Exception as e:
                 logger.error(f"Error processing message task for user {user_id}: {e}")
             finally:
+                active_topics = _active_delivery_topics.get(user_id)
+                if active_topics is not None:
+                    active_topics.discard(topic_key)
+                    if not active_topics:
+                        _active_delivery_topics.pop(user_id, None)
                 queue.task_done()
         except asyncio.CancelledError:
             logger.info(f"Message queue worker cancelled for user {user_id}")
@@ -1602,5 +1660,6 @@ async def shutdown_workers() -> None:
     _queue_workers.clear()
     _message_queues.clear()
     _queue_locks.clear()
+    _active_delivery_topics.clear()
     _queue_dock_msg_info.clear()
     logger.info("Message queue workers stopped")

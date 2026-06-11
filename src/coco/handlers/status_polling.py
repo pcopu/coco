@@ -40,7 +40,7 @@ from .looper import (
 )
 from . import autoresearch, personality
 from . import resource_monitor
-from .message_queue import get_message_queue
+from .message_queue import get_pending_delivery_topics
 from .message_sender import safe_send
 from .topic_send import send_text_to_topic as _send_text_to_topic
 from .run_watchdog import (
@@ -804,6 +804,10 @@ async def status_poll_loop(bot: Bot) -> None:
                 (user_id, thread_id or 0)
                 for user_id, _chat_id, thread_id, _ in bindings
             }
+            pending_delivery_topics: dict[int, set[int]] = {}
+            for user_id, _chat_id, _thread_id, _wid in bindings:
+                if user_id not in pending_delivery_topics:
+                    pending_delivery_topics[user_id] = await get_pending_delivery_topics(user_id)
             prune_run_watch_topics(active_topics)
             prune_looper_topics(active_topics)
             autoresearch.prune_autoresearch_topics(active_topics)
@@ -861,8 +865,7 @@ async def status_poll_loop(bot: Bot) -> None:
 
             for user_id, chat_id, thread_id, wid in bindings:
                 try:
-                    queue = get_message_queue(user_id)
-                    if queue and not queue.empty():
+                    if (thread_id or 0) in pending_delivery_topics.get(user_id, set()):
                         continue
 
                     if chat_id is None:

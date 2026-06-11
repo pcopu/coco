@@ -34,6 +34,7 @@ APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 TIMEOUT_RECYCLE_METHODS = frozenset({"thread/start", "turn/start", "turn/steer"})
 APP_SERVER_ENABLED_FEATURES = ("goals",)
 _APP_SERVER_START_FAILURE_FILE = coco_dir() / "app_server_start_failures.json"
+_APP_SERVER_OWNED_PIDS_DIR = coco_dir() / "app_server_owned_pids"
 _APP_SERVER_START_FAILURE_WINDOW_SECONDS = 15 * 60
 _APP_SERVER_START_FAILURE_RESET_THRESHOLD = 3
 
@@ -156,6 +157,7 @@ class CodexAppServerClient:
                             f"Failed to start codex app-server: {e}"
                         ) from e
 
+                    self._remember_owned_pid(self._proc.pid)
                     self._initialized = False
                     self._server_user_agent = ""
                     self._transport_needs_restart = False
@@ -199,6 +201,8 @@ class CodexAppServerClient:
             except TimeoutError:
                 proc.kill()
                 await proc.wait()
+        if proc and getattr(proc, "pid", None):
+            self._forget_owned_pid(proc.pid)
 
         for key, fut in list(self._pending.items()):
             if not fut.done():
@@ -236,6 +240,105 @@ class CodexAppServerClient:
             logger.debug(
                 "Failed clearing app-server startup failure state %s",
                 _APP_SERVER_START_FAILURE_FILE,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _load_owned_pid_state() -> dict[int, tuple[str, int]]:
+        path = _APP_SERVER_OWNED_PIDS_DIR
+        if not path.is_dir():
+            return {}
+        owned: dict[int, tuple[str, int]] = {}
+        try:
+            entries = list(path.iterdir())
+        except Exception:
+            logger.debug(
+                "Failed listing owned app-server pid state from %s",
+                path,
+                exc_info=True,
+            )
+            return {}
+        for entry in entries:
+            if entry.suffix != ".pid":
+                continue
+            try:
+                pid = int(entry.stem)
+            except (TypeError, ValueError):
+                continue
+            if pid > 0:
+                try:
+                    raw_marker = entry.read_text(encoding="utf-8").strip()
+                except OSError:
+                    raw_marker = ""
+                marker_identity = raw_marker
+                owner_pid = 0
+                if raw_marker:
+                    try:
+                        payload = json.loads(raw_marker)
+                    except json.JSONDecodeError:
+                        payload = None
+                    if isinstance(payload, dict):
+                        marker_identity = str(payload.get("identity", "")).strip()
+                        try:
+                            owner_pid = int(payload.get("owner_pid", 0) or 0)
+                        except (TypeError, ValueError):
+                            owner_pid = 0
+                owned[pid] = (marker_identity, owner_pid)
+        return owned
+
+    @staticmethod
+    def _owned_pid_marker(pid: int) -> Path:
+        return _APP_SERVER_OWNED_PIDS_DIR / f"{pid}.pid"
+
+    @staticmethod
+    def _read_process_identity(pid: int) -> str:
+        if os.name == "nt" or pid <= 0:
+            return ""
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        try:
+            after_comm = stat_text.rsplit(") ", 1)[1]
+            fields = after_comm.split()
+            return fields[19]
+        except (IndexError, ValueError):
+            return ""
+
+    @classmethod
+    def _remember_owned_pid(cls, pid: int | None) -> None:
+        if not pid or pid <= 0:
+            return
+        path = cls._owned_pid_marker(pid)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                path,
+                {
+                    "identity": cls._read_process_identity(pid),
+                    "owner_pid": os.getpid(),
+                },
+            )
+        except Exception:
+            logger.debug(
+                "Failed recording owned app-server pid state %s",
+                path,
+                exc_info=True,
+            )
+
+    @classmethod
+    def _forget_owned_pid(cls, pid: int | None) -> None:
+        if not pid or pid <= 0:
+            return
+        path = cls._owned_pid_marker(pid)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.debug(
+                "Failed clearing owned app-server pid state %s",
+                path,
                 exc_info=True,
             )
 
@@ -302,9 +405,10 @@ class CodexAppServerClient:
                 "Automatic stale app-server reap is not implemented on Windows; skipping"
             )
             return
+        owned_pids = self._load_owned_pid_state()
         try:
             proc = subprocess.run(
-                ["ps", "-eo", "pid=,args="],
+                ["ps", "-eo", "pid=,ppid=,args="],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -314,27 +418,74 @@ class CodexAppServerClient:
             return
 
         current_pid = getattr(self._proc, "pid", None)
-        killed = 0
+        app_server_rows: list[tuple[int, int]] = []
+        app_server_ppids: dict[int, int] = {}
+        running_app_server_pids: set[int] = set()
+        reused_marker_pids: set[int] = set()
         for raw_line in proc.stdout.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             try:
-                pid_text, args = line.split(None, 1)
+                pid_text, ppid_text, args = line.split(None, 2)
             except ValueError:
                 continue
             if "codex app-server" not in args or "--listen stdio://" not in args:
                 continue
             try:
                 pid = int(pid_text)
+                ppid = int(ppid_text)
             except ValueError:
                 continue
+            app_server_rows.append((pid, ppid))
+            app_server_ppids[pid] = ppid
+            running_app_server_pids.add(pid)
+
+        for pid, (marker_identity, _owner_pid) in list(owned_pids.items()):
+            if pid not in running_app_server_pids:
+                self._forget_owned_pid(pid)
+                owned_pids.pop(pid, None)
+                continue
+            current_identity = self._read_process_identity(pid)
+            if marker_identity and current_identity and marker_identity != current_identity:
+                self._forget_owned_pid(pid)
+                owned_pids.pop(pid, None)
+                reused_marker_pids.add(pid)
+
+        live_foreign_owner_present = any(
+            owner_pid > 0
+            and owner_pid != os.getpid()
+            and app_server_ppids.get(pid) == owner_pid
+            for pid, (_marker_identity, owner_pid) in owned_pids.items()
+        )
+
+        if not owned_pids:
+            logger.warning(
+                "No live owned app-server pids recorded for recovery reap; falling back to orphaned app-server scan"
+            )
+        compat_reap_orphans = not live_foreign_owner_present
+
+        killed = 0
+        for pid, ppid in app_server_rows:
             if current_pid and pid == current_pid:
                 continue
+            marker = owned_pids.get(pid)
+            if marker is None:
+                if pid in reused_marker_pids or not compat_reap_orphans or ppid > 1:
+                    continue
+            else:
+                _marker_identity, owner_pid = marker
+                if owner_pid == os.getpid():
+                    pass
+                elif owner_pid > 0 and ppid == owner_pid:
+                    continue
+                elif ppid > 1:
+                    continue
             try:
                 os.kill(pid, signal.SIGTERM)
                 killed += 1
             except ProcessLookupError:
+                self._forget_owned_pid(pid)
                 continue
             except Exception:
                 logger.warning("Failed terminating stale codex app-server pid=%s", pid, exc_info=True)
