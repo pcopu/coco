@@ -1242,15 +1242,19 @@ async def _do_clear_progress_message(
 ) -> None:
     """Delete the in-progress message for a user/topic."""
     skey = (user_id, thread_id_or_0)
-    info = _progress_msg_info.pop(skey, None)
-    _clear_progress_text_cache(user_id, thread_id_or_0 or None)
+    info = _progress_msg_info.get(skey)
     if info:
         msg_id = info[0]
         chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            if _progress_msg_info.get(skey) == info:
+                _progress_msg_info.pop(skey, None)
+                _clear_progress_text_cache(user_id, thread_id_or_0 or None)
         except Exception as e:
             logger.debug(f"Failed to delete progress message {msg_id}: {e}")
+    else:
+        _clear_progress_text_cache(user_id, thread_id_or_0 or None)
 
 
 async def _process_status_update_task(
@@ -1395,12 +1399,14 @@ async def _do_clear_status_message(
 ) -> None:
     """Delete the status message for a user (internal, called from worker)."""
     skey = (user_id, thread_id_or_0)
-    info = _status_msg_info.pop(skey, None)
+    info = _status_msg_info.get(skey)
     if info:
         msg_id = info[0]
         chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            if _status_msg_info.get(skey) == info:
+                _status_msg_info.pop(skey, None)
         except Exception as e:
             logger.debug(f"Failed to delete status message {msg_id}: {e}")
 

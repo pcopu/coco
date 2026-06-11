@@ -576,6 +576,80 @@ async def test_progress_update_edit_fallback_does_not_preemptively_drop_tracking
 
 
 @pytest.mark.asyncio
+async def test_do_clear_status_message_preserves_tracking_when_delete_fails(monkeypatch):
+    user_id = 115
+    thread_id = 116
+    skey = (user_id, thread_id)
+    mq._status_msg_info[skey] = (7017, "@19", "status text")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            raise Exception("delete failed")
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100912,
+    )
+
+    await mq._do_clear_status_message(_Bot(), user_id, thread_id)
+
+    assert mq._status_msg_info[skey] == (7017, "@19", "status text")
+
+
+@pytest.mark.asyncio
+async def test_do_clear_progress_message_preserves_tracking_when_delete_fails(monkeypatch):
+    user_id = 117
+    thread_id = 118
+    skey = (user_id, thread_id)
+    mq._progress_msg_info[skey] = (7018, "@20", "progress text")
+    mq._progress_text_cache[skey] = ("@20", "progress text")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            raise Exception("delete failed")
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100913,
+    )
+
+    await mq._do_clear_progress_message(_Bot(), user_id, thread_id)
+
+    assert mq._progress_msg_info[skey] == (7018, "@20", "progress text")
+    assert mq._progress_text_cache[skey] == ("@20", "progress text")
+
+
+@pytest.mark.asyncio
+async def test_do_clear_progress_message_does_not_clear_newer_cache_after_successful_delete(monkeypatch):
+    user_id = 119
+    thread_id = 120
+    skey = (user_id, thread_id)
+    old = (7019, "@21", "old progress")
+    newer = (7020, "@21", "newer progress")
+    mq._progress_msg_info[skey] = old
+    mq._progress_text_cache[skey] = ("@21", "old progress")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            mq._progress_msg_info[skey] = newer
+            mq._progress_text_cache[skey] = ("@21", "newer progress")
+            return True
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100914,
+    )
+
+    await mq._do_clear_progress_message(_Bot(), user_id, thread_id)
+
+    assert mq._progress_msg_info[skey] == newer
+    assert mq._progress_text_cache[skey] == ("@21", "newer progress")
+
+
+@pytest.mark.asyncio
 async def test_enqueue_progress_update_coalesces_trailing_pending_updates():
     user_id = 201
     thread_id = 202
