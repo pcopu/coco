@@ -855,6 +855,8 @@ class TestRuntimeCapabilityHint:
         assert ".jpg" in hint
         assert ".jpeg" in hint
         assert ".webp" in hint
+        assert ".mp4" in hint
+        assert ".webm" in hint
 
 
 class TestGroupChatId:

@@ -484,11 +484,16 @@ class SessionMonitor:
         await self._cleanup_all_stale_sessions()
         # Initialize last known session_map
         self._last_session_map = await self._load_current_session_map()
+        autodiscover_interval = max(60.0, self.poll_interval)
+        next_autodiscover_at = time.monotonic() + autodiscover_interval
 
         while self._running:
             try:
-                # Keep window->session map fresh even without hook support.
-                await session_manager.autodiscover_sessions_for_bound_windows()
+                # Keep window->session map fresh without rescanning all Codex
+                # transcripts on every short poll cycle.
+                if time.monotonic() >= next_autodiscover_at:
+                    next_autodiscover_at = time.monotonic() + autodiscover_interval
+                    await session_manager.autodiscover_sessions_for_bound_windows()
 
                 # Detect session_map changes and cleanup replaced/removed sessions
                 current_map = await self._detect_and_cleanup_changes()

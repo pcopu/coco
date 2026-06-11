@@ -3590,7 +3590,8 @@ class SessionManager:
             'append a standalone line exactly like '
             '<telegram-attachment path="relative/path.pdf" /> '
             "after your normal answer. Supported types: .pdf, .txt, .md, "
-            ".png, .jpg, .jpeg, .webp, .gif, .bmp, .tif, .tiff. "
+            ".png, .jpg, .jpeg, .webp, .gif, .bmp, .tif, .tiff, "
+            ".mp4, .mov, .webm, .mkv, .avi, .mpeg, .mpg. "
             "Use only files inside the workspace. The tag line is hidden from the user.\n"
             "Treat this as the current runtime capability for this turn, "
             "not as a user request."

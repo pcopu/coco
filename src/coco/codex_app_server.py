@@ -10,23 +10,32 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shlex
 import shutil
+import signal
+import subprocess
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .config import config
+from .utils import atomic_write_json, coco_dir
 
 logger = logging.getLogger(__name__)
 
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]]
 
-# Default asyncio StreamReader limit (64 KiB) is too small for some app-server
-# JSONL payloads; use a larger cap to avoid read-loop termination.
-APP_SERVER_STREAM_LIMIT = 1024 * 1024
+# Default asyncio StreamReader limit (64 KiB) is too small for app-server
+# JSONL payloads that can inline generated images. Keep this above the largest
+# single session line observed in production (~1.7 MiB).
+APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 TIMEOUT_RECYCLE_METHODS = frozenset({"thread/start", "turn/start", "turn/steer"})
 APP_SERVER_ENABLED_FEATURES = ("goals",)
+_APP_SERVER_START_FAILURE_FILE = coco_dir() / "app_server_start_failures.json"
+_APP_SERVER_START_FAILURE_WINDOW_SECONDS = 15 * 60
+_APP_SERVER_START_FAILURE_RESET_THRESHOLD = 3
 
 
 class CodexAppServerError(RuntimeError):
@@ -115,48 +124,56 @@ class CodexAppServerClient:
             return
 
         async with self._start_lock:
-            if self._is_transport_ready():
-                return
+            recovery_attempted = False
+            while True:
+                if self._is_transport_ready():
+                    return
 
-            if self._proc and self._proc.returncode is None and (
-                self._transport_needs_restart or not self._initialized
-            ):
-                logger.warning(
-                    "Recycling unhealthy Codex app-server transport "
-                    "(initialized=%s, needs_restart=%s)",
-                    self._initialized,
-                    self._transport_needs_restart,
-                )
-                await self.stop()
-
-            if not self._proc or self._proc.returncode is not None:
-                argv = self._app_server_argv()
-                logger.info("Starting Codex app-server: %s", argv)
-                try:
-                    self._proc = await asyncio.create_subprocess_exec(
-                        *argv,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        limit=APP_SERVER_STREAM_LIMIT,
+                if self._proc and self._proc.returncode is None and (
+                    self._transport_needs_restart or not self._initialized
+                ):
+                    logger.warning(
+                        "Recycling unhealthy Codex app-server transport "
+                        "(initialized=%s, needs_restart=%s)",
+                        self._initialized,
+                        self._transport_needs_restart,
                     )
-                except OSError as e:
-                    raise CodexAppServerError(
-                        f"Failed to start codex app-server: {e}"
-                    ) from e
+                    await self.stop()
 
-                self._initialized = False
-                self._server_user_agent = ""
-                self._transport_needs_restart = False
-                self._reader_task = asyncio.create_task(self._reader_loop())
-                self._stderr_task = asyncio.create_task(self._stderr_loop())
-                self._ensure_notification_worker()
+                if not self._proc or self._proc.returncode is not None:
+                    argv = self._app_server_argv()
+                    logger.info("Starting Codex app-server: %s", argv)
+                    try:
+                        self._proc = await asyncio.create_subprocess_exec(
+                            *argv,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            limit=APP_SERVER_STREAM_LIMIT,
+                        )
+                    except OSError as e:
+                        raise CodexAppServerError(
+                            f"Failed to start codex app-server: {e}"
+                        ) from e
 
-            try:
-                await self._run_initialize_handshake()
-            except Exception:
-                await self.stop()
-                raise
+                    self._initialized = False
+                    self._server_user_agent = ""
+                    self._transport_needs_restart = False
+                    self._reader_task = asyncio.create_task(self._reader_loop())
+                    self._stderr_task = asyncio.create_task(self._stderr_loop())
+                    self._ensure_notification_worker()
+
+                try:
+                    await self._run_initialize_handshake()
+                    self._clear_start_failure_state()
+                    return
+                except Exception as exc:
+                    await self.stop()
+                    if recovery_attempted:
+                        raise
+                    if not await self._attempt_recovery_after_start_failure(exc):
+                        raise
+                    recovery_attempted = True
 
     def is_running(self) -> bool:
         """Return whether the app-server process is currently running."""
@@ -193,6 +210,135 @@ class CodexAppServerClient:
         self._initialized = False
         self._server_user_agent = ""
         self._transport_needs_restart = False
+
+    @staticmethod
+    def _load_start_failure_state() -> dict[str, Any]:
+        try:
+            raw = json.loads(_APP_SERVER_START_FAILURE_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.debug(
+                "Failed reading app-server startup failure state from %s",
+                _APP_SERVER_START_FAILURE_FILE,
+                exc_info=True,
+            )
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _clear_start_failure_state() -> None:
+        try:
+            _APP_SERVER_START_FAILURE_FILE.unlink()
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.debug(
+                "Failed clearing app-server startup failure state %s",
+                _APP_SERVER_START_FAILURE_FILE,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _record_start_failure() -> int:
+        now = time.time()
+        state = CodexAppServerClient._load_start_failure_state()
+        first_failure = float(state.get("first_failure_ts", now))
+        count = int(state.get("count", 0))
+        if now - first_failure > _APP_SERVER_START_FAILURE_WINDOW_SECONDS:
+            first_failure = now
+            count = 0
+        count += 1
+        try:
+            atomic_write_json(
+                _APP_SERVER_START_FAILURE_FILE,
+                {
+                    "first_failure_ts": first_failure,
+                    "last_failure_ts": now,
+                    "count": count,
+                },
+            )
+        except Exception:
+            logger.debug(
+                "Failed writing app-server startup failure state %s",
+                _APP_SERVER_START_FAILURE_FILE,
+                exc_info=True,
+            )
+        return count
+
+    @staticmethod
+    def _should_force_recover_start_failure(err: Exception) -> bool:
+        if not isinstance(err, CodexAppServerError):
+            return False
+        text = str(err).lower()
+        return (
+            "database is locked" in text
+            or "codex app-server disconnected" in text
+            or "timed out waiting for app-server response: initialize" in text
+        )
+
+    async def _attempt_recovery_after_start_failure(self, err: Exception) -> bool:
+        failure_count = self._record_start_failure()
+        emit_recovery = (
+            failure_count >= _APP_SERVER_START_FAILURE_RESET_THRESHOLD
+            and self._should_force_recover_start_failure(err)
+        )
+        if not emit_recovery:
+            return False
+
+        logger.warning(
+            "Codex app-server startup failed %d times in %ds; reaping stale local app-server processes and retrying once",
+            failure_count,
+            _APP_SERVER_START_FAILURE_WINDOW_SECONDS,
+        )
+        self._clear_start_failure_state()
+        self._reap_stale_local_app_server_processes()
+        await asyncio.sleep(0.5)
+        return True
+
+    def _reap_stale_local_app_server_processes(self) -> None:
+        if os.name == "nt":
+            logger.warning(
+                "Automatic stale app-server reap is not implemented on Windows; skipping"
+            )
+            return
+        try:
+            proc = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            logger.warning("Failed listing local processes for app-server recovery", exc_info=True)
+            return
+
+        current_pid = getattr(self._proc, "pid", None)
+        killed = 0
+        for raw_line in proc.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                pid_text, args = line.split(None, 1)
+            except ValueError:
+                continue
+            if "codex app-server" not in args or "--listen stdio://" not in args:
+                continue
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            if current_pid and pid == current_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            except ProcessLookupError:
+                continue
+            except Exception:
+                logger.warning("Failed terminating stale codex app-server pid=%s", pid, exc_info=True)
+        logger.warning("App-server recovery reaped %d stale local codex app-server process(es)", killed)
 
     def _is_transport_ready(self) -> bool:
         if not self._proc or self._proc.returncode is not None:

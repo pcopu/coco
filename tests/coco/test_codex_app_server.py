@@ -152,6 +152,93 @@ async def test_ensure_started_stops_process_when_handshake_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ensure_started_reaps_stale_processes_after_repeated_initialize_failures(
+    monkeypatch, tmp_path
+):
+    client = cas.CodexAppServerClient()
+    attempts = 0
+    reaps: list[str] = []
+    failure_file = tmp_path / "failures.json"
+    failure_file.write_text(
+        '{"count": 2, "first_failure_ts": 500, "last_failure_ts": 900}',
+        encoding="utf-8",
+    )
+
+    async def _fake_create_subprocess_exec(*_args, **_kwargs):
+        return _FakeProc()
+
+    async def _noop_loop():
+        return None
+
+    async def _fake_request_started(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            raise cas.CodexAppServerError("failed to initialize sqlite state runtime: database is locked")
+        return {"userAgent": "codex/test"}
+
+    async def _fake_write_jsonrpc(_payload: dict):
+        return None
+
+    async def _fake_sleep(_seconds: float):
+        return None
+
+    monkeypatch.setattr(cas.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(cas, "_APP_SERVER_START_FAILURE_FILE", failure_file)
+    monkeypatch.setattr(cas.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(cas.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(client, "_reader_loop", _noop_loop)
+    monkeypatch.setattr(client, "_stderr_loop", _noop_loop)
+    monkeypatch.setattr(client, "_request_started", _fake_request_started)
+    monkeypatch.setattr(client, "_write_jsonrpc", _fake_write_jsonrpc)
+    monkeypatch.setattr(
+        client,
+        "_reap_stale_local_app_server_processes",
+        lambda: reaps.append("reap"),
+    )
+
+    await client.ensure_started()
+
+    assert attempts == 2
+    assert reaps == ["reap"]
+    assert client.get_server_user_agent() == "codex/test"
+    assert not failure_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_successful_ensure_started_clears_persisted_failure_state(monkeypatch, tmp_path):
+    client = cas.CodexAppServerClient()
+    failure_file = tmp_path / "failures.json"
+    failure_file.write_text('{"count": 2, "first_failure_ts": 1, "last_failure_ts": 2}', encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*_args, **_kwargs):
+        return _FakeProc()
+
+    async def _noop_loop():
+        return None
+
+    async def _fake_request_started(method: str, params: dict, *, timeout: float = 60.0):
+        _ = timeout
+        assert method == "initialize"
+        assert "clientInfo" in params
+        return {"userAgent": "codex/test"}
+
+    async def _fake_write_jsonrpc(_payload: dict):
+        return None
+
+    monkeypatch.setattr(cas, "_APP_SERVER_START_FAILURE_FILE", failure_file)
+    monkeypatch.setattr(cas.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(client, "_reader_loop", _noop_loop)
+    monkeypatch.setattr(client, "_stderr_loop", _noop_loop)
+    monkeypatch.setattr(client, "_request_started", _fake_request_started)
+    monkeypatch.setattr(client, "_write_jsonrpc", _fake_write_jsonrpc)
+
+    await client.ensure_started()
+
+    assert not failure_file.exists()
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
     client = cas.CodexAppServerClient()
     calls: list[tuple[str, dict[str, object], float]] = []
