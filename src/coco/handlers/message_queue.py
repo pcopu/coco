@@ -279,9 +279,10 @@ async def sync_queued_topic_dock(
     if not pending_items:
         if current_info:
             msg_id, _old_text = current_info
-            _queue_dock_msg_info.pop(skey, None)
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                if _queue_dock_msg_info.get(skey) == current_info:
+                    _queue_dock_msg_info.pop(skey, None)
             except Exception:
                 pass
         return
@@ -350,13 +351,15 @@ async def clear_queued_topic_dock(
 ) -> None:
     """Delete the queue dock message for a topic (best effort)."""
     skey = _topic_key(user_id, thread_id)
-    info = _queue_dock_msg_info.pop(skey, None)
+    info = _queue_dock_msg_info.get(skey)
     if not info or bot is None:
         return
     msg_id, _old_text = info
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     try:
         await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        if _queue_dock_msg_info.get(skey) == info:
+            _queue_dock_msg_info.pop(skey, None)
     except Exception:
         pass
 

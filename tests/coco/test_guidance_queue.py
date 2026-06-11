@@ -894,6 +894,47 @@ async def test_sync_queued_topic_dock_edits_existing_message_in_place(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_sync_queued_topic_dock_preserves_tracking_when_empty_delete_fails(monkeypatch):
+    user_id = 305
+    thread_id = 305
+    skey = (user_id, thread_id)
+    mq._queued_topic_inputs.pop(skey, None)
+    mq._queue_dock_msg_info[skey] = (56, "⏳ Queue\n1. item")
+
+    class _Bot:
+        async def delete_message(self, **_kwargs):
+            raise Exception("delete failed")
+
+    monkeypatch.setattr(mq.session_manager, "resolve_chat_id", lambda *_args, **_kwargs: -100305)
+
+    try:
+        await mq.sync_queued_topic_dock(_Bot(), user_id, thread_id, window_id="@305")  # type: ignore[arg-type]
+        assert mq._queue_dock_msg_info[skey] == (56, "⏳ Queue\n1. item")
+    finally:
+        mq._queue_dock_msg_info.pop(skey, None)
+
+
+@pytest.mark.asyncio
+async def test_clear_queued_topic_dock_preserves_tracking_when_delete_fails(monkeypatch):
+    user_id = 306
+    thread_id = 306
+    skey = (user_id, thread_id)
+    mq._queue_dock_msg_info[skey] = (57, "⏳ Queue\n1. item")
+
+    class _Bot:
+        async def delete_message(self, **_kwargs):
+            raise Exception("delete failed")
+
+    monkeypatch.setattr(mq.session_manager, "resolve_chat_id", lambda *_args, **_kwargs: -100306)
+
+    try:
+        await mq.clear_queued_topic_dock(_Bot(), user_id, thread_id)  # type: ignore[arg-type]
+        assert mq._queue_dock_msg_info[skey] == (57, "⏳ Queue\n1. item")
+    finally:
+        mq._queue_dock_msg_info.pop(skey, None)
+
+
+@pytest.mark.asyncio
 async def test_steer_message_keeps_progress_block_active(monkeypatch):
     events: list[tuple[str, str | None]] = []
 
