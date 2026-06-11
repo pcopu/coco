@@ -60,14 +60,22 @@ async def clear_interactive_msg(
 ) -> None:
     """Clear tracked interactive message, delete from chat, and exit interactive mode."""
     ikey = (user_id, thread_id or 0)
-    msg_id = _interactive_msgs.pop(ikey, None)
-    _interactive_mode.pop(ikey, None)
+    msg_id = _interactive_msgs.get(ikey)
+    window_id = _interactive_mode.get(ikey)
     if not bot or not msg_id:
+        _interactive_msgs.pop(ikey, None)
+        _interactive_mode.pop(ikey, None)
         return
     try:
         await bot.delete_message(
             chat_id=session_manager.resolve_chat_id(user_id, thread_id),
             message_id=msg_id,
         )
+        if _interactive_msgs.get(ikey) == msg_id:
+            _interactive_msgs.pop(ikey, None)
+            _interactive_mode.pop(ikey, None)
     except Exception as e:
+        if _interactive_msgs.get(ikey) == msg_id:
+            _interactive_msgs.pop(ikey, None)
+            _interactive_mode.pop(ikey, None)
         logger.debug("Failed to delete interactive message %s: %s", msg_id, e)
