@@ -1180,6 +1180,8 @@ async def _process_progress_finalize_task(
                 _clear_progress_text_cache(user_id, task.thread_id)
                 return
             logger.debug(f"Failed to finalize progress message: {plain_error}")
+            _progress_msg_info.pop(skey, None)
+            _clear_progress_text_cache(user_id, task.thread_id)
 
 
 async def _do_send_progress_message(

@@ -282,6 +282,41 @@ async def test_progress_finalize_compact_mode_hides_body(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_progress_finalize_clears_tracking_when_all_edits_fail(monkeypatch):
+    user_id = 99
+    thread_id = 100
+    skey = (user_id, thread_id)
+    mq._progress_msg_info[skey] = (7005, "@11", "Working on it")
+    mq._progress_text_cache[skey] = ("@11", "Working on it")
+    edit_attempts: list[int] = []
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs):
+            edit_attempts.append(1)
+            raise Exception("message to edit not found")
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100904,
+    )
+
+    await mq._process_progress_finalize_task(
+        _Bot(),
+        user_id,
+        mq.MessageTask(
+            task_type="progress_finalize",
+            window_id="@11",
+            thread_id=thread_id,
+        ),
+    )
+
+    assert len(edit_attempts) == 2
+    assert skey not in mq._progress_msg_info
+    assert skey not in mq._progress_text_cache
+
+
+@pytest.mark.asyncio
 async def test_enqueue_progress_update_coalesces_trailing_pending_updates():
     user_id = 201
     thread_id = 202
