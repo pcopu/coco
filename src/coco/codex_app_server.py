@@ -8,6 +8,7 @@ helpers for thread/turn operations used by Telegram handlers.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import logging
 import os
@@ -31,6 +32,14 @@ ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] 
 # JSONL payloads that can inline generated images. Keep this above the largest
 # single session line observed in production (~1.7 MiB).
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE = 256
+APP_SERVER_NOTIFICATION_OVERFLOW_MAXSIZE = 64
+APP_SERVER_NOTIFICATION_DROP_WHEN_FULL = frozenset(
+    {
+        "account/rateLimits/updated",
+        "thread/tokenUsage/updated",
+    }
+)
 TIMEOUT_RECYCLE_METHODS = frozenset({"thread/start", "turn/start", "turn/steer"})
 APP_SERVER_ENABLED_FEATURES = ("goals",)
 _APP_SERVER_START_FAILURE_FILE = coco_dir() / "app_server_start_failures.json"
@@ -52,7 +61,10 @@ class CodexAppServerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
         self._notification_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = (
-            asyncio.Queue()
+            asyncio.Queue(maxsize=APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE)
+        )
+        self._notification_overflow: deque[tuple[str, dict[str, Any]]] = deque(
+            maxlen=APP_SERVER_NOTIFICATION_OVERFLOW_MAXSIZE
         )
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
@@ -192,7 +204,8 @@ class CodexAppServerClient:
         self._stderr_task = None
         self._notification_task = None
         # Drop any queued notifications from the previous process lifecycle.
-        self._notification_queue = asyncio.Queue()
+        self._notification_queue = asyncio.Queue(maxsize=APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE)
+        self._notification_overflow.clear()
 
         if proc and proc.returncode is None:
             proc.terminate()
@@ -633,7 +646,12 @@ class CodexAppServerClient:
     async def _notification_loop(self) -> None:
         try:
             while True:
-                method, params = await self._notification_queue.get()
+                if not self._notification_queue.empty():
+                    method, params = await self._notification_queue.get()
+                elif self._notification_overflow:
+                    method, params = self._notification_overflow.popleft()
+                else:
+                    method, params = await self._notification_queue.get()
                 handler = self._notification_handler
                 if not handler:
                     continue
@@ -645,6 +663,73 @@ class CodexAppServerClient:
                     logger.exception("app-server notification handler failed: %s", method)
         except asyncio.CancelledError:
             return
+
+    def _drop_replaceable_queued_notification(self) -> bool:
+        queue_items = getattr(self._notification_queue, "_queue", None)
+        if queue_items is None:
+            return False
+        for item in list(queue_items):
+            try:
+                method, _params = item
+            except (TypeError, ValueError):
+                continue
+            if method in APP_SERVER_NOTIFICATION_DROP_WHEN_FULL:
+                queue_items.remove(item)
+                return True
+        return False
+
+    def _enqueue_notification(self, method: str, params: dict[str, Any]) -> bool:
+        if self._notification_overflow:
+            if method in APP_SERVER_NOTIFICATION_DROP_WHEN_FULL:
+                logger.warning(
+                    "app-server notification overflow pending; dropping %s snapshot",
+                    method,
+                )
+                return False
+            self._notification_overflow.append((method, params))
+            return True
+        try:
+            self._notification_queue.put_nowait((method, params))
+            return True
+        except asyncio.QueueFull:
+            if method in APP_SERVER_NOTIFICATION_DROP_WHEN_FULL:
+                logger.warning(
+                    "app-server notification queue full (%d); dropping %s snapshot",
+                    self._notification_queue.maxsize,
+                    method,
+                )
+                return False
+            if self._drop_replaceable_queued_notification():
+                try:
+                    self._notification_queue.put_nowait((method, params))
+                    logger.warning(
+                        "app-server notification queue full (%d); evicted stale snapshot for %s",
+                        self._notification_queue.maxsize,
+                        method,
+                    )
+                    return True
+                except asyncio.QueueFull:
+                    pass
+            overflow_was_full = (
+                self._notification_overflow.maxlen is not None
+                and len(self._notification_overflow) >= self._notification_overflow.maxlen
+            )
+            self._notification_overflow.append((method, params))
+            if overflow_was_full:
+                logger.warning(
+                    "app-server notification overflow full (%d); dropped oldest item for %s",
+                    self._notification_overflow.maxlen,
+                    method,
+                )
+            else:
+                logger.warning(
+                    "app-server notification queue full (%d); spilling %s notification to overflow (%d/%d)",
+                    self._notification_queue.maxsize,
+                    method,
+                    len(self._notification_overflow),
+                    self._notification_overflow.maxlen or 0,
+                )
+            return True
 
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")
@@ -676,7 +761,7 @@ class CodexAppServerClient:
                 # work (progress edits, etc.) can be slow and would otherwise
                 # starve request/response processing, leading to turn/start timeouts.
                 self._ensure_notification_worker()
-                self._notification_queue.put_nowait((method, params_dict))
+                self._enqueue_notification(method, params_dict)
             return
 
         # Response (id, maybe result/error)

@@ -1013,6 +1013,46 @@ class TestResolveWindowForThread:
         assert mgr.resolve_window_for_thread(100, 42) == "@3"
 
 
+class TestSessionDirectPathCache:
+    @pytest.mark.asyncio
+    async def test_get_session_direct_reuses_resolved_file_path(
+        self, mgr: SessionManager, monkeypatch, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        sessions_root = tmp_path / "sessions"
+        sessions_dir = sessions_root / "2026" / "06" / "11"
+        sessions_dir.mkdir(parents=True)
+        session_id = "019eb7f2-0a01-7023-a382-194ec2966267"
+        session_file = sessions_dir / f"rollout-2026-06-11T18-29-13-{session_id}.jsonl"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": session_id, "cwd": str(workspace)},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        class _CountingSessionsPath:
+            def __init__(self, root: Path) -> None:
+                self.root = root
+                self.glob_calls = 0
+
+            def glob(self, pattern: str):
+                self.glob_calls += 1
+                return self.root.glob(pattern)
+
+        counting_root = _CountingSessionsPath(sessions_root)
+        monkeypatch.setattr(session_mod.config, "sessions_path", counting_root)
+
+        assert await mgr._get_session_direct(session_id, str(workspace)) is not None
+        assert await mgr._get_session_direct(session_id, str(workspace)) is not None
+        assert counting_root.glob_calls == 1
+
+
 class TestDisplayNames:
     def test_get_display_name_fallback(self, mgr: SessionManager) -> None:
         """get_display_name returns window_id when no display name is set."""
@@ -1035,6 +1075,46 @@ class TestDisplayNames:
         mgr.bind_thread(100, 1, "@1")
         # No display name set, fallback to window_id
         assert mgr.get_display_name("@1") == "@1"
+
+
+class TestAutodiscoverBoundWindows:
+    @pytest.mark.asyncio
+    async def test_reuses_session_summary_lookup_for_windows_in_same_cwd(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_thread(100, 2, "@2")
+        mgr.get_window_state("@1").cwd = str(workspace)
+        mgr.get_window_state("@1").last_input_ts = 10.0
+        mgr.get_window_state("@2").cwd = str(workspace)
+        mgr.get_window_state("@2").last_input_ts = 10.0
+
+        calls: list[str] = []
+
+        def fake_list_summaries(cwd: str, *, limit: int = 100):
+            calls.append(cwd)
+            return [
+                CodexSessionSummary(
+                    thread_id="latest-session",
+                    file_path=workspace / "rollout.jsonl",
+                    created_at=11.0,
+                    last_active_at=12.0,
+                )
+            ]
+
+        monkeypatch.setattr(
+            mgr,
+            "list_codex_session_summaries_for_cwd",
+            fake_list_summaries,
+        )
+
+        await mgr.autodiscover_sessions_for_bound_windows()
+
+        assert calls == [str(workspace)]
+        assert mgr.get_window_state("@1").session_id == "latest-session"
+        assert mgr.get_window_state("@2").session_id == "latest-session"
 
 
 class TestFindUsersForSession:

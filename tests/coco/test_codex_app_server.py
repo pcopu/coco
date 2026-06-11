@@ -1,6 +1,7 @@
 """Tests for Codex app-server client transport and handshake."""
 
 import asyncio
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -555,6 +556,141 @@ async def test_notification_handling_does_not_block_reader_loop():
     assert client.get_active_turn_id("th_1") == "turn_1"
 
     await client.stop()
+
+
+def test_notification_queue_drops_snapshot_when_full():
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=1)
+    client._notification_queue.put_nowait(
+        ("account/rateLimits/updated", {"rateLimits": {"remaining": 1}})
+    )
+
+    accepted = client._enqueue_notification(
+        "thread/tokenUsage/updated",
+        {"threadId": "th_1", "tokenUsage": {"totalTokens": 9}},
+    )
+
+    assert accepted is False
+    assert client._notification_queue.get_nowait() == (
+        "account/rateLimits/updated",
+        {"rateLimits": {"remaining": 1}},
+    )
+
+
+def test_notification_queue_evicts_snapshot_for_turn_lifecycle_notification():
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=1)
+    client._notification_queue.put_nowait(
+        ("thread/tokenUsage/updated", {"threadId": "th_1", "tokenUsage": {"totalTokens": 9}})
+    )
+
+    accepted = client._enqueue_notification(
+        "turn/started",
+        {"threadId": "th_1", "turn": {"id": "turn_1"}},
+    )
+
+    assert accepted is True
+    assert client._notification_queue.get_nowait() == (
+        "turn/started",
+        {"threadId": "th_1", "turn": {"id": "turn_1"}},
+    )
+
+
+def test_notification_queue_spills_turn_lifecycle_when_only_critical_items_remain():
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=1)
+    client._notification_queue.put_nowait(
+        ("turn/completed", {"threadId": "th_0", "turn": {"status": "completed"}})
+    )
+
+    accepted = client._enqueue_notification(
+        "turn/started",
+        {"threadId": "th_1", "turn": {"id": "turn_1"}},
+    )
+
+    assert accepted is True
+    assert client._notification_queue.get_nowait() == (
+        "turn/completed",
+        {"threadId": "th_0", "turn": {"status": "completed"}},
+    )
+    assert list(client._notification_overflow) == [
+        ("turn/started", {"threadId": "th_1", "turn": {"id": "turn_1"}})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_notification_loop_preserves_fifo_when_overflow_contains_newer_item():
+    client = cas.CodexAppServerClient()
+    delivered: list[tuple[str, dict[str, object]]] = []
+
+    async def _handler(method: str, params: dict[str, object]) -> None:
+        delivered.append((method, params))
+
+    await client.set_handlers(notification_handler=_handler)
+    client._notification_queue = asyncio.Queue(maxsize=1)
+    client._notification_queue.put_nowait(
+        ("turn/completed", {"threadId": "th_0", "turn": {"status": "completed"}})
+    )
+    client._notification_overflow.append(
+        ("turn/started", {"threadId": "th_1", "turn": {"id": "turn_1"}})
+    )
+
+    task = asyncio.create_task(client._notification_loop())
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert delivered == [
+        ("turn/completed", {"threadId": "th_0", "turn": {"status": "completed"}}),
+        ("turn/started", {"threadId": "th_1", "turn": {"id": "turn_1"}}),
+    ]
+
+
+def test_notification_queue_appends_new_critical_items_behind_existing_overflow():
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=2)
+    client._notification_queue.put_nowait(
+        ("turn/completed", {"threadId": "th_0", "turn": {"status": "completed"}})
+    )
+    client._notification_overflow.append(
+        ("turn/started", {"threadId": "th_1", "turn": {"id": "turn_1"}})
+    )
+
+    accepted = client._enqueue_notification(
+        "turn/completed",
+        {"threadId": "th_1", "turn": {"status": "completed"}},
+    )
+
+    assert accepted is True
+    assert list(client._notification_overflow) == [
+        ("turn/started", {"threadId": "th_1", "turn": {"id": "turn_1"}}),
+        ("turn/completed", {"threadId": "th_1", "turn": {"status": "completed"}}),
+    ]
+
+
+def test_notification_overflow_keeps_latest_when_bounded(monkeypatch):
+    monkeypatch.setattr(cas, "APP_SERVER_NOTIFICATION_OVERFLOW_MAXSIZE", 2)
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=1)
+    client._notification_queue.put_nowait(
+        ("turn/completed", {"threadId": "th_0", "turn": {"status": "completed"}})
+    )
+
+    for idx in range(3):
+        accepted = client._enqueue_notification(
+            "turn/started",
+            {"threadId": f"th_{idx + 1}", "turn": {"id": f"turn_{idx + 1}"}},
+        )
+        assert accepted is True
+
+    assert list(client._notification_overflow) == [
+        ("turn/started", {"threadId": "th_2", "turn": {"id": "turn_2"}}),
+        ("turn/started", {"threadId": "th_3", "turn": {"id": "turn_3"}}),
+    ]
 
 
 @pytest.mark.asyncio

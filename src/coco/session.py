@@ -395,6 +395,11 @@ class SessionManager:
         init=False,
         repr=False,
     )
+    _session_file_path_cache: dict[str, Path] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -1039,6 +1044,33 @@ class SessionManager:
         """Return True when the Codex transcript cwd exactly matches window cwd."""
         return file_cwd == target_cwd
 
+    @staticmethod
+    def _normalized_cwd_key(cwd: str) -> str:
+        try:
+            return str(Path(cwd).resolve())
+        except (OSError, ValueError):
+            return cwd
+
+    @staticmethod
+    def _select_latest_session_summary(
+        summaries: list[CodexSessionSummary], *, prefer_recent_since: float = 0.0
+    ) -> tuple[str, Path] | None:
+        matching = [
+            (summary.last_active_at, summary.thread_id, summary.file_path)
+            for summary in summaries
+        ]
+        if not matching:
+            return None
+
+        if prefer_recent_since > 0:
+            cutoff = prefer_recent_since - 2.0
+            matching = [item for item in matching if item[0] >= cutoff]
+            if not matching:
+                return None
+
+        _mtime, sid, path = max(matching, key=lambda item: item[0])
+        return sid, path
+
     def _find_latest_session_for_cwd(
         self, cwd: str, *, prefer_recent_since: float = 0.0
     ) -> tuple[str, Path] | None:
@@ -1048,30 +1080,11 @@ class SessionManager:
         after that timestamp are considered. This avoids binding to stale
         transcripts when a new window is created in a directory with old history.
         """
-        try:
-            target_cwd = str(Path(cwd).resolve())
-        except (OSError, ValueError):
-            target_cwd = cwd
-
-        # Codex sessions are sharded by date under ~/.codex/sessions/YYYY/MM/...
-        matching = [
-            (summary.last_active_at, summary.thread_id, summary.file_path)
-            for summary in self.list_codex_session_summaries_for_cwd(cwd)
-        ]
-
-        if not matching:
-            return None
-
-        if prefer_recent_since > 0:
-            cutoff = prefer_recent_since - 2.0
-            recent = [item for item in matching if item[0] >= cutoff]
-            if not recent:
-                return None
-            _mtime, sid, path = max(recent, key=lambda item: item[0])
-            return sid, path
-
-        _mtime, sid, path = max(matching, key=lambda item: item[0])
-        return sid, path
+        summaries = self.list_codex_session_summaries_for_cwd(cwd)
+        return self._select_latest_session_summary(
+            summaries,
+            prefer_recent_since=prefer_recent_since,
+        )
 
     def get_latest_codex_session_id_for_cwd(self, cwd: str) -> str:
         """Return latest Codex session/thread id for an exact workspace cwd."""
@@ -1121,46 +1134,68 @@ class SessionManager:
                 break
         return summaries
 
-    async def autodiscover_session_for_window(self, window_id: str) -> bool:
-        """Auto-associate transcript session metadata for one window binding."""
+    def _autodiscover_session_for_window_from_summaries(
+        self, window_id: str, summaries: list[CodexSessionSummary]
+    ) -> bool:
         state = self.get_window_state(window_id)
-        cwd = state.cwd.strip()
-        if not cwd:
+        if not state.cwd.strip():
             return False
-
         if not state.session_id and state.last_input_ts <= 0:
             return False
 
-        discovered = self._find_latest_session_for_cwd(
-            cwd,
+        discovered = self._select_latest_session_summary(
+            summaries,
             prefer_recent_since=state.last_input_ts,
         )
         if not discovered:
             return False
 
         session_id, _ = discovered
-        changed = False
+        if state.session_id == session_id:
+            return True
 
-        if state.session_id != session_id:
-            state.session_id = session_id
-            changed = True
-        if changed:
-            self._save_state()
-            logger.info(
-                "Auto-associated window %s -> session %s",
-                window_id,
-                session_id,
-            )
+        state.session_id = session_id
+        self._save_state()
+        logger.info(
+            "Auto-associated window %s -> session %s",
+            window_id,
+            session_id,
+        )
         return True
+
+    async def autodiscover_session_for_window(self, window_id: str) -> bool:
+        """Auto-associate transcript session metadata for one window binding."""
+        state = self.get_window_state(window_id)
+        cwd = state.cwd.strip()
+        if not cwd:
+            return False
+        summaries = self.list_codex_session_summaries_for_cwd(cwd)
+        return self._autodiscover_session_for_window_from_summaries(
+            window_id,
+            summaries,
+        )
 
     async def autodiscover_sessions_for_bound_windows(self) -> None:
         """Auto-associate sessions for all currently bound windows."""
         bound_window_ids = {
             window_id for _, _, _, window_id in self.iter_topic_window_bindings()
         }
+        summaries_by_cwd: dict[str, list[CodexSessionSummary]] = {}
         for window_id in bound_window_ids:
             try:
-                await self.autodiscover_session_for_window(window_id)
+                state = self.get_window_state(window_id)
+                cwd = state.cwd.strip()
+                if not cwd:
+                    continue
+                cwd_key = self._normalized_cwd_key(cwd)
+                summaries = summaries_by_cwd.get(cwd_key)
+                if summaries is None:
+                    summaries = self.list_codex_session_summaries_for_cwd(cwd)
+                    summaries_by_cwd[cwd_key] = summaries
+                self._autodiscover_session_for_window_from_summaries(
+                    window_id,
+                    summaries,
+                )
             except Exception as e:
                 logger.debug("Autodiscovery failed for window %s: %s", window_id, e)
 
@@ -1566,16 +1601,26 @@ class SessionManager:
         self, session_id: str, cwd: str
     ) -> SessionTranscript | None:
         """Get a session directly from session_id and cwd (no full scan)."""
-        file_path = self._build_session_file_path(session_id, cwd)
+        file_path = self._session_file_path_cache.get(session_id)
+        if file_path is not None and not file_path.exists():
+            self._session_file_path_cache.pop(session_id, None)
+            file_path = None
+
+        if file_path is None:
+            file_path = self._build_session_file_path(session_id, cwd)
 
         # Fallback: glob search if direct path doesn't exist
         if not file_path or not file_path.exists():
             matches = list(config.sessions_path.glob(f"**/*-{session_id}.jsonl"))
             if matches:
                 file_path = matches[0]
+                self._session_file_path_cache[session_id] = file_path
                 logger.debug("Found session via glob: %s", file_path)
             else:
+                self._session_file_path_cache.pop(session_id, None)
                 return None
+        else:
+            self._session_file_path_cache[session_id] = file_path
 
         # Single pass: read file once, extract summary + count messages
         summary = ""
