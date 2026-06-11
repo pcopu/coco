@@ -1418,9 +1418,10 @@ async def enqueue_status_update(
     thread_id: int | None = None,
 ) -> None:
     """Enqueue status update. Skipped if text unchanged or during flood control."""
-    # Don't enqueue during flood control — they'd just be dropped
+    # New status text is ephemeral, but clears are recovery work and should
+    # still be delivered after the flood window ends.
     flood_end = _flood_until.get(user_id, 0)
-    if flood_end > time.monotonic():
+    if status_text and flood_end > time.monotonic():
         return
 
     tid = thread_id or 0

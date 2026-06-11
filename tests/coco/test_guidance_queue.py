@@ -466,6 +466,35 @@ async def test_message_queue_worker_retries_progress_finalize_after_long_retry_a
 
 
 @pytest.mark.asyncio
+async def test_enqueue_status_clear_survives_active_flood_control(monkeypatch):
+    user_id = 303
+    current_time = {"value": 300.0}
+    monkeypatch.setattr(mq.time, "monotonic", lambda: current_time["value"])
+
+    queue = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    mq._flood_until[user_id] = current_time["value"] + 30.0
+
+    try:
+        await mq.enqueue_status_update(
+            object(),  # type: ignore[arg-type]
+            user_id,
+            "@303",
+            None,
+            thread_id=303,
+        )
+
+        item = queue.get_nowait()
+        assert item.task_type == "status_clear"
+        assert item.thread_id == 303
+    finally:
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._flood_until.pop(user_id, None)
+
+
+@pytest.mark.asyncio
 async def test_steer_message_keeps_progress_block_active(monkeypatch):
     events: list[tuple[str, str | None]] = []
 
