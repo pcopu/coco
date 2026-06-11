@@ -495,6 +495,37 @@ async def test_enqueue_status_clear_survives_active_flood_control(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sync_queued_topic_dock_edits_existing_message_in_place(monkeypatch):
+    user_id = 304
+    thread_id = 304
+    skey = (user_id, thread_id)
+    mq._queued_topic_inputs[skey] = [("second item", -100304, 1)]
+    mq._queue_dock_msg_info[skey] = (55, "⏳ Queue\n1. first item")
+    events: list[tuple[str, int]] = []
+
+    class _Bot:
+        async def edit_message_text(self, **kwargs):
+            events.append(("edit", kwargs["message_id"]))
+
+        async def delete_message(self, **kwargs):
+            events.append(("delete", kwargs["message_id"]))
+
+    async def _unexpected_send(*_args, **_kwargs):
+        raise AssertionError("queue dock refresh should edit in place, not send a replacement")
+
+    monkeypatch.setattr(mq.session_manager, "resolve_chat_id", lambda *_args, **_kwargs: -100304)
+    monkeypatch.setattr(mq, "send_with_fallback", _unexpected_send)
+
+    try:
+        await mq.sync_queued_topic_dock(_Bot(), user_id, thread_id, window_id="@304")  # type: ignore[arg-type]
+        assert events == [("edit", 55)]
+        assert mq._queue_dock_msg_info[skey] == (55, "⏳ Queue\n1. second item")
+    finally:
+        mq._queued_topic_inputs.pop(skey, None)
+        mq._queue_dock_msg_info.pop(skey, None)
+
+
+@pytest.mark.asyncio
 async def test_steer_message_keeps_progress_block_active(monkeypatch):
     events: list[tuple[str, str | None]] = []
 

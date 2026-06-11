@@ -292,6 +292,16 @@ async def sync_queued_topic_dock(
         msg_id, old_text = current_info
         if old_text == dock_text:
             return
+        edited = await _edit_queue_dock_message(
+            bot,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=msg_id,
+            text=dock_text,
+        )
+        if edited:
+            _queue_dock_msg_info[skey] = (msg_id, dock_text)
+            return
         _queue_dock_msg_info.pop(skey, None)
         try:
             sent = await send_with_fallback(

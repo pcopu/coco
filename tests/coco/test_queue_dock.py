@@ -8,7 +8,7 @@ import coco.handlers.message_queue as mq
 
 
 @pytest.mark.asyncio
-async def test_sync_queued_topic_dock_send_replace_delete(monkeypatch):
+async def test_sync_queued_topic_dock_edits_in_place_then_deletes_when_empty(monkeypatch):
     user_id = 17
     thread_id = 71
 
@@ -54,13 +54,13 @@ async def test_sync_queued_topic_dock_send_replace_delete(monkeypatch):
 
     mq.enqueue_queued_topic_input(user_id, thread_id, "second queued item", -100123, 2)
     await mq.sync_queued_topic_dock(fake_bot, user_id, thread_id, window_id="@1")
-    assert len(fake_bot.sent) == 2
-    assert not fake_bot.edited
-    assert len(fake_bot.deleted) == 1
-    assert fake_bot.sent[1][1].startswith("⏳ Queue")
+    assert len(fake_bot.sent) == 1
+    assert len(fake_bot.edited) == 1
+    assert not fake_bot.deleted
+    assert fake_bot.edited[0][2].startswith("⏳ Queue")
 
     mq.clear_queued_topic_inputs(user_id, thread_id)
     await mq.sync_queued_topic_dock(fake_bot, user_id, thread_id, window_id="@1")
-    assert len(fake_bot.deleted) == 2
+    assert len(fake_bot.deleted) == 1
 
     mq._queue_dock_msg_info.clear()
