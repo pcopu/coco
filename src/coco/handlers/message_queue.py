@@ -1203,10 +1203,12 @@ async def _do_send_progress_message(
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
 
     # Remove any orphaned progress message first.
-    old = _progress_msg_info.pop(skey, None)
+    old = _progress_msg_info.get(skey)
+    old_deleted = False
     if old:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
+            old_deleted = True
         except Exception:
             pass
 
@@ -1218,7 +1220,20 @@ async def _do_send_progress_message(
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
-        _progress_msg_info[skey] = (sent.message_id, window_id, accumulated_text)
+        if _progress_msg_info.get(skey) in {None, old}:
+            _progress_msg_info[skey] = (sent.message_id, window_id, accumulated_text)
+        else:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+            except Exception:
+                pass
+    elif old:
+        if old_deleted:
+            if _progress_msg_info.get(skey) == old:
+                _progress_msg_info.pop(skey, None)
+        else:
+            if _progress_msg_info.get(skey) in {None, old}:
+                _progress_msg_info[skey] = old
 
 
 async def _do_clear_progress_message(
@@ -1336,10 +1351,12 @@ async def _do_send_status_message(
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     # Safety net: delete any orphaned status message before sending a new one.
     # This catches edge cases where tracking was cleared without deleting the message.
-    old = _status_msg_info.pop(skey, None)
+    old = _status_msg_info.get(skey)
+    old_deleted = False
     if old:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
+            old_deleted = True
         except Exception:
             pass
     # Send typing indicator when Codex is working
@@ -1357,7 +1374,20 @@ async def _do_send_status_message(
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
-        _status_msg_info[skey] = (sent.message_id, window_id, text)
+        if _status_msg_info.get(skey) in {None, old}:
+            _status_msg_info[skey] = (sent.message_id, window_id, text)
+        else:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+            except Exception:
+                pass
+    elif old:
+        if old_deleted:
+            if _status_msg_info.get(skey) == old:
+                _status_msg_info.pop(skey, None)
+        else:
+            if _status_msg_info.get(skey) in {None, old}:
+                _status_msg_info[skey] = old
 
 
 async def _do_clear_status_message(

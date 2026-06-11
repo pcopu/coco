@@ -355,6 +355,142 @@ async def test_convert_status_to_content_deletes_orphan_when_all_edits_fail(monk
 
 
 @pytest.mark.asyncio
+async def test_do_send_status_message_preserves_old_tracking_when_delete_and_send_fail(monkeypatch):
+    user_id = 103
+    thread_id = 104
+    skey = (user_id, thread_id)
+    mq._status_msg_info[skey] = (7007, "@13", "old status")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            raise Exception("delete failed")
+
+        async def send_chat_action(self, **_kwargs):
+            return True
+
+    async def _send_none(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100906,
+    )
+    monkeypatch.setattr(mq, "send_with_fallback", _send_none)
+
+    await mq._do_send_status_message(
+        _Bot(),
+        user_id,
+        thread_id,
+        "@13",
+        "new status",
+    )
+
+    assert mq._status_msg_info[skey] == (7007, "@13", "old status")
+
+
+@pytest.mark.asyncio
+async def test_do_send_progress_message_preserves_old_tracking_when_delete_and_send_fail(monkeypatch):
+    user_id = 105
+    thread_id = 106
+    skey = (user_id, thread_id)
+    mq._progress_msg_info[skey] = (7008, "@14", "old progress")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            raise Exception("delete failed")
+
+    async def _send_none(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100907,
+    )
+    monkeypatch.setattr(mq, "send_with_fallback", _send_none)
+
+    await mq._do_send_progress_message(
+        _Bot(),
+        user_id,
+        thread_id,
+        "@14",
+        "new progress",
+    )
+
+    assert mq._progress_msg_info[skey] == (7008, "@14", "old progress")
+
+
+@pytest.mark.asyncio
+async def test_do_send_status_message_does_not_clobber_newer_tracking_on_send_failure(monkeypatch):
+    user_id = 107
+    thread_id = 108
+    skey = (user_id, thread_id)
+    mq._status_msg_info[skey] = (7009, "@15", "old status")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            return True
+
+        async def send_chat_action(self, **_kwargs):
+            return True
+
+    async def _send_none(*_args, **_kwargs):
+        mq._status_msg_info[skey] = (7010, "@15", "newer status")
+        return None
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100908,
+    )
+    monkeypatch.setattr(mq, "send_with_fallback", _send_none)
+
+    await mq._do_send_status_message(
+        _Bot(),
+        user_id,
+        thread_id,
+        "@15",
+        "replacement status",
+    )
+
+    assert mq._status_msg_info[skey] == (7010, "@15", "newer status")
+
+
+@pytest.mark.asyncio
+async def test_do_send_progress_message_does_not_clobber_newer_tracking_on_send_failure(monkeypatch):
+    user_id = 109
+    thread_id = 110
+    skey = (user_id, thread_id)
+    mq._progress_msg_info[skey] = (7011, "@16", "old progress")
+
+    class _Bot:
+        async def delete_message(self, *, chat_id: int, message_id: int):
+            return True
+
+    async def _send_none(*_args, **_kwargs):
+        mq._progress_msg_info[skey] = (7012, "@16", "newer progress")
+        return None
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100909,
+    )
+    monkeypatch.setattr(mq, "send_with_fallback", _send_none)
+
+    await mq._do_send_progress_message(
+        _Bot(),
+        user_id,
+        thread_id,
+        "@16",
+        "replacement progress",
+    )
+
+    assert mq._progress_msg_info[skey] == (7012, "@16", "newer progress")
+
+
+@pytest.mark.asyncio
 async def test_enqueue_progress_update_coalesces_trailing_pending_updates():
     user_id = 201
     thread_id = 202
