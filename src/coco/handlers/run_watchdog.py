@@ -134,7 +134,7 @@ def _load_retry_state(now: float | None = None) -> None:
     if not isinstance(payload, dict):
         return
 
-    ts = now if now is not None else time.monotonic()
+    ts = now if now is not None else time.time()
     for key, raw in payload.items():
         if not isinstance(key, str) or not isinstance(raw, dict):
             continue
@@ -174,7 +174,7 @@ def _save_retry_state() -> None:
 
 def _prune_retry_state(now: float | None = None) -> None:
     _load_retry_state(now)
-    ts = now if now is not None else time.monotonic()
+    ts = now if now is not None else time.time()
     stale_keys = []
     for key, raw in _run_watch_retry_state.items():
         try:
@@ -220,7 +220,7 @@ def _set_persisted_retry_count(
             _save_retry_state()
         return
 
-    ts = now if now is not None else time.monotonic()
+    ts = now if now is not None else time.time()
     _run_watch_retry_state[key] = {
         "count": normalized,
         "updated_at": ts,
@@ -248,9 +248,11 @@ def note_run_started(
     pending_text: str = "",
     expect_response: bool = False,
     now: float | None = None,
+    persisted_now: float | None = None,
 ) -> None:
     """Start/reset pending-response tracking for a topic turn."""
     ts = now if now is not None else time.monotonic()
+    persisted_ts = persisted_now if persisted_now is not None else time.time()
     skey = _topic_key(user_id, thread_id)
 
     text = pending_text.strip()
@@ -267,7 +269,7 @@ def note_run_started(
     persisted_retries = _get_persisted_retry_count(
         skey,
         pending_fingerprint,
-        now=ts,
+        now=persisted_ts,
     )
     _run_watch_state[skey] = RunWatchState(
         window_id=window_id,
@@ -381,9 +383,10 @@ def note_auto_retry_attempt(
     thread_id: int | None,
     window_id: str,
     now: float | None = None,
+    persisted_now: float | None = None,
 ) -> tuple[int, int]:
     """Increment and persist auto-retry attempt count for the active topic."""
-    ts = now if now is not None else time.monotonic()
+    persisted_ts = persisted_now if persisted_now is not None else time.time()
     skey = _topic_key(user_id, thread_id)
     state = _run_watch_state.get(skey)
     if not state:
@@ -423,7 +426,7 @@ def note_auto_retry_attempt(
         skey,
         state.pending_fingerprint,
         state.retry_count,
-        now=ts,
+        now=persisted_ts,
     )
     emit_telemetry(
         "watchdog.retry_attempt",

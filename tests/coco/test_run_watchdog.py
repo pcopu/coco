@@ -222,6 +222,91 @@ def test_retry_count_persists_for_same_text_across_restart():
     assert due_30[0].retry_count == 2
 
 
+def test_retry_count_persists_from_epoch_timestamp_across_restart_when_monotonic_resets():
+    _clear()
+    watchdog.note_run_started(
+        user_id=16,
+        thread_id=160,
+        window_id="@16",
+        source="user_input",
+        expect_response=True,
+        pending_text="carry retry state",
+        now=50000.0,
+        persisted_now=1_700_000_000.0,
+    )
+    watchdog.get_due_run_checks(
+        user_id=16,
+        thread_id=160,
+        window_id="@16",
+        now=50030.0,
+    )
+    watchdog.note_auto_retry_attempt(
+        user_id=16,
+        thread_id=160,
+        window_id="@16",
+        now=50030.1,
+        persisted_now=1_700_000_030.1,
+    )
+
+    watchdog.reset_run_watchdog_for_tests(clear_persisted=False)
+
+    watchdog.note_run_started(
+        user_id=16,
+        thread_id=160,
+        window_id="@16",
+        source="user_input",
+        expect_response=True,
+        pending_text="carry retry state",
+        now=1000.0,
+        persisted_now=1_700_000_060.0,
+    )
+    due_30 = watchdog.get_due_run_checks(
+        user_id=16,
+        thread_id=160,
+        window_id="@16",
+        now=1030.0,
+    )
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+    assert due_30[0].auto_retry_allowed is True
+    assert due_30[0].retry_count == 1
+
+
+def test_legacy_monotonic_retry_state_is_discarded_after_restart():
+    _clear()
+    fingerprint = watchdog._fingerprint_text("carry retry state")
+    retry_key = watchdog._retry_key((17, 170), fingerprint)
+    watchdog._RUN_RETRY_STATE_FILE.write_text(
+        (
+            "{\n"
+            f'  "{retry_key}": {{"count": 2, "updated_at": 50030.1}}\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    watchdog.reset_run_watchdog_for_tests(clear_persisted=False)
+
+    watchdog.note_run_started(
+        user_id=17,
+        thread_id=170,
+        window_id="@17",
+        source="user_input",
+        expect_response=True,
+        pending_text="carry retry state",
+        now=1000.0,
+        persisted_now=1_700_000_060.0,
+    )
+    due_30 = watchdog.get_due_run_checks(
+        user_id=17,
+        thread_id=170,
+        window_id="@17",
+        now=1030.0,
+    )
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+    assert due_30[0].auto_retry_allowed is True
+    assert due_30[0].retry_count == 0
+
+
 def test_activity_clears_pending_state_and_retry_counter():
     _clear()
     watchdog.note_run_started(
