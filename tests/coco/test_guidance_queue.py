@@ -491,6 +491,91 @@ async def test_do_send_progress_message_does_not_clobber_newer_tracking_on_send_
 
 
 @pytest.mark.asyncio
+async def test_status_update_edit_fallback_does_not_preemptively_drop_tracking(monkeypatch):
+    user_id = 111
+    thread_id = 112
+    skey = (user_id, thread_id)
+    mq._status_msg_info[skey] = (7013, "@17", "old status")
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs):
+            raise Exception("cannot edit")
+
+        async def send_chat_action(self, **_kwargs):
+            return True
+
+    observed_before_send: list[tuple[int, str, str] | None] = []
+
+    async def _fake_send_status(_bot, _user_id, tid, wid, text):
+        observed_before_send.append(mq._status_msg_info.get((user_id, tid)))
+        mq._status_msg_info[(user_id, tid)] = (7014, wid, text)
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100910,
+    )
+    monkeypatch.setattr(mq, "_do_send_status_message", _fake_send_status)
+
+    await mq._process_status_update_task(
+        _Bot(),
+        user_id,
+        mq.MessageTask(
+            task_type="status_update",
+            text="new status",
+            window_id="@17",
+            thread_id=thread_id,
+        ),
+    )
+
+    assert observed_before_send == [(7013, "@17", "old status")]
+    assert mq._status_msg_info[skey] == (7014, "@17", "new status")
+
+
+@pytest.mark.asyncio
+async def test_progress_update_edit_fallback_does_not_preemptively_drop_tracking(monkeypatch):
+    user_id = 113
+    thread_id = 114
+    skey = (user_id, thread_id)
+    mq._progress_msg_info[skey] = (7015, "@18", "old progress")
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs):
+            raise Exception("cannot edit")
+
+    async def _noop_clear_status(*_args, **_kwargs):
+        return None
+
+    observed_before_send: list[tuple[int, str, str] | None] = []
+
+    async def _fake_send_progress(_bot, _user_id, tid, wid, accumulated_text, **_kwargs):
+        observed_before_send.append(mq._progress_msg_info.get((user_id, tid)))
+        mq._progress_msg_info[(user_id, tid)] = (7016, wid, accumulated_text)
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100911,
+    )
+    monkeypatch.setattr(mq, "_do_clear_status_message", _noop_clear_status)
+    monkeypatch.setattr(mq, "_do_send_progress_message", _fake_send_progress)
+
+    await mq._process_progress_update_task(
+        _Bot(),
+        user_id,
+        mq.MessageTask(
+            task_type="progress_update",
+            text=" plus more",
+            window_id="@18",
+            thread_id=thread_id,
+        ),
+    )
+
+    assert observed_before_send == [(7015, "@18", "old progress")]
+    assert mq._progress_msg_info[skey] == (7016, "@18", "old progress plus more")
+
+
+@pytest.mark.asyncio
 async def test_enqueue_progress_update_coalesces_trailing_pending_updates():
     user_id = 201
     thread_id = 202

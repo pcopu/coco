@@ -1061,7 +1061,6 @@ async def _process_progress_update_task(
                     _progress_msg_info[skey] = (msg_id, wid, updated)
                     return
                 logger.debug(f"Failed to edit progress message: {plain_error}")
-                _progress_msg_info.pop(skey, None)
                 await _do_send_progress_message(
                     bot, user_id, tid, wid, updated, chat_id=chat_id
                 )
@@ -1331,7 +1330,6 @@ async def _process_status_update_task(
                     raise
                 except Exception as e:
                     logger.debug(f"Failed to edit status message: {e}")
-                    _status_msg_info.pop(skey, None)
                     await _do_send_status_message(bot, user_id, tid, wid, status_text)
     else:
         # No existing status message, send new
