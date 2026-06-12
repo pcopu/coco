@@ -58,6 +58,8 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+TOPIC_PROBE_PERMISSION_BACKOFF = 15 * 60.0  # seconds
+_topic_probe_retry_after: dict[tuple[int, int], float] = {}
 
 WATCHDOG_ACTIVE_TURN_KEEPALIVE_EMOJIS: tuple[str, ...] = (
     "👀",
@@ -772,6 +774,103 @@ async def update_status_message(
         await clear_interactive_msg(user_id, bot, thread_id)
 
 
+def _topic_probe_key(chat_id: int, thread_id: int | None) -> tuple[int, int]:
+    return chat_id, thread_id or 0
+
+
+def _is_topic_probe_permission_error(exc: BadRequest) -> bool:
+    text = str(exc).lower()
+    return "not enough rights" in text and "pinned" in text
+
+
+async def _probe_topic_bindings(
+    bot: Bot,
+    bindings: list[tuple[int, int | None, int, str]],
+    *,
+    now: float,
+) -> None:
+    probe_targets: dict[
+        tuple[int, int],
+        tuple[int, int | None, list[tuple[int, int | None, int, str]]],
+    ] = {}
+    for user_id, chat_id, thread_id, wid in bindings:
+        try:
+            resolved_chat_id = (
+                session_manager.resolve_chat_id(user_id, thread_id)
+                if chat_id is None
+                else session_manager.resolve_chat_id(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
+            )
+        except Exception as exc:
+            logger.debug("Skipping topic probe for %s: %s", wid, exc)
+            continue
+        key = _topic_probe_key(resolved_chat_id, thread_id)
+        target = probe_targets.get(key)
+        if target is None:
+            probe_targets[key] = (resolved_chat_id, thread_id, [(user_id, chat_id, thread_id, wid)])
+        else:
+            target[2].append((user_id, chat_id, thread_id, wid))
+
+    active_probe_keys = set(probe_targets)
+    for key in list(_topic_probe_retry_after):
+        if key not in active_probe_keys:
+            _topic_probe_retry_after.pop(key, None)
+
+    for key, (resolved_chat_id, thread_id, target_bindings) in probe_targets.items():
+        retry_after = _topic_probe_retry_after.get(key, 0.0)
+        if retry_after > now:
+            continue
+        try:
+            await bot.unpin_all_forum_topic_messages(
+                chat_id=resolved_chat_id,
+                message_thread_id=thread_id,
+            )
+            _topic_probe_retry_after.pop(key, None)
+        except BadRequest as e:
+            if "Topic_id_invalid" in str(e):
+                _topic_probe_retry_after.pop(key, None)
+                for user_id, chat_id, bound_thread_id, wid in target_bindings:
+                    # Topic deleted: unbind and clean up state.
+                    if chat_id is None:
+                        session_manager.unbind_thread(user_id, bound_thread_id)
+                    else:
+                        session_manager.unbind_thread(
+                            user_id,
+                            bound_thread_id,
+                            chat_id=chat_id,
+                        )
+                    await clear_topic_state(user_id, bound_thread_id, bot)
+                    logger.info(
+                        "Topic deleted: unbound window_id '%s' "
+                        "for thread %d user %d",
+                        wid,
+                        bound_thread_id,
+                        user_id,
+                    )
+            elif _is_topic_probe_permission_error(e):
+                _topic_probe_retry_after[key] = now + TOPIC_PROBE_PERMISSION_BACKOFF
+                logger.debug(
+                    "Topic probe permission error for %s: %s",
+                    target_bindings[0][3],
+                    e,
+                )
+            else:
+                logger.debug(
+                    "Topic probe error for %s: %s",
+                    target_bindings[0][3],
+                    e,
+                )
+        except Exception as e:
+            logger.debug(
+                "Topic probe error for %s: %s",
+                target_bindings[0][3],
+                e,
+            )
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
@@ -816,52 +915,7 @@ async def status_poll_loop(bot: Bot) -> None:
             # Periodic topic existence probe
             if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
                 last_topic_check = now
-                for user_id, chat_id, thread_id, wid in bindings:
-                    try:
-                        resolved_chat_id = (
-                            session_manager.resolve_chat_id(user_id, thread_id)
-                            if chat_id is None
-                            else session_manager.resolve_chat_id(
-                                user_id,
-                                thread_id,
-                                chat_id=chat_id,
-                            )
-                        )
-                        await bot.unpin_all_forum_topic_messages(
-                            chat_id=resolved_chat_id,
-                            message_thread_id=thread_id,
-                        )
-                    except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
-                            # Topic deleted — unbind and clean up state.
-                            if chat_id is None:
-                                session_manager.unbind_thread(user_id, thread_id)
-                            else:
-                                session_manager.unbind_thread(
-                                    user_id,
-                                    thread_id,
-                                    chat_id=chat_id,
-                                )
-                            await clear_topic_state(user_id, thread_id, bot)
-                            logger.info(
-                                "Topic deleted: unbound window_id '%s' "
-                                "for thread %d user %d",
-                                wid,
-                                thread_id,
-                                user_id,
-                            )
-                        else:
-                            logger.debug(
-                                "Topic probe error for %s: %s",
-                                wid,
-                                e,
-                            )
-                    except Exception as e:
-                        logger.debug(
-                            "Topic probe error for %s: %s",
-                            wid,
-                            e,
-                        )
+                await _probe_topic_bindings(bot, bindings, now=now)
 
             for user_id, chat_id, thread_id, wid in bindings:
                 try:

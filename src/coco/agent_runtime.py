@@ -11,7 +11,7 @@ from .codex_app_server import codex_app_server_client
 from .config import config
 from .controller_rpc import ControllerRpcClient
 from .node_registry import node_registry
-from .tts_runtime import ensure_tts_server_started, stop_tts_server
+from .tts_runtime import stop_tts_server
 
 
 logger = logging.getLogger(__name__)
@@ -34,11 +34,6 @@ async def run_agent_async() -> None:
     logger.info("Tailnet name: %s", config.tailnet_name or "<unset>")
     logger.info("Sessions path: %s", config.sessions_path)
     logger.info("Assistant command: %s", config.assistant_command)
-
-    try:
-        await ensure_tts_server_started()
-    except Exception as exc:
-        logger.warning("Managed local TTS startup failed on agent: %s", exc)
 
     node_registry.ensure_local_node(transport="agent_rpc")
     server = AgentRpcServer(shared_secret=config.cluster_shared_secret)

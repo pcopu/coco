@@ -1588,6 +1588,29 @@ class SessionManager:
         """Clear active Codex turn id for a window."""
         self.set_window_codex_active_turn_id(window_id, "")
 
+    def clear_window_codex_turns_for_machine(self, machine_id: str) -> int:
+        """Clear active Codex turn ids for windows bound to one machine."""
+        target_machine_id = machine_id.strip()
+        local_machine_id, _local_machine_name = self._local_machine_identity()
+        if not target_machine_id:
+            target_machine_id = local_machine_id
+
+        cleared = 0
+        for window_id, state in self.window_states.items():
+            if not state.codex_active_turn_id:
+                continue
+            bound_machine_id = self.get_window_machine_id(window_id)
+            if bound_machine_id:
+                if bound_machine_id != target_machine_id:
+                    continue
+            elif target_machine_id != local_machine_id:
+                continue
+            state.codex_active_turn_id = ""
+            cleared += 1
+        if cleared:
+            self._save_state()
+        return cleared
+
     def _build_session_file_path(self, session_id: str, cwd: str) -> Path | None:
         """Return direct transcript path when it can be derived cheaply.
 

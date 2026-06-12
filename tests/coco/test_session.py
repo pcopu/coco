@@ -173,6 +173,49 @@ class TestTopicBindingsV2:
         assert mgr.resolve_topic_binding(100, 1) is None
         assert mgr.get_window_for_thread(100, 1) is None
 
+    def test_clear_window_codex_turns_for_machine_preserves_remote_turns(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local Node"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="local-thread",
+            window_id="@local",
+            cwd="/tmp/local",
+            machine_id="local-node",
+            machine_display_name="Local Node",
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=2,
+            codex_thread_id="remote-thread",
+            window_id="@remote",
+            cwd="/tmp/remote",
+            machine_id="remote-node",
+            machine_display_name="Remote Node",
+        )
+        mgr.get_window_state("@local").codex_active_turn_id = "local-turn"
+        mgr.get_window_state("@remote").codex_active_turn_id = "remote-turn"
+        mgr.get_window_state("@unbound").codex_active_turn_id = "legacy-local-turn"
+        save_calls = 0
+
+        def _save_state():
+            nonlocal save_calls
+            save_calls += 1
+
+        monkeypatch.setattr(mgr, "_save_state", _save_state)
+
+        assert mgr.clear_window_codex_turns_for_machine("local-node") == 2
+        assert mgr.get_window_state("@local").codex_active_turn_id == ""
+        assert mgr.get_window_state("@remote").codex_active_turn_id == "remote-turn"
+        assert mgr.get_window_state("@unbound").codex_active_turn_id == ""
+        assert save_calls == 1
+
     def test_set_window_codex_thread_id_syncs_topic_binding(
         self, mgr: SessionManager
     ) -> None:

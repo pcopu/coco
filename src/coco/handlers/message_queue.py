@@ -81,6 +81,39 @@ _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
 _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 _active_delivery_topics: dict[int, set[int]] = {}
+_queued_delivery_topic_counts: dict[int, dict[int, int]] = {}
+
+
+def _track_queued_task(user_id: int, task: MessageTask) -> None:
+    """Track a task that is semantically waiting in a user's queue."""
+    topic_id = task.thread_id or 0
+    counts = _queued_delivery_topic_counts.setdefault(user_id, {})
+    counts[topic_id] = counts.get(topic_id, 0) + 1
+
+
+def _untrack_queued_task(user_id: int, task: MessageTask) -> None:
+    """Remove one semantically queued task from the topic index."""
+    counts = _queued_delivery_topic_counts.get(user_id)
+    if not counts:
+        return
+    topic_id = task.thread_id or 0
+    remaining = counts.get(topic_id, 0) - 1
+    if remaining > 0:
+        counts[topic_id] = remaining
+        return
+    counts.pop(topic_id, None)
+    if not counts:
+        _queued_delivery_topic_counts.pop(user_id, None)
+
+
+def _put_queued_task(
+    user_id: int,
+    queue: asyncio.Queue[MessageTask],
+    task: MessageTask,
+) -> None:
+    """Put a new semantic task in the queue and update the topic index."""
+    queue.put_nowait(task)
+    _track_queued_task(user_id, task)
 
 # Map (tool_use_id, user_id, thread_id_or_0) -> telegram message_id
 # for editing tool_use messages with results
@@ -128,14 +161,10 @@ def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
 async def get_pending_delivery_topics(user_id: int) -> set[int]:
     """Return topic ids with in-flight or queued delivery work for one user."""
     pending_topics = set(_active_delivery_topics.get(user_id, set()))
-
-    queue = _message_queues.get(user_id)
-    lock = _queue_locks.get(user_id)
-    if queue is None or lock is None:
-        return pending_topics
-
-    async with lock:
-        pending_topics.update((task.thread_id or 0) for task in getattr(queue, "_queue", ()))
+    if user_id in _message_queues:
+        pending_topics.update(_queued_delivery_topic_counts.get(user_id, ()))
+    else:
+        _queued_delivery_topic_counts.pop(user_id, None)
     return pending_topics
 
 
@@ -399,12 +428,14 @@ def _task_survives_flood_pause(task_type: str) -> bool:
 async def _requeue_task_front(
     queue: asyncio.Queue[MessageTask],
     lock: asyncio.Lock,
+    *,
+    user_id: int,
     task: MessageTask,
 ) -> None:
     """Requeue one in-flight task at the front while preserving queue counters."""
     async with lock:
         retained = _inspect_queue(queue)
-        queue.put_nowait(task)
+        _put_queued_task(user_id, queue, task)
         for item in retained:
             queue.put_nowait(item)
             queue.task_done()
@@ -413,6 +444,8 @@ async def _requeue_task_front(
 def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
     if base.window_id != candidate.window_id:
+        return False
+    if (base.thread_id or 0) != (candidate.thread_id or 0):
         return False
     if candidate.task_type != "content":
         return False
@@ -436,6 +469,8 @@ async def _merge_content_tasks(
     queue: asyncio.Queue[MessageTask],
     first: MessageTask,
     lock: asyncio.Lock,
+    *,
+    user_id: int,
 ) -> tuple[MessageTask, int]:
     """Merge consecutive content tasks from queue.
 
@@ -472,6 +507,7 @@ async def _merge_content_tasks(
             merged_parts.extend(task.parts)
             current_length += task_length
             merge_count += 1
+            _untrack_queued_task(user_id, task)
 
         # Put remaining items back into the queue
         for item in remaining:
@@ -509,6 +545,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
     while True:
         try:
             task = await queue.get()
+            _untrack_queued_task(user_id, task)
+            task_to_retry = task
             topic_key = task.thread_id or 0
             _active_delivery_topics.setdefault(user_id, set()).add(topic_key)
             try:
@@ -536,8 +574,9 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                 if task.task_type == "content":
                     # Try to merge consecutive content tasks
                     merged_task, merge_count = await _merge_content_tasks(
-                        queue, task, lock
+                        queue, task, lock, user_id=user_id
                     )
+                    task_to_retry = merged_task
                     if merge_count > 0:
                         logger.debug(f"Merged {merge_count} tasks for user {user_id}")
                         # Mark merged tasks as done
@@ -567,7 +606,12 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     time.monotonic() + retry_secs,
                 )
                 if _task_survives_flood_pause(task.task_type):
-                    await _requeue_task_front(queue, lock, task)
+                    await _requeue_task_front(
+                        queue,
+                        lock,
+                        user_id=user_id,
+                        task=task_to_retry,
+                    )
                 if retry_secs > FLOOD_CONTROL_MAX_WAIT:
                     logger.warning(
                         "Flood control for user %d: retry_after=%ds, "
@@ -621,6 +665,8 @@ def _can_coalesce_progress_task(base: MessageTask, candidate: MessageTask) -> bo
 async def _enqueue_progress_update_coalesced(
     queue: asyncio.Queue[MessageTask],
     lock: asyncio.Lock,
+    *,
+    user_id: int,
     task: MessageTask,
 ) -> None:
     """Enqueue progress update while coalescing trailing pending progress tasks.
@@ -650,10 +696,11 @@ async def _enqueue_progress_update_coalesced(
 
         # Dropped pending progress tasks were already counted as unfinished; mark
         # them as done now so queue.join() cannot deadlock.
-        for _ in collapsed:
+        for pending in collapsed:
+            _untrack_queued_task(user_id, pending)
             queue.task_done()
 
-        queue.put_nowait(task)
+        _put_queued_task(user_id, queue, task)
 
 
 def _merge_progress_text(existing: str, new_chunk: str) -> str:
@@ -1460,7 +1507,7 @@ async def enqueue_content_message(
         video_data=video_data,
         response_mode_override=response_mode_override,
     )
-    queue.put_nowait(task)
+    _put_queued_task(user_id, queue, task)
 
 
 async def enqueue_status_update(
@@ -1502,7 +1549,7 @@ async def enqueue_status_update(
     else:
         task = MessageTask(task_type="status_clear", thread_id=thread_id)
 
-    queue.put_nowait(task)
+    _put_queued_task(user_id, queue, task)
 
 
 async def enqueue_progress_update(
@@ -1534,7 +1581,7 @@ async def enqueue_progress_update(
         window_id=window_id,
         thread_id=thread_id,
     )
-    await _enqueue_progress_update_coalesced(queue, lock, task)
+    await _enqueue_progress_update_coalesced(queue, lock, user_id=user_id, task=task)
 
 
 async def enqueue_progress_start(
@@ -1554,7 +1601,7 @@ async def enqueue_progress_start(
         window_id=window_id,
         thread_id=thread_id,
     )
-    queue.put_nowait(task)
+    _put_queued_task(user_id, queue, task)
 
 
 async def enqueue_progress_clear(
@@ -1566,7 +1613,7 @@ async def enqueue_progress_clear(
     _clear_progress_text_cache(user_id, thread_id)
     queue = get_or_create_queue(bot, user_id)
     task = MessageTask(task_type="progress_clear", thread_id=thread_id)
-    queue.put_nowait(task)
+    _put_queued_task(user_id, queue, task)
 
 
 async def enqueue_progress_finalize(
@@ -1585,7 +1632,7 @@ async def enqueue_progress_finalize(
         thread_id=thread_id,
         finalize_mode="compact" if compact else "full",
     )
-    queue.put_nowait(task)
+    _put_queued_task(user_id, queue, task)
 
 
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
@@ -1715,5 +1762,6 @@ async def shutdown_workers() -> None:
     _message_queues.clear()
     _queue_locks.clear()
     _active_delivery_topics.clear()
+    _queued_delivery_topic_counts.clear()
     _queue_dock_msg_info.clear()
     logger.info("Message queue workers stopped")

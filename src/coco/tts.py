@@ -21,6 +21,18 @@ async def _ensure_tts_runtime_started() -> None:
     await ensure_tts_server_started()
 
 
+def _begin_tts_runtime_usage() -> None:
+    from .tts_runtime import begin_tts_server_usage
+
+    begin_tts_server_usage()
+
+
+def _end_tts_runtime_usage() -> None:
+    from .tts_runtime import end_tts_server_usage
+
+    end_tts_server_usage()
+
+
 def _tts_base_url() -> str:
     return env_alias("COCO_TTS_BASE_URL", default="http://127.0.0.1:7788").strip()
 
@@ -109,33 +121,37 @@ async def synthesize_voice_note(text: str) -> tuple[str, bytes]:
     if not normalized:
         raise TtsError("text to synthesize cannot be empty")
 
+    _begin_tts_runtime_usage()
     try:
-        await _ensure_tts_runtime_started()
-    except Exception as exc:
-        raise TtsError(f"local TTS runtime unavailable: {exc}") from exc
+        try:
+            await _ensure_tts_runtime_started()
+        except Exception as exc:
+            raise TtsError(f"local TTS runtime unavailable: {exc}") from exc
 
-    payload: dict[str, object] = {
-        "model": "supertonic-3",
-        "voice": _tts_voice(),
-        "input": normalized,
-        "response_format": "wav",
-        "language": _tts_language(),
-        "speed": _tts_speed(),
-    }
+        payload: dict[str, object] = {
+            "model": "supertonic-3",
+            "voice": _tts_voice(),
+            "input": normalized,
+            "response_format": "wav",
+            "language": _tts_language(),
+            "speed": _tts_speed(),
+        }
 
-    try:
-        async with httpx.AsyncClient(base_url=_tts_base_url(), timeout=30.0) as client:
-            response = await client.post("/v1/audio/speech", json=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        details = exc.response.text.strip() if exc.response is not None else ""
-        raise TtsError(details or str(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise TtsError(str(exc)) from exc
+        try:
+            async with httpx.AsyncClient(base_url=_tts_base_url(), timeout=30.0) as client:
+                response = await client.post("/v1/audio/speech", json=payload)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            details = exc.response.text.strip() if exc.response is not None else ""
+            raise TtsError(details or str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise TtsError(str(exc)) from exc
 
-    try:
-        voice_bytes = _prepare_voice_note_audio(response.content)
-    except Exception as exc:
-        raise TtsError(f"failed to prepare voice note audio: {exc}") from exc
+        try:
+            voice_bytes = _prepare_voice_note_audio(response.content)
+        except Exception as exc:
+            raise TtsError(f"failed to prepare voice note audio: {exc}") from exc
+    finally:
+        _end_tts_runtime_usage()
 
     return "audio/ogg", voice_bytes

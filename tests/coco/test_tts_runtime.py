@@ -157,6 +157,105 @@ async def test_stop_tts_server_terminates_managed_process(monkeypatch):
     assert tts_runtime._tts_server_process is None
 
 
+@pytest.mark.asyncio
+async def test_stop_tts_server_waits_for_in_progress_start(monkeypatch):
+    events: list[str] = []
+    spawned = asyncio.Event()
+    allow_health = asyncio.Event()
+
+    monkeypatch.setattr(tts_runtime, "_tts_base_url", lambda: "http://127.0.0.1:7788")
+    monkeypatch.setattr(tts_runtime, "_resolve_tts_command", lambda: ["supertonic", "serve"])
+    monkeypatch.setattr(tts_runtime, "_tts_binary_exists", lambda: True)
+    monkeypatch.setattr(tts_runtime, "_tts_server_start_timeout", lambda: 5.0)
+    monkeypatch.setattr(tts_runtime, "_tts_server_poll_interval", lambda: 0.0)
+    monkeypatch.setattr(tts_runtime, "_tts_server_process", None)
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            events.append("terminate")
+            self.returncode = 0
+
+        def kill(self):
+            events.append("kill")
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            events.append(f"wait:{timeout}")
+            return 0
+
+    def _fake_popen(*_args, **_kwargs):
+        events.append("spawn")
+        spawned.set()
+        return _FakeProc()
+
+    async def _fake_health() -> bool:
+        if not spawned.is_set():
+            return False
+        await allow_health.wait()
+        return True
+
+    async def _run_start() -> None:
+        await tts_runtime.ensure_tts_server_started()
+        events.append("start_done")
+
+    monkeypatch.setattr(tts_runtime.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(tts_runtime, "is_tts_server_healthy", _fake_health)
+
+    start_task = asyncio.create_task(_run_start())
+    await asyncio.wait_for(spawned.wait(), timeout=1.0)
+    stop_task = asyncio.create_task(tts_runtime.stop_tts_server())
+    await asyncio.sleep(0)
+
+    try:
+        assert "terminate" not in events
+    finally:
+        allow_health.set()
+        await asyncio.gather(start_task, stop_task)
+
+    assert events.index("start_done") < events.index("terminate")
+
+
+@pytest.mark.asyncio
+async def test_tts_usage_stops_managed_server_after_idle_timeout(monkeypatch):
+    calls: list[str] = []
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append("terminate")
+            self.returncode = 0
+
+        def kill(self):
+            calls.append("kill")
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            calls.append(f"wait:{timeout}")
+            return 0
+
+    monkeypatch.setattr(tts_runtime, "_tts_server_process", _FakeProc())
+    monkeypatch.setattr(tts_runtime, "_is_local_managed_base_url", lambda: True)
+    monkeypatch.setattr(tts_runtime, "_tts_idle_timeout_seconds", lambda: 0.01)
+
+    tts_runtime.begin_tts_server_usage()
+    tts_runtime.end_tts_server_usage()
+    await asyncio.sleep(0.05)
+
+    assert calls == ["terminate", "wait:5.0"]
+    assert tts_runtime._tts_server_process is None
+
+
 def test_resolve_tts_command_prefers_virtualenv_bin(monkeypatch, tmp_path):
     venv_dir = tmp_path / "venv"
     bin_dir = venv_dir / "bin"

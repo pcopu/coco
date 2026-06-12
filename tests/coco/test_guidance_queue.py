@@ -747,6 +747,219 @@ async def test_enqueue_progress_update_keeps_non_progress_tail():
 
 
 @pytest.mark.asyncio
+async def test_progress_update_coalescing_keeps_pending_topic_index_single():
+    user_id = 205
+    thread_id = 206
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+
+    try:
+        await mq.enqueue_progress_update(
+            bot=object(),  # type: ignore[arg-type]
+            user_id=user_id,
+            window_id="@4",
+            progress_text="Ready",
+            thread_id=thread_id,
+        )
+        await mq.enqueue_progress_update(
+            bot=object(),  # type: ignore[arg-type]
+            user_id=user_id,
+            window_id="@4",
+            progress_text=" to help",
+            thread_id=thread_id,
+        )
+
+        assert mq._queued_delivery_topic_counts[user_id] == {thread_id: 1}
+        assert await mq.get_pending_delivery_topics(user_id) == {thread_id}
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._progress_text_cache.pop((user_id, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_merge_content_tasks_removes_merged_tasks_from_pending_topic_index():
+    user_id = 207
+    thread_id = 208
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    first = mq.MessageTask(
+        task_type="content",
+        window_id="@5",
+        thread_id=thread_id,
+        parts=["hello"],
+    )
+    mergeable = mq.MessageTask(
+        task_type="content",
+        window_id="@5",
+        thread_id=thread_id,
+        parts=[" world"],
+    )
+    retained = mq.MessageTask(
+        task_type="status_update",
+        window_id="@5",
+        thread_id=thread_id,
+        text="working",
+    )
+
+    try:
+        mq._put_queued_task(user_id, queue, mergeable)
+        mq._put_queued_task(user_id, queue, retained)
+
+        merged, merge_count = await mq._merge_content_tasks(
+            queue,
+            first,
+            lock,
+            user_id=user_id,
+        )
+
+        assert merge_count == 1
+        assert merged.parts == ["hello", " world"]
+        assert mq._queued_delivery_topic_counts[user_id] == {thread_id: 1}
+        assert await mq.get_pending_delivery_topics(user_id) == {thread_id}
+        assert queue.get_nowait() is retained
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_merge_content_tasks_does_not_merge_across_topics():
+    user_id = 212
+    first_thread_id = 213
+    queued_thread_id = 214
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    first = mq.MessageTask(
+        task_type="content",
+        window_id="@8",
+        thread_id=first_thread_id,
+        parts=["first"],
+    )
+    different_topic = mq.MessageTask(
+        task_type="content",
+        window_id="@8",
+        thread_id=queued_thread_id,
+        parts=["second"],
+    )
+
+    try:
+        mq._put_queued_task(user_id, queue, different_topic)
+
+        merged, merge_count = await mq._merge_content_tasks(
+            queue,
+            first,
+            lock,
+            user_id=user_id,
+        )
+
+        assert merged is first
+        assert merge_count == 0
+        assert mq._queued_delivery_topic_counts[user_id] == {queued_thread_id: 1}
+        assert await mq.get_pending_delivery_topics(user_id) == {queued_thread_id}
+        assert queue.get_nowait() is different_topic
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_requeue_task_front_tracks_retried_task_and_preserves_existing_counts():
+    user_id = 209
+    retry_thread_id = 210
+    queued_thread_id = 211
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    retried = mq.MessageTask(
+        task_type="content",
+        window_id="@6",
+        thread_id=retry_thread_id,
+        parts=["retry"],
+    )
+    already_queued = mq.MessageTask(
+        task_type="progress_finalize",
+        window_id="@7",
+        thread_id=queued_thread_id,
+    )
+
+    try:
+        mq._put_queued_task(user_id, queue, already_queued)
+
+        await mq._requeue_task_front(
+            queue,
+            lock,
+            user_id=user_id,
+            task=retried,
+        )
+
+        assert mq._queued_delivery_topic_counts[user_id] == {
+            queued_thread_id: 1,
+            retry_thread_id: 1,
+        }
+        assert await mq.get_pending_delivery_topics(user_id) == {
+            queued_thread_id,
+            retry_thread_id,
+        }
+        assert queue.get_nowait() is retried
+        assert queue.get_nowait() is already_queued
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_pending_delivery_topics_uses_enqueue_index_without_queue_scan():
+    user_id = 401
+    thread_id = 402
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+
+    class _NoIter:
+        def __iter__(self):
+            raise AssertionError('pending delivery lookup should not scan queue internals')
+
+    try:
+        await mq.enqueue_content_message(
+            object(),  # type: ignore[arg-type]
+            user_id,
+            '@401',
+            ['hello'],
+            thread_id=thread_id,
+        )
+        original_queue = queue._queue
+        queue._queue = _NoIter()  # type: ignore[assignment]
+        try:
+            assert await mq.get_pending_delivery_topics(user_id) == {thread_id}
+        finally:
+            queue._queue = original_queue
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
 async def test_message_queue_worker_retries_content_after_retry_after(monkeypatch):
     user_id = 301
     queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
@@ -787,6 +1000,64 @@ async def test_message_queue_worker_retries_content_after_retry_after(monkeypatc
         mq._message_queues.pop(user_id, None)
         mq._queue_locks.pop(user_id, None)
         mq._active_delivery_topics.pop(user_id, None)
+        mq._flood_until.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_message_queue_worker_retries_merged_content_after_retry_after(monkeypatch):
+    user_id = 303
+    thread_id = 304
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    attempts: list[list[str]] = []
+    current_time = {"value": 300.0}
+
+    async def _fake_process_content_task(_bot, _user_id: int, task: mq.MessageTask):
+        attempts.append(list(task.parts))
+        if len(attempts) == 1:
+            raise RetryAfter(1)
+
+    async def _fake_sleep(seconds: float):
+        current_time["value"] += seconds
+
+    monkeypatch.setattr(mq, "_process_content_task", _fake_process_content_task)
+    monkeypatch.setattr(mq.time, "monotonic", lambda: current_time["value"])
+    monkeypatch.setattr(mq.asyncio, "sleep", _fake_sleep)
+
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))  # type: ignore[arg-type]
+    mq._put_queued_task(
+        user_id,
+        queue,
+        mq.MessageTask(
+            task_type="content",
+            window_id="@303",
+            thread_id=thread_id,
+            parts=["hello"],
+        ),
+    )
+    mq._put_queued_task(
+        user_id,
+        queue,
+        mq.MessageTask(
+            task_type="content",
+            window_id="@303",
+            thread_id=thread_id,
+            parts=[" world"],
+        ),
+    )
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=1)
+        assert attempts == [["hello", " world"], ["hello", " world"]]
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
         mq._flood_until.pop(user_id, None)
 
 

@@ -341,6 +341,79 @@ async def test_status_poll_loop_topic_deleted_in_app_server_only_skips_legacy_ki
 
 
 @pytest.mark.asyncio
+async def test_topic_probe_dedupes_permission_failures_and_backs_off(monkeypatch):
+    calls: list[tuple[int, int | None]] = []
+
+    monkeypatch.setattr(status_polling.session_manager, "resolve_chat_id", lambda *_args, **_kwargs: -100)
+    monkeypatch.setattr(status_polling, "TOPIC_PROBE_PERMISSION_BACKOFF", 30.0, raising=False)
+    if hasattr(status_polling, "_topic_probe_retry_after"):
+        status_polling._topic_probe_retry_after.clear()
+
+    class _Bot:
+        async def unpin_all_forum_topic_messages(self, *, chat_id: int, message_thread_id: int | None):
+            calls.append((chat_id, message_thread_id))
+            raise BadRequest("Not enough rights to manage pinned messages in the chat")
+
+    bindings = [
+        (1, None, 10, "@same-a"),
+        (1, -100, 10, "@same-b"),
+    ]
+
+    await status_polling._probe_topic_bindings(_Bot(), bindings, now=100.0)
+    await status_polling._probe_topic_bindings(_Bot(), bindings, now=120.0)
+    await status_polling._probe_topic_bindings(_Bot(), bindings, now=131.0)
+
+    assert calls == [(-100, 10), (-100, 10)]
+
+
+@pytest.mark.asyncio
+async def test_topic_probe_prunes_retry_backoff_for_inactive_topics(monkeypatch):
+    monkeypatch.setattr(status_polling.session_manager, "resolve_chat_id", lambda *_args, **_kwargs: -100)
+    status_polling._topic_probe_retry_after.clear()
+    status_polling._topic_probe_retry_after[(-100, 99)] = 999.0
+
+    class _Bot:
+        async def unpin_all_forum_topic_messages(self, *, chat_id: int, message_thread_id: int | None):
+            _ = chat_id, message_thread_id
+
+    await status_polling._probe_topic_bindings(
+        _Bot(),
+        [(1, -100, 10, "@active")],
+        now=100.0,
+    )
+
+    assert (-100, 99) not in status_polling._topic_probe_retry_after
+
+
+@pytest.mark.asyncio
+async def test_topic_probe_skips_binding_when_chat_resolution_fails(monkeypatch):
+    calls: list[tuple[int, int | None]] = []
+    status_polling._topic_probe_retry_after.clear()
+
+    def _resolve_chat_id(_user_id: int, thread_id: int | None, **_kwargs):
+        if thread_id == 10:
+            raise RuntimeError("bad binding")
+        return -100
+
+    class _Bot:
+        async def unpin_all_forum_topic_messages(self, *, chat_id: int, message_thread_id: int | None):
+            calls.append((chat_id, message_thread_id))
+
+    monkeypatch.setattr(status_polling.session_manager, "resolve_chat_id", _resolve_chat_id)
+
+    await status_polling._probe_topic_bindings(
+        _Bot(),
+        [
+            (1, None, 10, "@bad"),
+            (1, None, 11, "@valid"),
+        ],
+        now=100.0,
+    )
+
+    assert calls == [(-100, 11)]
+
+
+@pytest.mark.asyncio
 async def test_status_poll_loop_skips_only_busy_topic_not_all_user_topics(monkeypatch):
     events: list[str] = []
 

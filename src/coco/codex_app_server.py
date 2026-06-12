@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .config import config
-from .utils import atomic_write_json, coco_dir
+from .utils import atomic_write_json, coco_dir, env_alias
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,7 @@ class CodexAppServerClient:
         self._initialized = False
         self._server_user_agent = ""
         self._transport_needs_restart = False
+        self._systemd_unit_name = ""
 
     @staticmethod
     def transport_prefers_app_server() -> bool:
@@ -121,7 +122,52 @@ class CodexAppServerClient:
         if sandbox_mode:
             argv.extend(["-c", f'sandbox_mode="{sandbox_mode}"'])
 
+        if self._systemd_run_enabled():
+            unit_name = self._new_systemd_unit_name()
+            self._systemd_unit_name = unit_name
+            wrapped = [
+                "systemd-run",
+                "--user",
+                "--pipe",
+                "--quiet",
+                "--collect",
+                f"--unit={unit_name}",
+            ]
+            for property_value in self._systemd_run_properties():
+                wrapped.extend(["-p", property_value])
+            return [*wrapped, *argv]
+
         return argv
+
+    @staticmethod
+    def _systemd_run_enabled() -> bool:
+        raw = env_alias(
+            "COCO_CODEX_APP_SERVER_SYSTEMD_RUN",
+            default="false",
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _systemd_run_properties() -> list[str]:
+        raw = env_alias("COCO_CODEX_APP_SERVER_SYSTEMD_PROPERTIES", default="")
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    @staticmethod
+    def _new_systemd_unit_name() -> str:
+        return f"coco-codex-app-server-{os.getpid()}-{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _systemd_user_env() -> dict[str, str]:
+        env = os.environ.copy()
+        runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        env.setdefault("XDG_RUNTIME_DIR", runtime_dir)
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
+        return env
+
+    def _app_server_env(self) -> dict[str, str] | None:
+        if not self._systemd_run_enabled():
+            return None
+        return self._systemd_user_env()
 
     async def set_handlers(
         self,
@@ -157,12 +203,18 @@ class CodexAppServerClient:
                     argv = self._app_server_argv()
                     logger.info("Starting Codex app-server: %s", argv)
                     try:
+                        spawn_kwargs: dict[str, Any] = {
+                            "stdin": asyncio.subprocess.PIPE,
+                            "stdout": asyncio.subprocess.PIPE,
+                            "stderr": asyncio.subprocess.PIPE,
+                            "limit": APP_SERVER_STREAM_LIMIT,
+                        }
+                        app_server_env = self._app_server_env()
+                        if app_server_env is not None:
+                            spawn_kwargs["env"] = app_server_env
                         self._proc = await asyncio.create_subprocess_exec(
                             *argv,
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            limit=APP_SERVER_STREAM_LIMIT,
+                            **spawn_kwargs,
                         )
                     except OSError as e:
                         raise CodexAppServerError(
@@ -196,6 +248,8 @@ class CodexAppServerClient:
     async def stop(self) -> None:
         proc = self._proc
         self._proc = None
+        systemd_unit_name = self._systemd_unit_name
+        self._systemd_unit_name = ""
 
         for task in (self._reader_task, self._stderr_task, self._notification_task):
             if task:
@@ -206,6 +260,9 @@ class CodexAppServerClient:
         # Drop any queued notifications from the previous process lifecycle.
         self._notification_queue = asyncio.Queue(maxsize=APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE)
         self._notification_overflow.clear()
+
+        if systemd_unit_name:
+            await self._stop_systemd_unit(systemd_unit_name)
 
         if proc and proc.returncode is None:
             proc.terminate()
@@ -227,6 +284,39 @@ class CodexAppServerClient:
         self._initialized = False
         self._server_user_agent = ""
         self._transport_needs_restart = False
+
+    async def _stop_systemd_unit(self, unit_name: str) -> None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl",
+                "--user",
+                "stop",
+                unit_name,
+                stdout=subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._systemd_user_env(),
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+            if proc.returncode not in {0, None}:
+                stderr = b""
+                if proc.stderr is not None:
+                    stderr = await proc.stderr.read()
+                detail = stderr.decode("utf-8", errors="replace").strip()
+                logger.warning(
+                    "Failed to stop Codex app-server systemd unit %s: %s",
+                    unit_name,
+                    detail or f"exit {proc.returncode}",
+                )
+        except Exception:
+            logger.warning(
+                "Failed to stop Codex app-server systemd unit %s",
+                unit_name,
+                exc_info=True,
+            )
 
     @staticmethod
     def _load_start_failure_state() -> dict[str, Any]:
@@ -412,7 +502,64 @@ class CodexAppServerClient:
         await asyncio.sleep(0.5)
         return True
 
+    def _reap_stale_systemd_app_server_units(self) -> None:
+        if not self._systemd_run_enabled():
+            return
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "list-units", "coco-codex-app-server-*"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=self._systemd_user_env(),
+            )
+        except Exception:
+            logger.warning("Failed listing stale systemd app-server units", exc_info=True)
+            return
+
+        current_unit = self._systemd_unit_name
+        stopped = 0
+        for raw_line in proc.stdout.splitlines():
+            parts = raw_line.split()
+            if not parts:
+                continue
+            unit_name = parts[0].strip()
+            if not unit_name.startswith("coco-codex-app-server-"):
+                continue
+            if current_unit and unit_name == current_unit:
+                continue
+            try:
+                stop_proc = subprocess.run(
+                    ["systemctl", "--user", "stop", unit_name],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=self._systemd_user_env(),
+                )
+                if stop_proc.returncode == 0:
+                    stopped += 1
+                else:
+                    detail = (stop_proc.stderr or stop_proc.stdout or "").strip()
+                    logger.warning(
+                        "Failed stopping stale app-server unit %s: %s",
+                        unit_name,
+                        detail or f"exit {stop_proc.returncode}",
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed stopping stale app-server unit %s",
+                    unit_name,
+                    exc_info=True,
+                )
+        if stopped:
+            logger.warning(
+                "App-server recovery stopped %d stale systemd app-server unit(s)",
+                stopped,
+            )
+
     def _reap_stale_local_app_server_processes(self) -> None:
+        self._reap_stale_systemd_app_server_units()
+
         if os.name == "nt":
             logger.warning(
                 "Automatic stale app-server reap is not implemented on Windows; skipping"

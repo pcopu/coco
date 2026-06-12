@@ -192,9 +192,25 @@ class SessionMonitor:
     ) -> list[SessionInfo]:
         """Resolve active Codex session ids to transcript files."""
         sessions: list[SessionInfo] = []
-        if not self.projects_path.exists():
-            return sessions
+        unresolved: list[str] = []
+
         for session_id in active_session_ids:
+            tracked = self.state.get_session(session_id)
+            if tracked is not None and tracked.file_path:
+                file_path = Path(tracked.file_path)
+                if file_path.is_file():
+                    sessions.append(
+                        SessionInfo(
+                            session_id=session_id,
+                            file_path=file_path,
+                        )
+                    )
+                    continue
+            unresolved.append(session_id)
+
+        if not unresolved or not self.projects_path.exists():
+            return sessions
+        for session_id in unresolved:
             matches = sorted(
                 self.projects_path.glob(f"**/*-{session_id}.jsonl"),
                 key=lambda p: p.stat().st_mtime,
@@ -325,6 +341,18 @@ class SessionMonitor:
                     self._file_mtimes[session_info.session_id] = current_mtime
                     logger.info(f"Started tracking session: {session_info.session_id}")
                     continue
+
+                resolved_path = str(session_info.file_path)
+                if tracked.file_path != resolved_path:
+                    logger.info(
+                        "Updating tracked transcript path for session %s: %s -> %s",
+                        session_info.session_id,
+                        tracked.file_path,
+                        resolved_path,
+                    )
+                    tracked.file_path = resolved_path
+                    self.state.update_session(tracked)
+                    self._file_mtimes.pop(session_info.session_id, None)
 
                 # Check mtime + file size to see if file has changed
                 try:

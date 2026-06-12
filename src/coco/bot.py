@@ -13814,10 +13814,6 @@ async def post_init(application: Application) -> None:
             )
 
     await session_manager.resolve_stale_ids()
-    try:
-        await ensure_tts_server_started()
-    except Exception as exc:
-        logger.warning("Managed local TTS startup failed: %s", exc)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
@@ -13861,6 +13857,15 @@ async def post_init(application: Application) -> None:
         try:
             await codex_app_server_client.ensure_started()
             use_app_server_stream = True
+            local_machine_id, _local_machine_name = session_manager._local_machine_identity()
+            cleared_turns = session_manager.clear_window_codex_turns_for_machine(
+                local_machine_id
+            )
+            if cleared_turns:
+                logger.info(
+                    "Cleared %d local Codex active turn id(s) after app-server start",
+                    cleared_turns,
+                )
             try:
                 validation = await session_manager.validate_codex_topic_bindings()
                 emit_telemetry(

@@ -11,7 +11,7 @@ import coco.agent_runtime as agent_runtime
 
 
 @pytest.mark.asyncio
-async def test_run_agent_async_logs_coco_first_controller_host_warning(monkeypatch, caplog):
+async def test_run_agent_async_does_not_eagerly_start_tts(monkeypatch, caplog):
     tts_events: list[str] = []
 
     class _FakeServer:
@@ -54,6 +54,7 @@ async def test_run_agent_async_logs_coco_first_controller_host_warning(monkeypat
         agent_runtime,
         "ensure_tts_server_started",
         lambda: asyncio.sleep(0, result=tts_events.append("start")),
+        raising=False,
     )
     monkeypatch.setattr(
         agent_runtime,
@@ -73,4 +74,4 @@ async def test_run_agent_async_logs_coco_first_controller_host_warning(monkeypat
             await agent_runtime.run_agent_async()
 
     assert "COCO_CONTROLLER_RPC_HOST is unset; agent will not report upstream" in caplog.text
-    assert tts_events == ["start", "stop"]
+    assert tts_events == ["stop"]

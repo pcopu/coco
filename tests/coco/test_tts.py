@@ -26,6 +26,7 @@ class _FakeResponse:
 async def test_synthesize_voice_note_uses_supertone_openai_endpoint(monkeypatch):
     captured: dict[str, object] = {}
     runtime_calls: list[str] = []
+    usage_calls: list[str] = []
     wav_bytes = b"wav-bytes"
 
     class _FakeClient:
@@ -61,10 +62,23 @@ async def test_synthesize_voice_note_uses_supertone_openai_endpoint(monkeypatch)
 
     monkeypatch.setattr(tts, "_prepare_voice_note_audio", _fake_prepare_voice_note_audio)
     monkeypatch.setattr(tts, "_ensure_tts_runtime_started", _fake_ensure_started)
+    monkeypatch.setattr(
+        tts,
+        "_begin_tts_runtime_usage",
+        lambda: usage_calls.append("begin"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tts,
+        "_end_tts_runtime_usage",
+        lambda: usage_calls.append("end"),
+        raising=False,
+    )
 
     media_type, audio_bytes = await tts.synthesize_voice_note("hello world")
 
     assert runtime_calls == ["ensure"]
+    assert usage_calls == ["begin", "end"]
     assert media_type == "audio/ogg"
     assert audio_bytes == b"opus-bytes"
     assert captured_audio["raw_bytes"] == wav_bytes
@@ -82,6 +96,8 @@ async def test_synthesize_voice_note_uses_supertone_openai_endpoint(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_synthesize_voice_note_raises_tts_error_on_http_failure(monkeypatch):
+    usage_calls: list[str] = []
+
     class _FakeClient:
         def __init__(self, *, base_url: str, timeout: float) -> None:
             pass
@@ -96,11 +112,28 @@ async def test_synthesize_voice_note_raises_tts_error_on_http_failure(monkeypatc
             return _FakeResponse(content=b"", status_code=503, text="unavailable")
 
     monkeypatch.setattr(tts.httpx, "AsyncClient", _FakeClient)
+    async def _fake_ensure_started() -> None:
+        return None
+
+    monkeypatch.setattr(tts, "_ensure_tts_runtime_started", _fake_ensure_started)
+    monkeypatch.setattr(
+        tts,
+        "_begin_tts_runtime_usage",
+        lambda: usage_calls.append("begin"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tts,
+        "_end_tts_runtime_usage",
+        lambda: usage_calls.append("end"),
+        raising=False,
+    )
 
     with pytest.raises(tts.TtsError) as excinfo:
         await tts.synthesize_voice_note("hello world")
 
     assert "unavailable" in str(excinfo.value)
+    assert usage_calls == ["begin", "end"]
 
 
 def test_trim_leading_silence_removes_initial_quiet_frames():

@@ -79,6 +79,7 @@ def test_app_server_argv_enables_goals_feature(monkeypatch):
 
     monkeypatch.setattr(client, "_resolve_codex_binary", lambda: "/usr/bin/codex")
     monkeypatch.setattr(cas.config, "codex_sandbox_mode", "")
+    monkeypatch.setattr(client, "_systemd_run_enabled", lambda: False)
 
     argv = client._app_server_argv()
 
@@ -86,6 +87,59 @@ def test_app_server_argv_enables_goals_feature(monkeypatch):
     assert "--enable" in argv
     enable_idx = argv.index("--enable")
     assert argv[enable_idx + 1] == "goals"
+
+
+def test_app_server_argv_can_wrap_in_systemd_run(monkeypatch):
+    client = cas.CodexAppServerClient()
+
+    monkeypatch.setattr(client, "_resolve_codex_binary", lambda: "/usr/bin/codex")
+    monkeypatch.setattr(cas.config, "codex_sandbox_mode", "danger-full-access")
+    monkeypatch.setattr(client, "_systemd_run_enabled", lambda: True)
+    monkeypatch.setattr(client, "_new_systemd_unit_name", lambda: "coco-codex-app-server-test")
+    monkeypatch.setattr(
+        client,
+        "_systemd_run_properties",
+        lambda: ["MemoryHigh=8G", "MemoryMax=10G"],
+    )
+
+    argv = client._app_server_argv()
+
+    assert argv[:6] == [
+        "systemd-run",
+        "--user",
+        "--pipe",
+        "--quiet",
+        "--collect",
+        "--unit=coco-codex-app-server-test",
+    ]
+    assert "-p" in argv
+    assert "MemoryHigh=8G" in argv
+    assert argv[-8:] == [
+        "/usr/bin/codex",
+        "app-server",
+        "--listen",
+        "stdio://",
+        "--enable",
+        "goals",
+        "-c",
+        'sandbox_mode="danger-full-access"',
+    ]
+    assert client._systemd_unit_name == "coco-codex-app-server-test"
+
+
+def test_app_server_env_sets_user_bus_for_systemd_run(monkeypatch):
+    client = cas.CodexAppServerClient()
+
+    monkeypatch.setattr(client, "_systemd_run_enabled", lambda: True)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr(cas.os, "getuid", lambda: 1000)
+
+    env = client._app_server_env()
+
+    assert env is not None
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
 
 
 @pytest.mark.asyncio
@@ -151,6 +205,64 @@ async def test_ensure_started_stops_process_when_handshake_fails(monkeypatch):
         await client.ensure_started()
 
     assert client.is_running() is False
+
+
+@pytest.mark.asyncio
+async def test_stop_stops_systemd_run_unit_before_wrapper(monkeypatch):
+    client = cas.CodexAppServerClient()
+    events: list[str] = []
+    proc = _FakeProc()
+    client._proc = proc
+    client._systemd_unit_name = "coco-codex-app-server-123"
+
+    async def _fake_stop_unit(unit_name: str) -> None:
+        events.append(f"stop-unit:{unit_name}")
+
+    def _terminate() -> None:
+        events.append("terminate-wrapper")
+        proc.returncode = 0
+
+    proc.terminate = _terminate  # type: ignore[method-assign]
+    monkeypatch.setattr(client, "_stop_systemd_unit", _fake_stop_unit)
+
+    await client.stop()
+
+    assert events == [
+        "stop-unit:coco-codex-app-server-123",
+        "terminate-wrapper",
+    ]
+    assert client._systemd_unit_name == ""
+
+
+def test_reap_stale_processes_stops_stale_systemd_app_server_units(monkeypatch):
+    client = cas.CodexAppServerClient()
+    events: list[tuple[str, tuple[str, ...]]] = []
+
+    monkeypatch.setattr(client, "_systemd_run_enabled", lambda: True)
+    client._systemd_unit_name = "coco-codex-app-server-current.service"
+
+    def _fake_run(argv, **kwargs):
+        events.append(("run", tuple(argv)))
+        if argv[:3] == ["systemctl", "--user", "list-units"]:
+            return SimpleNamespace(
+                stdout=(
+                    "coco-codex-app-server-current.service loaded active running current\n"
+                    "coco-codex-app-server-stale.service loaded active running stale\n"
+                ),
+                returncode=0,
+            )
+        if argv[:3] == ["systemctl", "--user", "stop"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        if argv[:2] == ["ps", "-eo"]:
+            return SimpleNamespace(stdout="")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(cas.subprocess, "run", _fake_run)
+
+    client._reap_stale_local_app_server_processes()
+
+    assert ("run", ("systemctl", "--user", "stop", "coco-codex-app-server-stale.service")) in events
+    assert ("run", ("systemctl", "--user", "stop", "coco-codex-app-server-current.service")) not in events
 
 
 @pytest.mark.asyncio

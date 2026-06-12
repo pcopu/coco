@@ -7,7 +7,7 @@ import pytest
 
 import coco.session as session_module
 from coco.monitor_state import TrackedSession
-from coco.session_monitor import SessionMonitor
+from coco.session_monitor import SessionInfo, SessionMonitor
 
 
 class TestReadNewLinesOffsetRecovery:
@@ -95,6 +95,93 @@ class TestReadNewLinesOffsetRecovery:
         # Should reset offset to 0 and read the line
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
+
+
+def test_resolve_codex_session_files_prefers_tracked_file_path(tmp_path):
+    monitor = SessionMonitor(
+        projects_path=tmp_path / "projects",
+        state_file=tmp_path / "monitor_state.json",
+    )
+    jsonl_file = tmp_path / "session.jsonl"
+    jsonl_file.write_text("{}\n", encoding="utf-8")
+    monitor.state.update_session(
+        TrackedSession(
+            session_id="session-1",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+    )
+
+    class _NoGlobProjects:
+        def exists(self) -> bool:
+            return True
+
+        def glob(self, _pattern: str):
+            raise AssertionError("tracked session resolution should not scan")
+
+    monitor.projects_path = _NoGlobProjects()  # type: ignore[assignment]
+
+    sessions = monitor._resolve_codex_session_files_sync({"session-1"})
+
+    assert sessions == [SessionInfo(session_id="session-1", file_path=jsonl_file)]
+
+
+@pytest.mark.asyncio
+async def test_check_for_updates_updates_tracked_path_after_fallback_resolution(tmp_path):
+    session_id = "12345678-1234-1234-1234-123456789abc"
+    projects_path = tmp_path / "projects"
+    projects_path.mkdir()
+    stale_path = tmp_path / "missing" / f"old-{session_id}.jsonl"
+    resolved_path = projects_path / f"new-{session_id}.jsonl"
+    resolved_path.write_text("", encoding="utf-8")
+
+    monitor = SessionMonitor(
+        projects_path=projects_path,
+        state_file=tmp_path / "monitor_state.json",
+    )
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=session_id,
+            file_path=str(stale_path),
+            last_byte_offset=0,
+        )
+    )
+
+    assert await monitor.check_for_updates({session_id}) == []
+
+    tracked = monitor.state.get_session(session_id)
+    assert tracked is not None
+    assert tracked.file_path == str(resolved_path)
+
+
+@pytest.mark.asyncio
+async def test_check_for_updates_reads_resolved_path_after_stale_mtime_cache(tmp_path):
+    session_id = "12345678-1234-1234-1234-123456789abd"
+    projects_path = tmp_path / "projects"
+    projects_path.mkdir()
+    stale_path = tmp_path / "missing" / f"old-{session_id}.jsonl"
+    resolved_path = projects_path / f"new-{session_id}.jsonl"
+    resolved_path.write_text("", encoding="utf-8")
+
+    monitor = SessionMonitor(
+        projects_path=projects_path,
+        state_file=tmp_path / "monitor_state.json",
+    )
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=session_id,
+            file_path=str(stale_path),
+            last_byte_offset=50,
+        )
+    )
+    monitor._file_mtimes[session_id] = 9_999_999_999.0
+
+    assert await monitor.check_for_updates({session_id}) == []
+
+    tracked = monitor.state.get_session(session_id)
+    assert tracked is not None
+    assert tracked.file_path == str(resolved_path)
+    assert tracked.last_byte_offset == 0
 
 
 @pytest.mark.asyncio

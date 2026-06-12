@@ -20,6 +20,21 @@ from .utils import env_alias
 logger = logging.getLogger(__name__)
 
 _tts_server_process: subprocess.Popen[bytes] | None = None
+_tts_active_usages = 0
+_tts_idle_stop_task: asyncio.Task[None] | None = None
+_tts_last_used_at = 0.0
+_tts_lifecycle_lock: asyncio.Lock | None = None
+_tts_lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_tts_lifecycle_lock() -> asyncio.Lock:
+    global _tts_lifecycle_lock, _tts_lifecycle_lock_loop
+
+    loop = asyncio.get_running_loop()
+    if _tts_lifecycle_lock is None or _tts_lifecycle_lock_loop is not loop:
+        _tts_lifecycle_lock = asyncio.Lock()
+        _tts_lifecycle_lock_loop = loop
+    return _tts_lifecycle_lock
 
 
 def _tts_server_model() -> str:
@@ -44,6 +59,14 @@ def _tts_server_poll_interval() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return 0.25
+
+
+def _tts_idle_timeout_seconds() -> float:
+    raw = env_alias("COCO_TTS_IDLE_TIMEOUT_SECONDS", default="300").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
 
 
 def _tts_command_override() -> str:
@@ -199,7 +222,83 @@ async def is_tts_server_healthy() -> bool:
     return str(payload.get("status", "")).strip().lower() == "ok"
 
 
+def _cancel_tts_idle_stop_task() -> None:
+    global _tts_idle_stop_task
+
+    task = _tts_idle_stop_task
+    _tts_idle_stop_task = None
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def _stop_tts_server_after_idle(timeout: float) -> None:
+    global _tts_idle_stop_task
+
+    try:
+        await asyncio.sleep(timeout)
+        if _tts_active_usages > 0:
+            return
+        idle_for = time.monotonic() - _tts_last_used_at
+        if idle_for < timeout:
+            _schedule_tts_idle_stop()
+            return
+        proc = _tts_server_process
+        if proc is None or proc.poll() is not None:
+            return
+        logger.info("Stopping managed TTS server after %.1fs idle", timeout)
+        await stop_tts_server()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Managed TTS idle stop failed: %s", exc)
+    finally:
+        if _tts_idle_stop_task is asyncio.current_task():
+            _tts_idle_stop_task = None
+
+
+def _schedule_tts_idle_stop() -> None:
+    global _tts_idle_stop_task
+
+    if not _is_local_managed_base_url():
+        return
+    timeout = _tts_idle_timeout_seconds()
+    if timeout <= 0:
+        return
+    proc = _tts_server_process
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _cancel_tts_idle_stop_task()
+    _tts_idle_stop_task = loop.create_task(_stop_tts_server_after_idle(timeout))
+
+
+def begin_tts_server_usage() -> None:
+    global _tts_active_usages
+
+    _tts_active_usages += 1
+    _cancel_tts_idle_stop_task()
+
+
+def end_tts_server_usage() -> None:
+    global _tts_active_usages, _tts_last_used_at
+
+    _tts_active_usages = max(0, _tts_active_usages - 1)
+    _tts_last_used_at = time.monotonic()
+    if _tts_active_usages == 0:
+        _schedule_tts_idle_stop()
+
+
 async def ensure_tts_server_started() -> None:
+    global _tts_server_process
+
+    async with _get_tts_lifecycle_lock():
+        await _ensure_tts_server_started_locked()
+
+
+async def _ensure_tts_server_started_locked() -> None:
     global _tts_server_process
 
     if not _is_local_managed_base_url():
@@ -240,7 +339,19 @@ async def ensure_tts_server_started() -> None:
 
 
 async def stop_tts_server() -> None:
-    global _tts_server_process
+    async with _get_tts_lifecycle_lock():
+        await _stop_tts_server_locked()
+
+
+async def _stop_tts_server_locked() -> None:
+    global _tts_active_usages, _tts_idle_stop_task, _tts_server_process
+
+    _tts_active_usages = 0
+    task = _tts_idle_stop_task
+    current = asyncio.current_task()
+    _tts_idle_stop_task = None
+    if task is not None and task is not current and not task.done():
+        task.cancel()
 
     proc = _tts_server_process
     _tts_server_process = None

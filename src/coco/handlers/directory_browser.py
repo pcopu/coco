@@ -46,6 +46,18 @@ def clear_browse_state(user_data: dict | None) -> None:
         user_data.pop(BROWSE_DIRS_KEY, None)
 
 
+def _display_browse_path(path: Path) -> str:
+    """Return a compact display path, replacing home only as a path prefix."""
+    home = Path.home()
+    if path == home:
+        return "~"
+    try:
+        rel = path.relative_to(home)
+    except ValueError:
+        return str(path)
+    return str(Path("~") / rel)
+
+
 def build_directory_browser(
     current_path: str,
     page: int = 0,
@@ -125,8 +137,8 @@ def build_directory_browser(
     action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL))
     buttons.append(action_row)
 
-    display_path = str(path).replace(str(Path.home()), "~")
-    display_root = str(root).replace(str(Path.home()), "~")
+    display_path = _display_browse_path(path)
+    display_root = _display_browse_path(root)
     if not subdirs:
         text = (
             "*Select Working Directory*"
