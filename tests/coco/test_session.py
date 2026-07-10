@@ -2084,6 +2084,115 @@ async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
 
 
 @pytest.mark.asyncio
+async def test_send_inputs_to_window_thread_not_found_skips_subagent_session(
+    mgr: SessionManager,
+    monkeypatch,
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_root = tmp_path / "sessions"
+    sessions_dir = sessions_root / "2026" / "07"
+    sessions_dir.mkdir(parents=True)
+
+    subagent_transcript = sessions_dir / "session-subagent.jsonl"
+    subagent_transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-10T22:15:44Z",
+                "payload": {
+                    "id": "thread-subagent",
+                    "cwd": str(workspace.resolve()),
+                    "parent_thread_id": "thread-parent",
+                    "thread_source": "subagent",
+                    "multi_agent_version": "v2",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": "thread-parent",
+                                "depth": 1,
+                            }
+                        }
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    state = mgr.get_window_state("@900009")
+    state.cwd = str(workspace)
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-subagent"
+    state.codex_active_turn_id = "turn-old"
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=7,
+        codex_thread_id="thread-subagent",
+        cwd=str(workspace),
+        display_name="demo",
+        window_id="@900009",
+    )
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "sessions_path", sessions_root)
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    resume_calls: list[str] = []
+
+    async def _thread_resume(*, thread_id: str):
+        resume_calls.append(thread_id)
+        return {"thread": {"id": thread_id}}
+
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_resume", _thread_resume)
+
+    call_states: list[str] = []
+
+    async def _send_inputs_via_codex_app_server(
+        *,
+        window_id: str,
+        inputs: list[dict[str, object]],
+        steer: bool,
+        force_new_turn: bool = False,
+        window_name: str,
+        cwd: str,
+    ):
+        _ = window_id, inputs, window_name, cwd, force_new_turn
+        thread_id = mgr.get_window_codex_thread_id("@900009")
+        call_states.append(thread_id)
+        if len(call_states) == 1:
+            assert steer is False
+            raise session_mod.CodexAppServerError("thread not found: thread-subagent")
+        if thread_id == "thread-subagent":
+            raise session_mod.CodexAppServerError(
+                "direct app-server input is not allowed for multi-agent v2 sub-agents"
+            )
+        assert steer is False
+        mgr.set_window_codex_thread_id("@900009", "thread-new-root")
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "_send_inputs_via_codex_app_server", _send_inputs_via_codex_app_server)
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900009",
+        [{"type": "text", "text": "hello"}],
+        steer=False,
+    )
+
+    assert ok is True
+    assert msg == "ok"
+    assert resume_calls == []
+    assert call_states == ["thread-subagent", ""]
+    assert mgr.get_window_codex_thread_id("@900009") == "thread-new-root"
+    binding = mgr.resolve_topic_binding(100, 7)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-new-root"
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_to_window_thread_not_found_prefers_latest_cwd_resume(
     mgr: SessionManager,
     monkeypatch,

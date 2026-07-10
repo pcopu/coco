@@ -935,6 +935,8 @@ class SessionManager:
     def _extract_codex_session_summary(
         self,
         file_path: Path,
+        *,
+        resumable_only: bool = False,
     ) -> tuple[CodexSessionSummary, str] | None:
         """Read Codex session summary + cwd from a transcript JSONL file."""
         try:
@@ -963,6 +965,8 @@ class SessionManager:
                     payload = data.get("payload", {})
                     if not isinstance(payload, dict):
                         continue
+                    if resumable_only and self._is_codex_subagent_session_meta(payload):
+                        return None
                     raw_thread_id = payload.get("id", "")
                     raw_cwd = payload.get("cwd", "")
                     if isinstance(raw_thread_id, str) and raw_thread_id.strip():
@@ -987,6 +991,17 @@ class SessionManager:
             ),
             file_cwd,
         )
+
+    @staticmethod
+    def _is_codex_subagent_session_meta(payload: dict[str, Any]) -> bool:
+        """Return whether session metadata identifies a non-resumable sub-agent."""
+        thread_source = payload.get("thread_source")
+        if isinstance(thread_source, str) and thread_source.strip().lower() == "subagent":
+            return True
+        source = payload.get("source")
+        if isinstance(source, str):
+            return source.strip().lower() == "subagent"
+        return isinstance(source, dict) and "subagent" in source
 
     @staticmethod
     def _extract_codex_session_model_selection(file_path: Path) -> tuple[str, str]:
@@ -1168,7 +1183,10 @@ class SessionManager:
             reverse=True,
         )[:300]
         for file_path in candidates:
-            extracted = self._extract_codex_session_summary(file_path)
+            extracted = self._extract_codex_session_summary(
+                file_path,
+                resumable_only=True,
+            )
             if not extracted:
                 continue
             summary, file_cwd = extracted
