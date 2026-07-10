@@ -195,9 +195,10 @@ class TranscriptParser:
             return None
 
         try:
-            return json.loads(line)
+            parsed = json.loads(line)
         except json.JSONDecodeError:
             return None
+        return parsed if isinstance(parsed, dict) else None
 
     @staticmethod
     def get_message_type(data: dict) -> str | None:
@@ -421,6 +422,8 @@ class TranscriptParser:
         Returns:
             ParsedMessage or None if not a parseable message
         """
+        if not isinstance(data, dict):
+            return None
         codex_type = cls._get_codex_event_type(data)
         if codex_type in {"user_message", "agent_message", "agent_reasoning"}:
             payload = data.get("payload", {})

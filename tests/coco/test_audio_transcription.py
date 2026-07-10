@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from telegram.constants import ChatAction
+from telegram.error import NetworkError
 
 import coco.bot as bot
 from coco.transcription import TranscriptionBootstrapHandle
@@ -65,8 +66,9 @@ def _make_voice_update():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_echo", [False, True])
 async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, fail_echo
 ):
     update, tg_file = _make_voice_update()
     context = SimpleNamespace(bot=object(), user_data={})
@@ -89,6 +91,8 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
         return "voice transcript"
 
     async def _safe_reply(_message, text: str, **_kwargs):
+        if fail_echo:
+            raise NetworkError("telegram echo failed")
         replies.append(text)
 
     async def _forward_topic_text_message(
@@ -102,7 +106,7 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
         response_mode: str = "",
         persist_response_mode: bool = True,
     ) -> None:
-        assert replies == ["voice transcript"]
+        assert replies == ([] if fail_echo else ["voice transcript"])
         assert response_mode == "voice"
         assert persist_response_mode is True
         forwarded.append(
@@ -132,7 +136,7 @@ async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
     assert update.message.chat.actions == [ChatAction.TYPING]
     assert len(tg_file.paths) == 1
     assert not tg_file.paths[0].exists()
-    assert replies == ["voice transcript"]
+    assert replies == ([] if fail_echo else ["voice transcript"])
     assert forwarded == [
         {
             "message": update.message,
@@ -398,3 +402,51 @@ async def test_audio_handler_uses_fixed_compatible_profile(monkeypatch, tmp_path
     assert profiles == ["compatible"]
     assert replies == ["voice transcript"]
     assert forwarded == ["voice transcript"]
+
+
+@pytest.mark.asyncio
+async def test_audio_handler_splits_long_transcript_and_still_forwards(
+    monkeypatch, tmp_path
+):
+    update, tg_file = _make_voice_update()
+    context = SimpleNamespace(bot=object(), user_data={})
+    forwarded: list[str] = []
+    replies: list[str] = []
+    long_transcript = ("x" * 2500) + "\n" + ("y" * 2500)
+
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot,
+        "begin_transcription_bootstrap",
+        lambda profile="": None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot,
+        "transcribe_audio_file",
+        lambda _path, *, profile="": long_transcript,
+        raising=False,
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs["text"])
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(
+        bot,
+        "_forward_topic_text_message",
+        _forward_topic_text_message,
+        raising=False,
+    )
+
+    await bot.audio_handler(update, context)
+
+    assert len(tg_file.paths) == 1
+    assert not tg_file.paths[0].exists()
+    assert replies == [("x" * 2500), ("y" * 2500)]
+    assert forwarded == [long_transcript]

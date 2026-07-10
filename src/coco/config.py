@@ -10,6 +10,7 @@ Key class: Config (singleton instantiated as `config`).
 """
 
 import logging
+import math
 import socket
 from pathlib import Path
 
@@ -71,6 +72,16 @@ def _parse_bool(raw_value: str, *, default: bool) -> bool:
         return False
     logger.warning("Boolean config value %r is invalid; using default %s", raw_value, default)
     return default
+
+
+def _parse_positive_finite(raw_value: str, *, name: str) -> float:
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return value
 
 
 class Config:
@@ -227,9 +238,18 @@ class Config:
             self.sessions_path = Path(sessions_path_raw).expanduser()
         else:
             self.sessions_path = Path.home() / ".codex" / "sessions"
-        self.monitor_poll_interval = float(env.MONITOR_POLL_INTERVAL)
-        self.node_heartbeat_interval = float(env_alias("COCO_NODE_HEARTBEAT_INTERVAL", default="15.0"))
-        self.node_offline_timeout = float(env_alias("COCO_NODE_OFFLINE_TIMEOUT", default="45.0"))
+        self.monitor_poll_interval = _parse_positive_finite(
+            env.MONITOR_POLL_INTERVAL,
+            name="MONITOR_POLL_INTERVAL",
+        )
+        self.node_heartbeat_interval = _parse_positive_finite(
+            env_alias("COCO_NODE_HEARTBEAT_INTERVAL", default="15.0"),
+            name="COCO_NODE_HEARTBEAT_INTERVAL",
+        )
+        self.node_offline_timeout = _parse_positive_finite(
+            env_alias("COCO_NODE_OFFLINE_TIMEOUT", default="45.0"),
+            name="COCO_NODE_OFFLINE_TIMEOUT",
+        )
 
         hostname = socket.gethostname().strip().lower().replace(" ", "-")
         self.machine_id = env_alias("COCO_MACHINE_ID") or hostname or "coco-node"
@@ -244,6 +264,8 @@ class Config:
             self.rpc_port = int(env_alias("COCO_RPC_PORT", default="8787"))
         except ValueError as e:
             raise ValueError("COCO_RPC_PORT must be an integer") from e
+        if not 1 <= self.rpc_port <= 65535:
+            raise ValueError("COCO_RPC_PORT must be between 1 and 65535")
         self.rpc_advertise_host = env_alias("COCO_RPC_ADVERTISE_HOST")
         self.controller_rpc_host = env_alias("COCO_CONTROLLER_RPC_HOST")
         try:
@@ -252,6 +274,8 @@ class Config:
             )
         except ValueError as e:
             raise ValueError("COCO_CONTROLLER_RPC_PORT must be an integer") from e
+        if not 1 <= self.controller_rpc_port <= 65535:
+            raise ValueError("COCO_CONTROLLER_RPC_PORT must be between 1 and 65535")
         self.cluster_shared_secret = env_alias("COCO_CLUSTER_SHARED_SECRET")
         self.controller_capable = _parse_bool(
             env_alias("COCO_CONTROLLER_CAPABLE", default="true"),

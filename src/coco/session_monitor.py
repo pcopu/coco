@@ -279,16 +279,23 @@ class SessionMonitor:
                 safe_offset = session.last_byte_offset
                 async for line in f:
                     data = TranscriptParser.parse_line(line)
-                    if data:
+                    if data is not None:
                         new_entries.append(data)
                         safe_offset = await f.tell()
                     elif line.strip():
-                        # Partial JSONL line — don't advance offset past it
-                        logger.warning(
-                            "Partial JSONL line in session %s, will retry next cycle",
-                            session.session_id,
-                        )
-                        break
+                        try:
+                            json.loads(line)
+                        except json.JSONDecodeError:
+                            # Partial JSONL line — don't advance offset past it.
+                            logger.warning(
+                                "Partial JSONL line in session %s, will retry next cycle",
+                                session.session_id,
+                            )
+                            break
+                        # Complete JSON values with an unsupported shape are
+                        # invalid records, not partial writes. Skip them so one
+                        # scalar/list cannot pin the monitor offset forever.
+                        safe_offset = await f.tell()
                     else:
                         # Empty line — safe to skip
                         safe_offset = await f.tell()

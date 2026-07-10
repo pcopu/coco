@@ -93,6 +93,47 @@ def test_build_update_panel_text_mentions_coco_self_update():
     assert "Admins can apply CoCo, Codex, or both from this panel." in text
 
 
+def test_resolve_codex_upgrade_command_prefers_npm_for_nvm_installs(monkeypatch):
+    monkeypatch.setattr(bot, "_resolve_codex_exec_binary", lambda: "/home/pcopu/.nvm/versions/node/v24.13.1/bin/codex")
+    monkeypatch.setattr(bot, "env_alias", lambda _name: "")
+    monkeypatch.setattr(bot.shutil, "which", lambda name: f"/usr/bin/{name}" if name in {"uv", "pipx", "npm"} else None)
+
+    command, source = bot._resolve_codex_upgrade_command()
+
+    assert source == "npm"
+    assert command == "npm install -g @openai/codex@latest"
+
+
+def test_resolve_codex_upgrade_command_prefers_pipx_for_pipx_installs(monkeypatch):
+    monkeypatch.setattr(bot, "_resolve_codex_exec_binary", lambda: "/home/pcopu/.local/share/pipx/venvs/codex/bin/codex")
+    monkeypatch.setattr(bot, "env_alias", lambda _name: "")
+    monkeypatch.setattr(bot.shutil, "which", lambda name: f"/usr/bin/{name}" if name in {"uv", "pipx", "npm"} else None)
+
+    command, source = bot._resolve_codex_upgrade_command()
+
+    assert source == "pipx"
+    assert command == "pipx upgrade codex"
+
+
+def test_resolve_codex_upgrade_command_recognizes_windows_npm_install(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "_resolve_codex_exec_binary",
+        lambda: r"C:\Users\coco\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.exe",
+    )
+    monkeypatch.setattr(bot, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        bot.shutil,
+        "which",
+        lambda name: f"C:\\tools\\{name}.exe" if name in {"uv", "pipx", "npm"} else None,
+    )
+
+    command, source = bot._resolve_codex_upgrade_command()
+
+    assert source == "npm"
+    assert command == "npm install -g @openai/codex@latest"
+
+
 def test_build_update_panel_text_lists_remote_nodes(monkeypatch):
     monkeypatch.setattr(
         bot.node_registry,

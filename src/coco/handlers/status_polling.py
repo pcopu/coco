@@ -59,6 +59,7 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
 TOPIC_PROBE_PERMISSION_BACKOFF = 15 * 60.0  # seconds
+NODE_PROBE_TIMEOUT = 3.0  # seconds; never let an offline agent stall Telegram polling
 _topic_probe_retry_after: dict[tuple[int, int], float] = {}
 
 WATCHDOG_ACTIVE_TURN_KEEPALIVE_EMOJIS: tuple[str, ...] = (
@@ -210,14 +211,16 @@ async def _probe_stale_nodes(
         and node.last_seen_ts > 0
         and timestamp - node.last_seen_ts >= node_registry.offline_timeout_seconds
     ]
-    for node in stale_nodes:
+
+    async def _probe_one(node) -> None:
         worker_ids = _iter_monitor_workers(target_machine_id=node.machine_id)
         via_machine_id = worker_ids[0] if worker_ids else ""
         try:
-            payload = await _probe_machine_from_monitor(
-                node.machine_id,
-                via_machine_id=via_machine_id,
-            )
+            async with asyncio.timeout(NODE_PROBE_TIMEOUT):
+                payload = await _probe_machine_from_monitor(
+                    node.machine_id,
+                    via_machine_id=via_machine_id,
+                )
         except Exception as exc:
             emit_telemetry(
                 "node.probe_failed",
@@ -231,7 +234,7 @@ async def _probe_stale_nodes(
                 via_machine_id or "controller",
                 exc,
             )
-            continue
+            return
 
         machine_id = str(payload.get("machine_id", "")).strip() or node.machine_id
         display_name = str(payload.get("display_name", "")).strip() or node.display_name
@@ -272,6 +275,9 @@ async def _probe_stale_nodes(
             machine_id=machine_id,
             via_machine_id=via_machine_id,
         )
+
+    if stale_nodes:
+        await asyncio.gather(*(_probe_one(node) for node in stale_nodes))
     node_registry.mark_stale_nodes_offline(now=timestamp)
 
 

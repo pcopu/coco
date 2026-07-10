@@ -96,6 +96,27 @@ class TestReadNewLinesOffsetRecovery:
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
 
+    @pytest.mark.asyncio
+    async def test_valid_non_object_record_does_not_block_later_entries(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        jsonl_file = tmp_path / "session.jsonl"
+        entry = make_jsonl_entry(msg_type="assistant", content="after invalid shape")
+        jsonl_file.write_text(
+            "7\n[1]\n" + json.dumps(entry) + "\n",
+            encoding="utf-8",
+        )
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        assert result == [entry]
+        assert session.last_byte_offset == jsonl_file.stat().st_size
+
 
 def test_resolve_codex_session_files_prefers_tracked_file_path(tmp_path):
     monitor = SessionMonitor(

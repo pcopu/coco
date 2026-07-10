@@ -68,10 +68,14 @@ class MessageTask:
     tool_use_id: str | None = None
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
+    chat_id: int | None = None  # Telegram chat scope; thread IDs are chat-local
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
     document_data: list[tuple[str, bytes]] | None = None  # Explicit Telegram docs
     video_data: list[tuple[str, bytes]] | None = None  # Explicit Telegram videos
     response_mode_override: str = ""
+    # Snapshot of the topic delivery generation at first enqueue. Cancellation
+    # advances the generation so already-dequeued/retried work becomes stale.
+    delivery_generation: int | None = None
     # For progress_finalize tasks: "full" keeps accumulated body, "compact" keeps marker only.
     finalize_mode: str = "full"
 
@@ -80,13 +84,14 @@ class MessageTask:
 _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
 _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
-_active_delivery_topics: dict[int, set[int]] = {}
-_queued_delivery_topic_counts: dict[int, dict[int, int]] = {}
+_active_delivery_topics: dict[int, set[tuple[int, int]]] = {}
+_queued_delivery_topic_counts: dict[int, dict[tuple[int, int], int]] = {}
+_topic_delivery_generations: dict[tuple[int, int, int], int] = {}
 
 
 def _track_queued_task(user_id: int, task: MessageTask) -> None:
     """Track a task that is semantically waiting in a user's queue."""
-    topic_id = task.thread_id or 0
+    topic_id = (task.chat_id or 0, task.thread_id or 0)
     counts = _queued_delivery_topic_counts.setdefault(user_id, {})
     counts[topic_id] = counts.get(topic_id, 0) + 1
 
@@ -96,7 +101,7 @@ def _untrack_queued_task(user_id: int, task: MessageTask) -> None:
     counts = _queued_delivery_topic_counts.get(user_id)
     if not counts:
         return
-    topic_id = task.thread_id or 0
+    topic_id = (task.chat_id or 0, task.thread_id or 0)
     remaining = counts.get(topic_id, 0) - 1
     if remaining > 0:
         counts[topic_id] = remaining
@@ -112,29 +117,48 @@ def _put_queued_task(
     task: MessageTask,
 ) -> None:
     """Put a new semantic task in the queue and update the topic index."""
+    if task.delivery_generation is None:
+        topic_key = (user_id, task.chat_id or 0, task.thread_id or 0)
+        task.delivery_generation = _topic_delivery_generations.get(topic_key, 0)
     queue.put_nowait(task)
     _track_queued_task(user_id, task)
 
-# Map (tool_use_id, user_id, thread_id_or_0) -> telegram message_id
+
+def is_task_delivery_current(user_id: int, task: MessageTask) -> bool:
+    """Return whether a queued/dequeued task predates topic cancellation."""
+    topic_key = (user_id, task.chat_id or 0, task.thread_id or 0)
+    current = _topic_delivery_generations.get(topic_key, 0)
+    return task.delivery_generation is None or task.delivery_generation == current
+
+
+def _resolve_task_chat_id(user_id: int, task: MessageTask) -> int:
+    """Resolve a task's chat without losing its explicit cross-chat scope."""
+    if task.chat_id is None:
+        return session_manager.resolve_chat_id(user_id, task.thread_id)
+    return session_manager.resolve_chat_id(
+        user_id, task.thread_id, chat_id=task.chat_id
+    )
+
+# Map (tool_use_id, user_id, chat_id_or_0, thread_id_or_0) -> telegram message_id
 # for editing tool_use messages with results
-_tool_msg_ids: dict[tuple[str, int, int], int] = {}
+_tool_msg_ids: dict[tuple[str, int, int, int], int] = {}
 
-# Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
-_status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+# Status message tracking: (user_id, chat_id_or_0, thread_id_or_0) -> message state
+_status_msg_info: dict[tuple[int, int, int], tuple[int, str, str]] = {}
 
-# Progress message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, accumulated_text)
-_progress_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+# Progress tracking: (user_id, chat_id_or_0, thread_id_or_0) -> message state
+_progress_msg_info: dict[tuple[int, int, int], tuple[int, str, str]] = {}
 # Progress text cache used for completion-time fallbacks.
 # Unlike _progress_msg_info, this is updated when progress is enqueued (not only
 # after Telegram edits succeed). This avoids "turn completed" races where queued
 # edits have not yet run but we still need the best-known accumulated text.
-_progress_text_cache: dict[tuple[int, int], tuple[str, str]] = {}
+_progress_text_cache: dict[tuple[int, int, int], tuple[str, str]] = {}
 
 # Queued user inputs for /q:
 # (user_id, thread_id_or_0) -> [(text, source_chat_id, source_message_id), ...]
-_queued_topic_inputs: dict[tuple[int, int], list[tuple[str, int, int]]] = {}
+_queued_topic_inputs: dict[tuple[int, int, int], list[tuple[str, int, int]]] = {}
 # Queue dock tracking: (user_id, thread_id_or_0) -> (message_id, last_text)
-_queue_dock_msg_info: dict[tuple[int, int], tuple[int, str]] = {}
+_queue_dock_msg_info: dict[tuple[int, int, int], tuple[int, str]] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
@@ -158,37 +182,54 @@ def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     return _message_queues.get(user_id)
 
 
-async def get_pending_delivery_topics(user_id: int) -> set[int]:
+async def get_pending_delivery_topics(
+    user_id: int,
+    chat_id: int | None = None,
+) -> set[int]:
     """Return topic ids with in-flight or queued delivery work for one user."""
-    pending_topics = set(_active_delivery_topics.get(user_id, set()))
+    scoped_chat = chat_id or 0
+    pending_keys = set(_active_delivery_topics.get(user_id, set()))
     if user_id in _message_queues:
-        pending_topics.update(_queued_delivery_topic_counts.get(user_id, ()))
+        pending_keys.update(_queued_delivery_topic_counts.get(user_id, ()))
     else:
         _queued_delivery_topic_counts.pop(user_id, None)
-    return pending_topics
+    return {
+        thread_id
+        for key_chat_id, thread_id in pending_keys
+        if chat_id is None or key_chat_id == scoped_chat
+    }
 
 
-async def topic_has_pending_delivery(user_id: int, thread_id: int | None) -> bool:
+async def topic_has_pending_delivery(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> bool:
     """Return whether a topic has in-flight or queued delivery work."""
     tid = thread_id or 0
-    pending_topics = await get_pending_delivery_topics(user_id)
+    pending_topics = await get_pending_delivery_topics(user_id, chat_id)
     return tid in pending_topics
 
 
-def _topic_key(user_id: int, thread_id: int | None) -> tuple[int, int]:
+def _topic_key(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> tuple[int, int, int]:
     """Normalize per-topic key used by queue-related maps."""
-    return user_id, thread_id or 0
+    return user_id, chat_id or 0, thread_id or 0
 
 
 def _cache_progress_text(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     chunk: str,
 ) -> None:
     """Update completion-time progress cache for a topic."""
-    skey = _topic_key(user_id, thread_id)
+    skey = _topic_key(user_id, thread_id, chat_id)
     cached = _progress_text_cache.get(skey)
     cached_wid = cached[0] if cached else ""
     cached_text = cached[1] if cached else ""
@@ -197,9 +238,13 @@ def _cache_progress_text(
     _progress_text_cache[skey] = (window_id, _merge_progress_text(cached_text, chunk))
 
 
-def _clear_progress_text_cache(user_id: int, thread_id: int | None = None) -> None:
+def _clear_progress_text_cache(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear completion-time progress cache for a topic."""
-    skey = _topic_key(user_id, thread_id)
+    skey = _topic_key(user_id, thread_id, chat_id)
     _progress_text_cache.pop(skey, None)
 
 
@@ -298,12 +343,14 @@ async def sync_queued_topic_dock(
     thread_id: int | None,
     *,
     window_id: str | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Sync per-topic queued /q dock message to current internal queue state."""
-    skey = _topic_key(user_id, thread_id)
+    skey = _topic_key(user_id, thread_id, chat_id)
     pending_items = list(_queued_topic_inputs.get(skey, []))
     current_info = _queue_dock_msg_info.get(skey)
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    if chat_id is None:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
 
     if not pending_items:
         if current_info:
@@ -377,14 +424,16 @@ async def clear_queued_topic_dock(
     bot: Bot | None,
     user_id: int,
     thread_id: int | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Delete the queue dock message for a topic (best effort)."""
-    skey = _topic_key(user_id, thread_id)
+    skey = _topic_key(user_id, thread_id, chat_id)
     info = _queue_dock_msg_info.get(skey)
     if not info or bot is None:
         return
     msg_id, _old_text = info
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    if chat_id is None:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     try:
         await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         if _queue_dock_msg_info.get(skey) == info:
@@ -420,6 +469,57 @@ def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
     return items
 
 
+async def cancel_topic_delivery(
+    user_id: int, thread_id: int | None, *, chat_id: int | None = None
+) -> int:
+    """Discard pending Telegram delivery work for one topic only.
+
+    The worker may already be sending one item; that network request cannot be
+    recalled, but everything still waiting in the queue is removed atomically.
+    Returns the number of discarded tasks.
+    """
+    generation_key = (user_id, chat_id or 0, thread_id or 0)
+    canceled_generation = _topic_delivery_generations.get(generation_key, 0)
+    _topic_delivery_generations[generation_key] = canceled_generation + 1
+    queue = _message_queues.get(user_id)
+    lock = _queue_locks.get(user_id)
+    if queue is None or lock is None:
+        return 0
+
+    target_topic = thread_id or 0
+    target_chat = chat_id or 0
+    removed = 0
+    async with lock:
+        items = _inspect_queue(queue)
+        for item in items:
+            item_generation = item.delivery_generation
+            is_canceled_generation = (
+                item_generation is None or item_generation <= canceled_generation
+            )
+            if (
+                (item.thread_id or 0) == target_topic
+                and (item.chat_id or 0) == target_chat
+                and is_canceled_generation
+            ):
+                _untrack_queued_task(user_id, item)
+                queue.task_done()
+                removed += 1
+                continue
+            queue.put_nowait(item)
+            # The retained item was already counted before the drain. Offset
+            # the new put so queue.join() continues to reflect one task.
+            queue.task_done()
+
+    if removed:
+        logger.info(
+            "Canceled %d pending Telegram delivery task(s) for user=%d thread=%s",
+            removed,
+            user_id,
+            thread_id,
+        )
+    return removed
+
+
 def _task_survives_flood_pause(task_type: str) -> bool:
     """Return whether a queued task should wait out flood control."""
     return task_type in {"content", "status_clear", "progress_clear", "progress_finalize"}
@@ -443,6 +543,10 @@ async def _requeue_task_front(
 
 def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
+    if base.delivery_generation != candidate.delivery_generation:
+        return False
+    if (base.chat_id or 0) != (candidate.chat_id or 0):
+        return False
     if base.window_id != candidate.window_id:
         return False
     if (base.thread_id or 0) != (candidate.thread_id or 0):
@@ -527,10 +631,12 @@ async def _merge_content_tasks(
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
             thread_id=first.thread_id,
+            chat_id=first.chat_id,
             image_data=first.image_data,
             document_data=first.document_data,
             video_data=first.video_data,
             response_mode_override=first.response_mode_override,
+            delivery_generation=first.delivery_generation,
         ),
         merge_count,
     )
@@ -547,9 +653,11 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
             task = await queue.get()
             _untrack_queued_task(user_id, task)
             task_to_retry = task
-            topic_key = task.thread_id or 0
+            topic_key = (task.chat_id or 0, task.thread_id or 0)
             _active_delivery_topics.setdefault(user_id, set()).add(topic_key)
             try:
+                if not is_task_delivery_current(user_id, task):
+                    continue
                 # Flood control: drop status, wait for content
                 flood_end = _flood_until.get(user_id, 0)
                 if flood_end > 0:
@@ -571,6 +679,9 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     _flood_until.pop(user_id, None)
                     logger.info("Flood control lifted for user %d", user_id)
 
+                if not is_task_delivery_current(user_id, task):
+                    continue
+
                 if task.task_type == "content":
                     # Try to merge consecutive content tasks
                     merged_task, merge_count = await _merge_content_tasks(
@@ -582,17 +693,29 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                         # Mark merged tasks as done
                         for _ in range(merge_count):
                             queue.task_done()
+                    if not is_task_delivery_current(user_id, merged_task):
+                        continue
                     await _process_content_task(bot, user_id, merged_task)
                 elif task.task_type == "status_update":
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
-                    await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+                    await _do_clear_status_message(
+                        bot,
+                        user_id,
+                        task.thread_id or 0,
+                        chat_id=task.chat_id,
+                    )
                 elif task.task_type == "progress_start":
                     await _process_progress_start_task(bot, user_id, task)
                 elif task.task_type == "progress_update":
                     await _process_progress_update_task(bot, user_id, task)
                 elif task.task_type == "progress_clear":
-                    await _do_clear_progress_message(bot, user_id, task.thread_id or 0)
+                    await _do_clear_progress_message(
+                        bot,
+                        user_id,
+                        task.thread_id or 0,
+                        chat_id=task.chat_id,
+                    )
                 elif task.task_type == "progress_finalize":
                     await _process_progress_finalize_task(bot, user_id, task)
             except RetryAfter as e:
@@ -605,7 +728,10 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     _flood_until.get(user_id, 0.0),
                     time.monotonic() + retry_secs,
                 )
-                if _task_survives_flood_pause(task.task_type):
+                if (
+                    _task_survives_flood_pause(task.task_type)
+                    and is_task_delivery_current(user_id, task_to_retry)
+                ):
                     await _requeue_task_front(
                         queue,
                         lock,
@@ -659,6 +785,7 @@ def _can_coalesce_progress_task(base: MessageTask, candidate: MessageTask) -> bo
         and candidate.task_type == "progress_update"
         and base.window_id == candidate.window_id
         and (base.thread_id or 0) == (candidate.thread_id or 0)
+        and (base.chat_id or 0) == (candidate.chat_id or 0)
     )
 
 
@@ -751,9 +878,11 @@ def _is_message_not_modified_error(exc: Exception) -> bool:
     return "message is not modified" in str(exc).lower()
 
 
-async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
+async def _send_task_images(
+    bot: Bot, chat_id: int, task: MessageTask, *, user_id: int
+) -> None:
     """Send images attached to a task, if any."""
-    if not task.image_data:
+    if not task.image_data or not is_task_delivery_current(user_id, task):
         return
     logger.info(
         "Sending %d image(s) in thread %s",
@@ -764,11 +893,14 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
         bot,
         chat_id,
         task.image_data,
+        delivery_is_current=lambda: is_task_delivery_current(user_id, task),
         **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
     )
 
 
-async def _send_task_documents(bot: Bot, chat_id: int, task: MessageTask) -> None:
+async def _send_task_documents(
+    bot: Bot, chat_id: int, task: MessageTask, *, user_id: int
+) -> None:
     """Send documents attached to a task, if any."""
     if not task.document_data:
         return
@@ -777,15 +909,20 @@ async def _send_task_documents(bot: Bot, chat_id: int, task: MessageTask) -> Non
         len(task.document_data),
         task.thread_id,
     )
-    await send_documents(
-        bot,
-        chat_id,
-        task.document_data,
-        **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
-    )
+    for document in task.document_data:
+        if not is_task_delivery_current(user_id, task):
+            return
+        await send_documents(
+            bot,
+            chat_id,
+            [document],
+            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
 
 
-async def _send_task_videos(bot: Bot, chat_id: int, task: MessageTask) -> None:
+async def _send_task_videos(
+    bot: Bot, chat_id: int, task: MessageTask, *, user_id: int
+) -> None:
     """Send videos attached to a task, if any."""
     if not task.video_data:
         return
@@ -795,6 +932,8 @@ async def _send_task_videos(bot: Bot, chat_id: int, task: MessageTask) -> None:
         task.thread_id,
     )
     for media_type, raw_bytes in task.video_data:
+        if not is_task_delivery_current(user_id, task):
+            return
         await send_video(
             bot,
             chat_id,
@@ -808,15 +947,17 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     """Process a content message task."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    chat_id = _resolve_task_chat_id(user_id, task)
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
-        _tkey = (task.tool_use_id, user_id, tid)
+        _tkey = (task.tool_use_id, user_id, chat_id or 0, tid)
         edit_msg_id = _tool_msg_ids.pop(_tkey, None)
         if edit_msg_id is not None:
             # Clear status message first
-            await _do_clear_status_message(bot, user_id, tid)
+            await _do_clear_status_message(
+                bot, user_id, tid, chat_id=task.chat_id
+            )
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
             try:
@@ -834,14 +975,24 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     message_id=edit_msg_id,
                     source="message_queue.tool_result",
                 )
-                await _send_task_images(bot, chat_id, task)
-                await _send_task_documents(bot, chat_id, task)
-                await _send_task_videos(bot, chat_id, task)
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
+                await _send_task_images(bot, chat_id, task, user_id=user_id)
+                await _send_task_documents(bot, chat_id, task, user_id=user_id)
+                await _send_task_videos(bot, chat_id, task, user_id=user_id)
+                if not is_task_delivery_current(user_id, task):
+                    return
+                await _check_and_send_status(
+                    bot,
+                    user_id,
+                    wid,
+                    task.thread_id,
+                    chat_id=task.chat_id,
+                )
                 return
             except RetryAfter:
                 raise
             except Exception:
+                if not is_task_delivery_current(user_id, task):
+                    return
                 try:
                     # Fallback: plain text with sentinels stripped
                     plain_text = (
@@ -862,10 +1013,18 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         message_id=edit_msg_id,
                         source="message_queue.tool_result",
                     )
-                    await _send_task_images(bot, chat_id, task)
-                    await _send_task_documents(bot, chat_id, task)
-                    await _send_task_videos(bot, chat_id, task)
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+                    await _send_task_images(bot, chat_id, task, user_id=user_id)
+                    await _send_task_documents(bot, chat_id, task, user_id=user_id)
+                    await _send_task_videos(bot, chat_id, task, user_id=user_id)
+                    if not is_task_delivery_current(user_id, task):
+                        return
+                    await _check_and_send_status(
+                        bot,
+                        user_id,
+                        wid,
+                        task.thread_id,
+                        chat_id=task.chat_id,
+                    )
                     return
                 except RetryAfter:
                     raise
@@ -898,6 +1057,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         except TtsError:
             logger.warning("Voice synthesis failed for %s; falling back to text", wid, exc_info=True)
         else:
+            if not is_task_delivery_current(user_id, task):
+                return
             await send_voice(
                 bot,
                 chat_id,
@@ -905,12 +1066,22 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 raw_bytes,
                 **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
             )
-            await _check_and_send_status(bot, user_id, wid, task.thread_id)
+            if not is_task_delivery_current(user_id, task):
+                return
+            await _check_and_send_status(
+                bot,
+                user_id,
+                wid,
+                task.thread_id,
+                chat_id=task.chat_id,
+            )
             return
 
     first_part = True
     last_msg_id: int | None = None
     for part in task.parts:
+        if not is_task_delivery_current(user_id, task):
+            return
         sent = None
 
         # For first part, try to convert status message to content (edit instead of delete)
@@ -922,6 +1093,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 tid,
                 wid,
                 part,
+                chat_id=task.chat_id,
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
@@ -939,15 +1111,25 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
-        _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
+        _tool_msg_ids[(task.tool_use_id, user_id, chat_id or 0, tid)] = last_msg_id
 
     # 4. Send images if present (from tool_result with base64 image blocks)
-    await _send_task_images(bot, chat_id, task)
-    await _send_task_documents(bot, chat_id, task)
-    await _send_task_videos(bot, chat_id, task)
+    if not is_task_delivery_current(user_id, task):
+        return
+    await _send_task_images(bot, chat_id, task, user_id=user_id)
+    await _send_task_documents(bot, chat_id, task, user_id=user_id)
+    await _send_task_videos(bot, chat_id, task, user_id=user_id)
 
     # 5. After content, check and send status
-    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+    if not is_task_delivery_current(user_id, task):
+        return
+    await _check_and_send_status(
+        bot,
+        user_id,
+        wid,
+        task.thread_id,
+        chat_id=task.chat_id,
+    )
 
 
 async def _convert_status_to_content(
@@ -956,18 +1138,21 @@ async def _convert_status_to_content(
     thread_id_or_0: int,
     window_id: str,
     content_text: str,
+    *,
+    chat_id: int | None = None,
 ) -> int | None:
     """Convert status message to content message by editing it.
 
     Returns the message_id if converted successfully, None otherwise.
     """
-    skey = (user_id, thread_id_or_0)
+    skey = _topic_key(user_id, thread_id_or_0 or None, chat_id)
+    if chat_id is None:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
     info = _status_msg_info.pop(skey, None)
     if not info:
         return None
 
     msg_id, stored_wid, _ = info
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
     if stored_wid != window_id:
         # Different window, just delete the old status
         try:
@@ -1033,26 +1218,30 @@ async def _process_progress_update_task(
     """Process an in-progress update (single editable message)."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
-    skey = (user_id, tid)
+    chat_id = _resolve_task_chat_id(user_id, task)
+    skey = _topic_key(user_id, task.thread_id, task.chat_id)
     chunk = task.text or ""
 
     if not chunk.strip():
-        await _do_clear_progress_message(bot, user_id, tid)
+        await _do_clear_progress_message(
+            bot, user_id, tid, chat_id=task.chat_id
+        )
         return
 
     # Keep only one ephemeral process message visible at a time.
-    await _do_clear_status_message(bot, user_id, tid)
+    await _do_clear_status_message(bot, user_id, tid, chat_id=task.chat_id)
 
     current_info = _progress_msg_info.get(skey)
     if current_info:
         msg_id, stored_wid, accumulated = current_info
 
         if stored_wid != wid:
-            await _do_clear_progress_message(bot, user_id, tid)
+            await _do_clear_progress_message(
+                bot, user_id, tid, chat_id=task.chat_id
+            )
             new_accumulated = _merge_progress_text("", chunk)
             await _do_send_progress_message(
-                bot, user_id, tid, wid, new_accumulated, chat_id=chat_id
+                bot, user_id, tid, wid, new_accumulated, chat_id=task.chat_id
             )
             return
 
@@ -1112,12 +1301,12 @@ async def _process_progress_update_task(
                     return
                 logger.debug(f"Failed to edit progress message: {plain_error}")
                 await _do_send_progress_message(
-                    bot, user_id, tid, wid, updated, chat_id=chat_id
+                    bot, user_id, tid, wid, updated, chat_id=task.chat_id
                 )
     else:
         new_accumulated = _merge_progress_text("", chunk)
         await _do_send_progress_message(
-            bot, user_id, tid, wid, new_accumulated, chat_id=chat_id
+            bot, user_id, tid, wid, new_accumulated, chat_id=task.chat_id
         )
 
 
@@ -1127,11 +1316,11 @@ async def _process_progress_start_task(
     """Ensure an in-progress message exists for a topic/window."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
-    skey = (user_id, tid)
+    chat_id = _resolve_task_chat_id(user_id, task)
+    skey = _topic_key(user_id, task.thread_id, task.chat_id)
 
     # Hide status when we intentionally enter progress mode.
-    await _do_clear_status_message(bot, user_id, tid)
+    await _do_clear_status_message(bot, user_id, tid, chat_id=task.chat_id)
 
     current = _progress_msg_info.get(skey)
     if current:
@@ -1150,7 +1339,7 @@ async def _process_progress_start_task(
         tid,
         wid,
         "",
-        chat_id=chat_id,
+        chat_id=task.chat_id,
     )
 
 
@@ -1160,7 +1349,7 @@ async def _process_progress_finalize_task(
     """Mark the in-progress process message as complete and keep it visible."""
     tid = task.thread_id or 0
     wid = task.window_id or ""
-    skey = (user_id, tid)
+    skey = _topic_key(user_id, task.thread_id, task.chat_id)
     info = _progress_msg_info.get(skey)
     if not info:
         return
@@ -1172,12 +1361,14 @@ async def _process_progress_finalize_task(
         return
     if not accumulated.strip():
         # No real progress content was ever shown; remove the placeholder.
-        await _do_clear_progress_message(bot, user_id, tid)
+        await _do_clear_progress_message(
+            bot, user_id, tid, chat_id=task.chat_id
+        )
         return
 
     compact_finalize = (task.finalize_mode or "").strip().lower() == "compact"
     finalized = f"{accumulated.strip()}\n\n{PROGRESS_COMPLETE_MARKER}".strip()
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    chat_id = _resolve_task_chat_id(user_id, task)
     rendered = "✅ Process Complete" if compact_finalize else _render_progress_message(finalized)
 
     try:
@@ -1198,13 +1389,13 @@ async def _process_progress_finalize_task(
         # Keep the finalized process message in chat history, but stop tracking it
         # so the next user turn creates a fresh process message.
         _progress_msg_info.pop(skey, None)
-        _clear_progress_text_cache(user_id, task.thread_id)
+        _clear_progress_text_cache(user_id, task.thread_id, task.chat_id)
     except RetryAfter:
         raise
     except Exception as e:
         if _is_message_not_modified_error(e):
             _progress_msg_info.pop(skey, None)
-            _clear_progress_text_cache(user_id, task.thread_id)
+            _clear_progress_text_cache(user_id, task.thread_id, task.chat_id)
             return
         try:
             plain = rendered.replace(
@@ -1224,17 +1415,17 @@ async def _process_progress_finalize_task(
                 source="message_queue.progress_finalize",
             )
             _progress_msg_info.pop(skey, None)
-            _clear_progress_text_cache(user_id, task.thread_id)
+            _clear_progress_text_cache(user_id, task.thread_id, task.chat_id)
         except RetryAfter:
             raise
         except Exception as plain_error:
             if _is_message_not_modified_error(plain_error):
                 _progress_msg_info.pop(skey, None)
-                _clear_progress_text_cache(user_id, task.thread_id)
+                _clear_progress_text_cache(user_id, task.thread_id, task.chat_id)
                 return
             logger.debug(f"Failed to finalize progress message: {plain_error}")
             _progress_msg_info.pop(skey, None)
-            _clear_progress_text_cache(user_id, task.thread_id)
+            _clear_progress_text_cache(user_id, task.thread_id, task.chat_id)
 
 
 async def _do_send_progress_message(
@@ -1246,8 +1437,8 @@ async def _do_send_progress_message(
     chat_id: int | None = None,
 ) -> None:
     """Send a new in-progress message and track it."""
-    skey = (user_id, thread_id_or_0)
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
+    skey = _topic_key(user_id, thread_id, chat_id)
     if chat_id is None:
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
 
@@ -1289,22 +1480,30 @@ async def _do_clear_progress_message(
     bot: Bot,
     user_id: int,
     thread_id_or_0: int = 0,
+    *,
+    chat_id: int | None = None,
 ) -> None:
     """Delete the in-progress message for a user/topic."""
-    skey = (user_id, thread_id_or_0)
+    scope_chat_id = chat_id
+    skey = _topic_key(user_id, thread_id_or_0 or None, scope_chat_id)
+    if chat_id is None:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
     info = _progress_msg_info.get(skey)
     if info:
         msg_id = info[0]
-        chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             if _progress_msg_info.get(skey) == info:
                 _progress_msg_info.pop(skey, None)
-                _clear_progress_text_cache(user_id, thread_id_or_0 or None)
+                _clear_progress_text_cache(
+                    user_id, thread_id_or_0 or None, scope_chat_id
+                )
         except Exception as e:
             logger.debug(f"Failed to delete progress message {msg_id}: {e}")
     else:
-        _clear_progress_text_cache(user_id, thread_id_or_0 or None)
+        _clear_progress_text_cache(
+            user_id, thread_id_or_0 or None, scope_chat_id
+        )
 
 
 async def _process_status_update_task(
@@ -1313,13 +1512,13 @@ async def _process_status_update_task(
     """Process a status update task."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
-    skey = (user_id, tid)
+    chat_id = _resolve_task_chat_id(user_id, task)
+    skey = _topic_key(user_id, task.thread_id, task.chat_id)
     status_text = task.text or ""
 
     if not status_text:
         # No status text means clear status
-        await _do_clear_status_message(bot, user_id, tid)
+        await _do_clear_status_message(bot, user_id, tid, chat_id=task.chat_id)
         return
 
     current_info = _status_msg_info.get(skey)
@@ -1329,8 +1528,12 @@ async def _process_status_update_task(
 
         if stored_wid != wid:
             # Window changed - delete old and send new
-            await _do_clear_status_message(bot, user_id, tid)
-            await _do_send_status_message(bot, user_id, tid, wid, status_text)
+            await _do_clear_status_message(
+                bot, user_id, tid, chat_id=task.chat_id
+            )
+            await _do_send_status_message(
+                bot, user_id, tid, wid, status_text, chat_id=task.chat_id
+            )
         elif status_text == last_text:
             # Same content, skip edit
             return
@@ -1384,10 +1587,14 @@ async def _process_status_update_task(
                     raise
                 except Exception as e:
                     logger.debug(f"Failed to edit status message: {e}")
-                    await _do_send_status_message(bot, user_id, tid, wid, status_text)
+                    await _do_send_status_message(
+                        bot, user_id, tid, wid, status_text, chat_id=task.chat_id
+                    )
     else:
         # No existing status message, send new
-        await _do_send_status_message(bot, user_id, tid, wid, status_text)
+        await _do_send_status_message(
+            bot, user_id, tid, wid, status_text, chat_id=task.chat_id
+        )
 
 
 async def _do_send_status_message(
@@ -1396,11 +1603,14 @@ async def _do_send_status_message(
     thread_id_or_0: int,
     window_id: str,
     text: str,
+    *,
+    chat_id: int | None = None,
 ) -> None:
     """Send a new status message and track it (internal, called from worker)."""
-    skey = (user_id, thread_id_or_0)
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    skey = _topic_key(user_id, thread_id, chat_id)
+    if chat_id is None:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     # Safety net: delete any orphaned status message before sending a new one.
     # This catches edge cases where tracking was cleared without deleting the message.
     old = _status_msg_info.get(skey)
@@ -1446,13 +1656,16 @@ async def _do_clear_status_message(
     bot: Bot,
     user_id: int,
     thread_id_or_0: int = 0,
+    *,
+    chat_id: int | None = None,
 ) -> None:
     """Delete the status message for a user (internal, called from worker)."""
-    skey = (user_id, thread_id_or_0)
+    skey = _topic_key(user_id, thread_id_or_0 or None, chat_id)
+    if chat_id is None:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
     info = _status_msg_info.get(skey)
     if info:
         msg_id = info[0]
-        chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             if _status_msg_info.get(skey) == info:
@@ -1466,9 +1679,11 @@ async def _check_and_send_status(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
+    *,
+    chat_id: int | None = None,
 ) -> None:
     """Legacy status polling hook retained as no-op in app-server runtime."""
-    _ = bot, user_id, window_id, thread_id
+    _ = bot, user_id, window_id, thread_id, chat_id
 
 
 async def enqueue_content_message(
@@ -1480,6 +1695,7 @@ async def enqueue_content_message(
     content_type: str = "text",
     text: str | None = None,
     thread_id: int | None = None,
+    chat_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
     document_data: list[tuple[str, bytes]] | None = None,
     video_data: list[tuple[str, bytes]] | None = None,
@@ -1502,6 +1718,7 @@ async def enqueue_content_message(
         tool_use_id=tool_use_id,
         content_type=content_type,
         thread_id=thread_id,
+        chat_id=chat_id,
         image_data=image_data,
         document_data=document_data,
         video_data=video_data,
@@ -1516,6 +1733,7 @@ async def enqueue_status_update(
     window_id: str,
     status_text: str | None,
     thread_id: int | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Enqueue status update. Skipped if text unchanged or during flood control."""
     # New status text is ephemeral, but clears are recovery work and should
@@ -1532,7 +1750,7 @@ async def enqueue_status_update(
 
     # Deduplicate: skip if text matches what's already displayed
     if status_text:
-        skey = (user_id, tid)
+        skey = _topic_key(user_id, thread_id, chat_id)
         info = _status_msg_info.get(skey)
         if info and info[1] == window_id and info[2] == status_text:
             return
@@ -1545,9 +1763,15 @@ async def enqueue_status_update(
             text=status_text,
             window_id=window_id,
             thread_id=thread_id,
+            chat_id=chat_id,
         )
     else:
-        task = MessageTask(task_type="status_clear", thread_id=thread_id)
+        task = MessageTask(
+            task_type="status_clear",
+            window_id=window_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
 
     _put_queued_task(user_id, queue, task)
 
@@ -1558,6 +1782,7 @@ async def enqueue_progress_update(
     window_id: str,
     progress_text: str,
     thread_id: int | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Enqueue an in-progress update (single editable process message)."""
     flood_end = _flood_until.get(user_id, 0)
@@ -1570,6 +1795,7 @@ async def enqueue_progress_update(
     _cache_progress_text(
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         chunk=progress_text,
     )
@@ -1580,6 +1806,7 @@ async def enqueue_progress_update(
         text=progress_text,
         window_id=window_id,
         thread_id=thread_id,
+        chat_id=chat_id,
     )
     await _enqueue_progress_update_coalesced(queue, lock, user_id=user_id, task=task)
 
@@ -1589,6 +1816,7 @@ async def enqueue_progress_start(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Enqueue creation of an in-progress placeholder message."""
     flood_end = _flood_until.get(user_id, 0)
@@ -1600,6 +1828,7 @@ async def enqueue_progress_start(
         task_type="progress_start",
         window_id=window_id,
         thread_id=thread_id,
+        chat_id=chat_id,
     )
     _put_queued_task(user_id, queue, task)
 
@@ -1608,11 +1837,14 @@ async def enqueue_progress_clear(
     bot: Bot,
     user_id: int,
     thread_id: int | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Enqueue clearing of the in-progress message."""
-    _clear_progress_text_cache(user_id, thread_id)
+    _clear_progress_text_cache(user_id, thread_id, chat_id)
     queue = get_or_create_queue(bot, user_id)
-    task = MessageTask(task_type="progress_clear", thread_id=thread_id)
+    task = MessageTask(
+        task_type="progress_clear", thread_id=thread_id, chat_id=chat_id
+    )
     _put_queued_task(user_id, queue, task)
 
 
@@ -1623,6 +1855,7 @@ async def enqueue_progress_finalize(
     thread_id: int | None = None,
     *,
     compact: bool = False,
+    chat_id: int | None = None,
 ) -> None:
     """Enqueue finalization of an in-progress message (kept in chat)."""
     queue = get_or_create_queue(bot, user_id)
@@ -1630,33 +1863,50 @@ async def enqueue_progress_finalize(
         task_type="progress_finalize",
         window_id=window_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         finalize_mode="compact" if compact else "full",
     )
     _put_queued_task(user_id, queue, task)
 
 
-def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
+def clear_status_msg_info(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     _status_msg_info.pop(skey, None)
 
 
-def clear_progress_msg_info(user_id: int, thread_id: int | None = None) -> None:
+def clear_progress_msg_info(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear in-progress message tracking for a user/topic."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     _progress_msg_info.pop(skey, None)
     _progress_text_cache.pop(skey, None)
 
 
-def is_progress_active(user_id: int, thread_id: int | None = None) -> bool:
+def is_progress_active(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> bool:
     """Return whether a topic currently has an active in-progress message."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     return skey in _progress_msg_info
 
 
-def get_progress_text(user_id: int, thread_id: int | None = None) -> str:
+def get_progress_text(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> str:
     """Return accumulated in-progress text for a user/topic, if present."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     cached = _progress_text_cache.get(skey)
     if cached:
         return cached[1]
@@ -1677,7 +1927,7 @@ def enqueue_queued_topic_input(
 
     Returns the new queue length for this topic.
     """
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, source_chat_id)
     bucket = _queued_topic_inputs.setdefault(skey, [])
     bucket.append((text, source_chat_id, source_message_id))
     return len(bucket)
@@ -1694,7 +1944,7 @@ def prepend_queued_topic_input(
 
     Returns the new queue length for this topic.
     """
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, source_chat_id)
     bucket = _queued_topic_inputs.setdefault(skey, [])
     bucket.insert(0, (text, source_chat_id, source_message_id))
     return len(bucket)
@@ -1703,18 +1953,20 @@ def prepend_queued_topic_input(
 def get_queued_topic_input_snapshot(
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
 ) -> list[tuple[str, int, int]]:
     """Return a shallow copy of queued /q items for a topic."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     return list(_queued_topic_inputs.get(skey, []))
 
 
 def pop_queued_topic_input(
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
 ) -> tuple[str, int, int] | None:
     """Pop the next queued /q input for a topic (FIFO)."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     bucket = _queued_topic_inputs.get(skey)
     if not bucket:
         return None
@@ -1724,19 +1976,31 @@ def pop_queued_topic_input(
     return item
 
 
-def queued_topic_input_count(user_id: int, thread_id: int | None) -> int:
+def queued_topic_input_count(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> int:
     """Return number of queued /q inputs for a topic."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     return len(_queued_topic_inputs.get(skey, []))
 
 
-def clear_queued_topic_inputs(user_id: int, thread_id: int | None = None) -> None:
+def clear_queued_topic_inputs(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear queued /q inputs for a topic."""
-    skey = (user_id, thread_id or 0)
+    skey = _topic_key(user_id, thread_id, chat_id)
     _queued_topic_inputs.pop(skey, None)
 
 
-def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
+def clear_tool_msg_ids_for_topic(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear tool message ID tracking for a specific topic.
 
     Removes all entries in _tool_msg_ids that match the given user and thread.
@@ -1744,7 +2008,11 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
     tid = thread_id or 0
     # Find and remove all matching keys
     keys_to_remove = [
-        key for key in _tool_msg_ids if key[1] == user_id and key[2] == tid
+        key
+        for key in _tool_msg_ids
+        if key[1] == user_id
+        and key[3] == tid
+        and (chat_id is None or key[2] == (chat_id or 0))
     ]
     for key in keys_to_remove:
         _tool_msg_ids.pop(key, None)
@@ -1763,5 +2031,6 @@ async def shutdown_workers() -> None:
     _queue_locks.clear()
     _active_delivery_topics.clear()
     _queued_delivery_topic_counts.clear()
+    _topic_delivery_generations.clear()
     _queue_dock_msg_info.clear()
     logger.info("Message queue workers stopped")

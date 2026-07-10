@@ -31,10 +31,16 @@ class TrackedSession:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TrackedSession":
         """Create from dict."""
+        session_id = data.get("session_id", "")
+        file_path = data.get("file_path", "")
+        try:
+            last_byte_offset = int(data.get("last_byte_offset", 0))
+        except (TypeError, ValueError, OverflowError):
+            last_byte_offset = 0
         return cls(
-            session_id=data.get("session_id", ""),
-            file_path=data.get("file_path", ""),
-            last_byte_offset=data.get("last_byte_offset", 0),
+            session_id=session_id if isinstance(session_id, str) else "",
+            file_path=file_path if isinstance(file_path, str) else "",
+            last_byte_offset=max(0, last_byte_offset),
         )
 
 
@@ -58,14 +64,20 @@ class MonitorState:
 
         try:
             data = json.loads(self.state_file.read_text())
+            if not isinstance(data, dict):
+                raise TypeError("state root must be an object")
             sessions = data.get("tracked_sessions", {})
+            if not isinstance(sessions, dict):
+                raise TypeError("tracked_sessions must be an object")
             self.tracked_sessions = {
-                k: TrackedSession.from_dict(v) for k, v in sessions.items()
+                k: TrackedSession.from_dict(v)
+                for k, v in sessions.items()
+                if isinstance(k, str) and isinstance(v, dict)
             }
             logger.info(
                 f"Loaded {len(self.tracked_sessions)} tracked sessions from state"
             )
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(f"Failed to load state file: {e}")
             self.tracked_sessions = {}
 

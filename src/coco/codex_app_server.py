@@ -46,6 +46,12 @@ _APP_SERVER_START_FAILURE_FILE = coco_dir() / "app_server_start_failures.json"
 _APP_SERVER_OWNED_PIDS_DIR = coco_dir() / "app_server_owned_pids"
 _APP_SERVER_START_FAILURE_WINDOW_SECONDS = 15 * 60
 _APP_SERVER_START_FAILURE_RESET_THRESHOLD = 3
+_CODEX_LOGS_DB_NAME = "logs_2.sqlite"
+_CODEX_LOGS_DB_RECOVERY_MIN_BYTES = 1024 * 1024 * 1024
+_CODEX_LOGS_DB_WAL_RECOVERY_MIN_BYTES = 256 * 1024 * 1024
+_CODEX_LOGS_DB_RECOVERY_TRUE_VALUES = {"1", "true", "yes", "on"}
+_CODEX_LOGS_DB_PROCESS_EXIT_TIMEOUT_SECONDS = 1.0
+_CODEX_LOGS_DB_PROCESS_EXIT_POLL_SECONDS = 0.05
 
 
 class CodexAppServerError(RuntimeError):
@@ -60,6 +66,17 @@ class CodexAppServerClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
+        self._notification_delivery_tasks: set[asyncio.Task[None]] = set()
+        self._notification_locks: dict[str, asyncio.Lock] = {}
+        self._notification_active_partitions: set[str] = set()
+        self._notification_partition_backlog: dict[
+            str, deque[tuple[str, dict[str, Any]]]
+        ] = {}
+        self._notification_partition_backlog_size = 0
+        self._notification_backlog_available = asyncio.Event()
+        self._notification_delivery_slots = asyncio.Semaphore(
+            APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE
+        )
         self._notification_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = (
             asyncio.Queue(maxsize=APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE)
         )
@@ -257,6 +274,17 @@ class CodexAppServerClient:
         self._reader_task = None
         self._stderr_task = None
         self._notification_task = None
+        delivery_tasks = list(self._notification_delivery_tasks)
+        self._notification_partition_backlog.clear()
+        self._notification_partition_backlog_size = 0
+        self._notification_backlog_available.set()
+        for task in delivery_tasks:
+            task.cancel()
+        if delivery_tasks:
+            await asyncio.gather(*delivery_tasks, return_exceptions=True)
+        self._notification_delivery_tasks.clear()
+        self._notification_locks.clear()
+        self._notification_active_partitions.clear()
         # Drop any queued notifications from the previous process lifecycle.
         self._notification_queue = asyncio.Queue(maxsize=APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE)
         self._notification_overflow.clear()
@@ -483,6 +511,109 @@ class CodexAppServerClient:
             or "timed out waiting for app-server response: initialize" in text
         )
 
+    @staticmethod
+    def _codex_home() -> Path:
+        raw = env_alias("CODEX_HOME", default="").strip()
+        if raw:
+            return Path(raw).expanduser()
+        return Path.home() / ".codex"
+
+    @staticmethod
+    def _codex_logs_db_recovery_enabled() -> bool:
+        raw = env_alias(
+            "COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB",
+            default="false",
+        ).strip().lower()
+        return raw in _CODEX_LOGS_DB_RECOVERY_TRUE_VALUES
+
+    @staticmethod
+    def _path_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    @staticmethod
+    def _new_codex_logs_db_backup_dir(codex_home: Path) -> Path:
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        base = codex_home / f"logs-sqlite-backup-{timestamp}"
+        for suffix in range(1000):
+            candidate = base if suffix == 0 else codex_home / f"{base.name}-{suffix}"
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+                return candidate
+            except FileExistsError:
+                continue
+        raise CodexAppServerError(
+            f"Unable to create Codex logs SQLite backup directory under {codex_home}"
+        )
+
+    @staticmethod
+    def _recover_oversized_codex_logs_db(codex_home: Path | None = None) -> Path | None:
+        if not CodexAppServerClient._codex_logs_db_recovery_enabled():
+            return None
+
+        codex_home = codex_home or CodexAppServerClient._codex_home()
+        logs_db = codex_home / _CODEX_LOGS_DB_NAME
+        logs_wal = codex_home / f"{_CODEX_LOGS_DB_NAME}-wal"
+        logs_shm = codex_home / f"{_CODEX_LOGS_DB_NAME}-shm"
+        db_size = CodexAppServerClient._path_size(logs_db)
+        wal_size = CodexAppServerClient._path_size(logs_wal)
+        if (
+            db_size < _CODEX_LOGS_DB_RECOVERY_MIN_BYTES
+            and wal_size < _CODEX_LOGS_DB_WAL_RECOVERY_MIN_BYTES
+        ):
+            return None
+
+        backup_dir = CodexAppServerClient._new_codex_logs_db_backup_dir(codex_home)
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for path in (logs_db, logs_wal, logs_shm):
+                target = backup_dir / path.name
+                try:
+                    path.replace(target)
+                    moved.append((path, target))
+                except FileNotFoundError:
+                    continue
+        except Exception:
+            rollback_errors: list[Exception] = []
+            for original, target in reversed(moved):
+                try:
+                    target.replace(original)
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+            if not rollback_errors:
+                try:
+                    backup_dir.rmdir()
+                except OSError:
+                    pass
+            else:
+                logger.error(
+                    "Failed rolling back %d Codex logs SQLite quarantine move(s)",
+                    len(rollback_errors),
+                )
+            raise
+
+        if not moved:
+            try:
+                backup_dir.rmdir()
+            except OSError:
+                pass
+            return None
+
+        logger.warning(
+            (
+                "Quarantined oversized Codex logs SQLite files to %s after "
+                "app-server startup failures; %s=%d bytes, wal=%d bytes, moved=%s"
+            ),
+            backup_dir,
+            _CODEX_LOGS_DB_NAME,
+            db_size,
+            wal_size,
+            ",".join(original.name for original, _target in moved),
+        )
+        return backup_dir
+
     async def _attempt_recovery_after_start_failure(self, err: Exception) -> bool:
         failure_count = self._record_start_failure()
         emit_recovery = (
@@ -499,8 +630,87 @@ class CodexAppServerClient:
         )
         self._clear_start_failure_state()
         self._reap_stale_local_app_server_processes()
+        if self._codex_logs_db_recovery_enabled():
+            if await self._wait_for_local_app_servers_to_exit():
+                try:
+                    self._recover_oversized_codex_logs_db()
+                except Exception:
+                    logger.warning(
+                        (
+                            "Failed recovering oversized Codex logs SQLite files after "
+                            "app-server startup failures"
+                        ),
+                        exc_info=True,
+                    )
+            else:
+                logger.warning(
+                    "Skipping Codex logs SQLite quarantine because an app-server process is still live"
+                )
         await asyncio.sleep(0.5)
         return True
+
+    def _running_local_app_server_pids(self) -> set[int] | None:
+        """Return local app-server PIDs, or None when liveness cannot be proven."""
+        if os.name == "nt":
+            return None
+        try:
+            proc = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            logger.warning("Failed checking app-server exit state", exc_info=True)
+            return None
+        if proc.returncode != 0:
+            return None
+
+        pids: set[int] = set()
+        for raw_line in proc.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                pid_text, args = line.split(None, 1)
+                pid = int(pid_text)
+            except (ValueError, TypeError):
+                continue
+            if self._is_codex_app_server_command(args):
+                pids.add(pid)
+        return pids
+
+    @staticmethod
+    def _is_codex_app_server_command(args: str) -> bool:
+        """Recognize direct and node-launched Codex app-server commands."""
+        if "--listen stdio://" not in args:
+            return False
+        try:
+            argv = shlex.split(args)
+        except ValueError:
+            argv = args.split()
+        if "app-server" not in argv:
+            return False
+        for token in argv:
+            normalized = token.replace("\\", "/").lower()
+            executable = normalized.rsplit("/", 1)[-1]
+            if executable in {"codex", "codex.exe", "codex.js", "codex.mjs"}:
+                return True
+            if "/@openai/codex/" in normalized:
+                return True
+        return False
+
+    async def _wait_for_local_app_servers_to_exit(self) -> bool:
+        """Wait until no local Codex app-server can still write the shared logs DB."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CODEX_LOGS_DB_PROCESS_EXIT_TIMEOUT_SECONDS
+        while True:
+            pids = self._running_local_app_server_pids()
+            if pids == set():
+                return True
+            if pids is None or loop.time() >= deadline:
+                return False
+            await asyncio.sleep(_CODEX_LOGS_DB_PROCESS_EXIT_POLL_SECONDS)
 
     def _reap_stale_systemd_app_server_units(self) -> None:
         if not self._systemd_run_enabled():
@@ -590,7 +800,7 @@ class CodexAppServerClient:
                 pid_text, ppid_text, args = line.split(None, 2)
             except ValueError:
                 continue
-            if "codex app-server" not in args or "--listen stdio://" not in args:
+            if not self._is_codex_app_server_command(args):
                 continue
             try:
                 pid = int(pid_text)
@@ -799,17 +1009,151 @@ class CodexAppServerClient:
                     method, params = self._notification_overflow.popleft()
                 else:
                     method, params = await self._notification_queue.get()
-                handler = self._notification_handler
-                if not handler:
+                if not self._notification_handler:
                     continue
-                try:
-                    await handler(method, params)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("app-server notification handler failed: %s", method)
+                # Preserve ordering within one Codex thread while allowing an
+                # unrelated topic to bypass slow Telegram I/O or completion
+                # grace periods in another thread.
+                partition = self._notification_partition(params)
+                if partition in self._notification_active_partitions:
+                    await self._append_notification_partition_backlog(
+                        partition,
+                        method,
+                        params,
+                    )
+                    continue
+                await self._notification_delivery_slots.acquire()
+                self._notification_active_partitions.add(partition)
+                self._start_notification_delivery(partition, method, params)
         except asyncio.CancelledError:
             return
+
+    @staticmethod
+    def _notification_partition(params: dict[str, Any]) -> str:
+        thread_id = params.get("threadId")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+        return "__global__"
+
+    def _start_notification_delivery(
+        self,
+        partition: str,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        task = asyncio.create_task(self._deliver_notification(method, params))
+        self._notification_delivery_tasks.add(task)
+        task.add_done_callback(
+            lambda completed, key=partition: self._notification_delivery_done(
+                completed, key
+            )
+        )
+
+    async def _append_notification_partition_backlog(
+        self,
+        partition: str,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        limit = APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE
+        while True:
+            backlog = self._notification_partition_backlog.get(partition)
+            if self._notification_partition_backlog_size < limit:
+                if backlog is None:
+                    backlog = deque()
+                    self._notification_partition_backlog[partition] = backlog
+                backlog.append((method, params))
+                self._notification_partition_backlog_size += 1
+                return
+
+            if method in APP_SERVER_NOTIFICATION_DROP_WHEN_FULL:
+                if backlog is not None:
+                    for index in range(len(backlog) - 1, -1, -1):
+                        if backlog[index][0] == method:
+                            backlog[index] = (method, params)
+                            logger.debug(
+                                "Coalesced %s notification in full global backlog for %s",
+                                method,
+                                partition,
+                            )
+                            return
+                logger.warning(
+                    "Dropping %s notification from full global backlog for %s",
+                    method,
+                    partition,
+                )
+                return
+
+            evicted = False
+            for backlog_partition, candidate_backlog in list(
+                self._notification_partition_backlog.items()
+            ):
+                for item in candidate_backlog:
+                    if item[0] not in APP_SERVER_NOTIFICATION_DROP_WHEN_FULL:
+                        continue
+                    candidate_backlog.remove(item)
+                    self._notification_partition_backlog_size -= 1
+                    if not candidate_backlog:
+                        self._notification_partition_backlog.pop(backlog_partition, None)
+                    evicted = True
+                    break
+                if evicted:
+                    break
+            if evicted:
+                backlog = self._notification_partition_backlog.setdefault(
+                    partition, deque()
+                )
+                backlog.append((method, params))
+                self._notification_partition_backlog_size += 1
+                logger.warning(
+                    "Evicted replaceable notification from global backlog for %s",
+                    method,
+                )
+                return
+
+            # Every queued item is lifecycle/final output. Preserve it and
+            # apply backpressure until the active delivery advances.
+            self._notification_backlog_available.clear()
+            if self._notification_partition_backlog_size >= limit:
+                await self._notification_backlog_available.wait()
+
+    def _notification_delivery_done(
+        self,
+        task: asyncio.Task[None],
+        partition: str,
+    ) -> None:
+        self._notification_delivery_tasks.discard(task)
+        backlog = self._notification_partition_backlog.get(partition)
+        if backlog:
+            method, params = backlog.popleft()
+            self._notification_partition_backlog_size -= 1
+            self._notification_backlog_available.set()
+            if not backlog:
+                self._notification_partition_backlog.pop(partition, None)
+                self._notification_locks.pop(partition, None)
+            self._start_notification_delivery(partition, method, params)
+            return
+        self._notification_locks.pop(partition, None)
+        self._notification_active_partitions.discard(partition)
+        self._notification_delivery_slots.release()
+
+    async def _deliver_notification(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        partition = self._notification_partition(params)
+        lock = self._notification_locks.setdefault(partition, asyncio.Lock())
+        async with lock:
+            handler = self._notification_handler
+            if not handler:
+                return
+            try:
+                await handler(method, params)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("app-server notification handler failed: %s", method)
 
     def _drop_replaceable_queued_notification(self) -> bool:
         queue_items = getattr(self._notification_queue, "_queue", None)
@@ -1188,9 +1532,10 @@ class CodexAppServerClient:
         self,
         *,
         thread_id: str,
+        timeout: float = 60.0,
     ) -> dict[str, Any]:
         params = {"threadId": thread_id}
-        result = await self.request("thread/read", params, timeout=60.0)
+        result = await self.request("thread/read", params, timeout=timeout)
         return result if isinstance(result, dict) else {}
 
     async def thread_rollback(

@@ -83,3 +83,9 @@ class TestReadCwdFromJsonl:
 
     def test_missing_file_returns_empty(self, tmp_path: Path):
         assert read_cwd_from_jsonl(tmp_path / "nonexistent.jsonl") == ""
+
+    def test_skips_non_object_json_entries(self, tmp_path: Path):
+        f = tmp_path / "session.jsonl"
+        f.write_text('[]\nnull\n{"cwd": 7}\n{"cwd": "/valid"}\n', encoding="utf-8")
+
+        assert read_cwd_from_jsonl(f) == "/valid"

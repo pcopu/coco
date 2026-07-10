@@ -890,7 +890,7 @@ class AgentRpcClient:
             if not isinstance(name, str) or not isinstance(data_b64, str):
                 continue
             try:
-                resolved.append((name, base64.b64decode(data_b64)))
+                resolved.append((name, base64.b64decode(data_b64, validate=True)))
             except Exception:
                 continue
         return resolved
@@ -926,7 +926,9 @@ class AgentRpcClient:
                 if not isinstance(name, str) or not isinstance(data_b64, str):
                     continue
                 try:
-                    resolved_documents.append((name, base64.b64decode(data_b64)))
+                    resolved_documents.append(
+                        (name, base64.b64decode(data_b64, validate=True))
+                    )
                 except Exception:
                     continue
 
@@ -941,7 +943,9 @@ class AgentRpcClient:
                 if not isinstance(media_type, str) or not isinstance(data_b64, str):
                     continue
                 try:
-                    resolved_images.append((media_type, base64.b64decode(data_b64)))
+                    resolved_images.append(
+                        (media_type, base64.b64decode(data_b64, validate=True))
+                    )
                 except Exception:
                     continue
 
@@ -956,7 +960,9 @@ class AgentRpcClient:
                 if not isinstance(media_type, str) or not isinstance(data_b64, str):
                     continue
                 try:
-                    resolved_videos.append((media_type, base64.b64decode(data_b64)))
+                    resolved_videos.append(
+                        (media_type, base64.b64decode(data_b64, validate=True))
+                    )
                 except Exception:
                     continue
 
@@ -1164,7 +1170,17 @@ def _run_command_sync(
     except FileNotFoundError as exc:
         return False, "", "", str(exc)
     except subprocess.TimeoutExpired as exc:
-        return False, exc.stdout or "", exc.stderr or "", "timeout"
+        stdout = (
+            exc.stdout.decode("utf-8", errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else exc.stdout or ""
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else exc.stderr or ""
+        )
+        return False, stdout, stderr, "timeout"
     except OSError as exc:
         return False, "", "", str(exc)
     return proc.returncode == 0, proc.stdout, proc.stderr, ""
@@ -1181,6 +1197,15 @@ def _resolve_codex_upgrade_command() -> tuple[str, str]:
     custom = env_alias(_CODEX_UPGRADE_COMMAND_ENV)
     if custom:
         return custom, "custom"
+    codex_binary = shutil.which("codex") or ""
+    codex_realpath = os.path.realpath(codex_binary) if codex_binary else ""
+    normalized_binary = codex_realpath.lower().replace("\\", "/")
+    if "/node_modules/@openai/codex/" in normalized_binary:
+        return "npm install -g @openai/codex@latest", "npm"
+    if "/pipx/venvs/" in normalized_binary:
+        return "pipx upgrade codex", "pipx"
+    if "/uv/tools/" in normalized_binary:
+        return "uv tool upgrade codex", "uv"
     if shutil.which("uv"):
         return "uv tool upgrade codex", "uv"
     if shutil.which("pipx"):

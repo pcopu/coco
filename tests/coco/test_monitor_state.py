@@ -25,6 +25,11 @@ class TestTrackedSession:
         assert session.file_path == ""
         assert session.last_byte_offset == 0
 
+    def test_from_dict_non_finite_offset_uses_zero(self):
+        session = TrackedSession.from_dict({"last_byte_offset": float("inf")})
+
+        assert session.last_byte_offset == 0
+
 
 class TestMonitorStateLoad:
     def test_load_missing_file(self, tmp_path):

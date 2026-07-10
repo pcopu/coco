@@ -157,6 +157,7 @@ from .handlers.looper import (
     stop_looper,
 )
 from .handlers.message_queue import (
+    cancel_topic_delivery,
     clear_queued_topic_dock,
     clear_queued_topic_inputs,
     clear_status_msg_info,
@@ -203,6 +204,7 @@ from .session_monitor import NewMessage, SessionMonitor
 from .skills import resolve_skill_identifier
 from .telemetry import emit_telemetry
 from .telegram_memory import log_incoming_message
+from .telegram_sender import split_message
 from .transcription import (
     TranscriptionError,
     begin_transcription_bootstrap,
@@ -251,6 +253,7 @@ _pending_transient_app_server_errors: dict[str, tuple[str, str]] = {}
 # threads should be ignored until the next started/completed notification clears
 # the marker.
 _interrupted_codex_threads: set[str] = set()
+_interrupted_codex_turns: dict[str, str] = {}
 
 # Prevent duplicate /restart handling races.
 _restart_requested = False
@@ -3844,6 +3847,14 @@ async def _set_eyes_reaction(message) -> None:
         )
 
 
+def _start_ingress_ack(message) -> tuple[asyncio.Task, asyncio.Task]:
+    """Start Telegram's visible receipt signals without blocking submission."""
+    return (
+        asyncio.create_task(_set_eyes_reaction(message)),
+        asyncio.create_task(message.chat.send_action(ChatAction.TYPING)),
+    )
+
+
 async def _set_hourglass_reaction(message) -> None:
     """Set hourglass reaction on a queued /q message (best effort)."""
     try:
@@ -4297,6 +4308,8 @@ async def _is_window_in_progress(
     user_id: int,
     thread_id: int | None,
     window_id: str,
+    *,
+    chat_id: int | None = None,
 ) -> bool:
     """Return whether a window appears to be actively processing."""
     if session_manager.is_window_external_turn_active(window_id):
@@ -4312,7 +4325,7 @@ async def _is_window_in_progress(
             # App-server turn is idle; stale process-message state must not force
             # steer mode for the next user message.
             return False
-    return is_progress_active(user_id, thread_id)
+    return is_progress_active(user_id, thread_id, chat_id)
 
 
 async def _handle_shadow_transcript_message_for_topic(
@@ -4342,7 +4355,7 @@ async def _handle_shadow_transcript_message_for_topic(
         if sync_mode != TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL:
             return True
         session_manager.set_window_external_turn_active(window_id, False)
-        if queued_topic_input_count(user_id, thread_id) > 0:
+        if queued_topic_input_count(user_id, thread_id, chat_id) > 0:
             await _dispatch_next_queued_input(
                 bot=bot,
                 user_id=user_id,
@@ -4395,7 +4408,9 @@ async def _dispatch_next_queued_input(
     chat_id: int | None = None,
 ) -> None:
     """Send one queued /q message after current run completion."""
-    if await _is_window_in_progress(user_id, thread_id, window_id):
+    if await _is_window_in_progress(
+        user_id, thread_id, window_id, chat_id=chat_id
+    ):
         emit_telemetry(
             "queue.dispatch.deferred_active_turn",
             user_id=user_id,
@@ -4407,16 +4422,18 @@ async def _dispatch_next_queued_input(
             user_id,
             thread_id,
             window_id=window_id,
+            chat_id=chat_id,
         )
         return
 
-    queued = pop_queued_topic_input(user_id, thread_id)
+    queued = pop_queued_topic_input(user_id, thread_id, chat_id)
     if not queued:
         await sync_queued_topic_dock(
             bot,
             user_id,
             thread_id,
             window_id=window_id,
+            chat_id=chat_id,
         )
         return
 
@@ -4426,6 +4443,7 @@ async def _dispatch_next_queued_input(
         user_id,
         thread_id,
         window_id=window_id,
+        chat_id=chat_id,
     )
     emit_telemetry(
         "queue.dispatch.start",
@@ -4482,6 +4500,7 @@ async def _dispatch_next_queued_input(
             user_id,
             thread_id,
             window_id=window_id,
+            chat_id=chat_id,
         )
         await safe_send(
             bot,
@@ -5317,6 +5336,15 @@ def _resolve_codex_upgrade_command() -> tuple[str, str]:
     custom = env_alias(_CODEX_UPGRADE_COMMAND_ENV)
     if custom:
         return custom, "custom"
+    codex_binary = _resolve_codex_exec_binary()
+    codex_realpath = os.path.realpath(codex_binary) if codex_binary else ""
+    normalized_binary = codex_realpath.lower().replace("\\", "/")
+    if "/node_modules/@openai/codex/" in normalized_binary:
+        return "npm install -g @openai/codex@latest", "npm"
+    if "/pipx/venvs/" in normalized_binary:
+        return "pipx upgrade codex", "pipx"
+    if "/uv/tools/" in normalized_binary:
+        return "uv tool upgrade codex", "uv"
     if shutil.which("uv"):
         return "uv tool upgrade codex", "uv"
     if shutil.which("pipx"):
@@ -8549,7 +8577,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     prompt = _pick_image_prompt(update.message.caption)
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id)
+    clear_status_msg_info(user.id, thread_id, chat_id)
 
     if config.session_provider == "codex":
         asyncio.create_task(
@@ -8826,8 +8854,10 @@ async def _forward_topic_text_message(
             thread_id,
         )
         session_manager.unbind_thread(user_id, thread_id, chat_id=chat_id)
-        clear_queued_topic_inputs(user_id, thread_id)
-        await clear_queued_topic_dock(context.bot, user_id, thread_id)
+        clear_queued_topic_inputs(user_id, thread_id, chat_id)
+        await clear_queued_topic_dock(
+            context.bot, user_id, thread_id, chat_id
+        )
         await safe_reply(
             message,
             "❌ Session binding is incomplete. Send a message to start a new session.",
@@ -8887,6 +8917,7 @@ async def _forward_topic_text_message(
                     user_id,
                     target_thread_id,
                     window_id=target_wid,
+                    chat_id=source_chat_id,
                 )
                 return
 
@@ -8916,6 +8947,38 @@ async def _forward_topic_text_message(
             )
             return
 
+    direct_goal_action, direct_goal_text = _parse_direct_goal_request(text)
+    if direct_goal_action:
+        from .handlers import commands as command_handlers
+
+        if direct_goal_action == "clear":
+            ok, _payload, message_text = await session_manager.clear_topic_goal(
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+            )
+            if not ok:
+                prefix = "ℹ️" if "no goal" in message_text.lower() else "❌"
+                await safe_reply(message, f"{prefix} {message_text}")
+                return
+            await safe_reply(message, "✅ Goal cleared.")
+            return
+
+        ok, payload, message_text = await session_manager.set_topic_goal(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            goal_text=direct_goal_text,
+        )
+        if not ok:
+            await safe_reply(message, f"❌ {message_text}")
+            return
+        await safe_reply(
+            message,
+            command_handlers._render_goal_text(payload, prefix="✅ Goal updated."),
+        )
+        return
+
     if session_manager.is_window_external_turn_active(wid):
         source_chat_id = getattr(message, "chat_id", None)
         chat = getattr(message, "chat", None)
@@ -8934,12 +8997,19 @@ async def _forward_topic_text_message(
             user_id,
             thread_id,
             window_id=wid,
+            chat_id=chat_id,
         )
         return
 
-    is_steer_message = await _is_window_in_progress(user_id, thread_id, wid)
+    is_steer_message = await _is_window_in_progress(
+        user_id, thread_id, wid, chat_id=chat_id
+    )
 
-    await message.chat.send_action(ChatAction.TYPING)
+    ack_tasks = _start_ingress_ack(message)
+    # Give the acknowledgement task one scheduling turn so the Telegram API
+    # calls start before app-server submission, even when a test/fake send is
+    # fully synchronous.
+    await asyncio.sleep(0)
     if is_steer_message:
         logger.info(
             "Steer message accepted (user=%d, thread=%d, window=%s)",
@@ -8948,8 +9018,12 @@ async def _forward_topic_text_message(
             wid,
         )
     else:
-        await enqueue_status_update(context.bot, user_id, wid, None, thread_id=thread_id)
-        await enqueue_progress_clear(context.bot, user_id, thread_id=thread_id)
+        await enqueue_status_update(
+            context.bot, user_id, wid, None, thread_id=thread_id, chat_id=chat_id
+        )
+        await enqueue_progress_clear(
+            context.bot, user_id, thread_id=thread_id, chat_id=chat_id
+        )
 
     success, send_msg = await session_manager.send_topic_text_to_window(
         user_id=user_id,
@@ -8959,6 +9033,7 @@ async def _forward_topic_text_message(
         text=text,
     )
     if not success:
+        await asyncio.gather(*ack_tasks, return_exceptions=True)
         await safe_reply(message, f"❌ {send_msg}")
         return
     if is_steer_message:
@@ -8974,6 +9049,7 @@ async def _forward_topic_text_message(
             user_id,
             window_id=wid,
             thread_id=thread_id,
+            chat_id=chat_id,
         )
         note_run_started(
             user_id=user_id,
@@ -8983,7 +9059,7 @@ async def _forward_topic_text_message(
             pending_text=text,
             expect_response=True,
         )
-    await _set_eyes_reaction(message)
+    await asyncio.gather(*ack_tasks, return_exceptions=True)
 
 
 def _resolve_coco_control_target_topic(
@@ -9139,13 +9215,31 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     )
     if not is_coco_control_voice:
-        await safe_reply(message, transcript)
+        for transcript_chunk in split_message(transcript, max_length=3000):
+            try:
+                await safe_reply(message, transcript_chunk)
+            except Exception as exc:
+                logger.warning(
+                    "Failed echoing audio transcript (user=%d thread=%s): %s",
+                    user.id,
+                    thread_id,
+                    exc,
+                )
+                break
 
     if complete_transcription_bootstrap(bootstrap_handle, success=True):
-        await safe_reply(
-            message,
-            "✅ Local transcription is ready. The model finished downloading and the first transcription is complete.",
-        )
+        try:
+            await safe_reply(
+                message,
+                "✅ Local transcription is ready. The model finished downloading and the first transcription is complete.",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed announcing transcription bootstrap completion (user=%d thread=%s): %s",
+                user.id,
+                thread_id,
+                exc,
+            )
 
     if is_coco_control_voice:
         prompt = _build_coco_control_audio_prompt(
@@ -12819,6 +12913,43 @@ def _is_transient_app_server_turn_error(message: str, details: str = "") -> bool
     )
 
 
+_DIRECT_GOAL_SET_PATTERNS = (
+    re.compile(
+        r"^\s*(?:please\s+)?(?:set|change|update)\s+(?:the\s+)?goal\s+(?:to|as)\s+(?P<goal>.+?)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:please\s+)?goal\s*:\s*(?P<goal>.+?)\s*$",
+        re.IGNORECASE,
+    ),
+)
+_DIRECT_GOAL_CLEAR_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:clear|remove|reset)\s+(?:the\s+)?goal\s*$",
+    re.IGNORECASE,
+)
+_DIRECT_GOAL_COMPOUND_CLAUSE_PATTERN = re.compile(
+    r"\b(?:and\s+then|then|if|when|unless|after|before)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_direct_goal_request(text: str) -> tuple[str, str]:
+    """Parse one explicit native goal request from plain topic text."""
+    normalized = text.strip() if isinstance(text, str) else ""
+    if not normalized:
+        return "", ""
+    if _DIRECT_GOAL_CLEAR_PATTERN.match(normalized):
+        return "clear", ""
+    for pattern in _DIRECT_GOAL_SET_PATTERNS:
+        match = pattern.match(normalized)
+        if not match:
+            continue
+        goal_text = str(match.group("goal") or "").strip()
+        if goal_text and not _DIRECT_GOAL_COMPOUND_CLAUSE_PATTERN.search(goal_text):
+            return "set", goal_text
+    return "", ""
+
+
 async def _retry_failed_turn_after_transient_app_server_error(
     *,
     bot: Bot,
@@ -12891,6 +13022,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
             bot,
             user_id,
             thread_id=bound_thread_id,
+            chat_id=bound_chat_id,
         )
         send_ok, send_msg = await session_manager.send_topic_text_to_window(
             user_id=user_id,
@@ -12930,6 +13062,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
                 user_id,
                 window_id=wid,
                 thread_id=bound_thread_id,
+                chat_id=bound_chat_id,
             )
             await safe_send(
                 bot,
@@ -13316,7 +13449,13 @@ async def _handle_codex_app_server_notification(
         turn = params.get("turn")
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if isinstance(thread_id, str) and isinstance(turn_id, str):
-            _interrupted_codex_threads.discard(thread_id)
+            fenced_turn_id = _interrupted_codex_turns.get(thread_id)
+            if (
+                thread_id not in _interrupted_codex_threads
+                or fenced_turn_id not in {"", turn_id}
+            ):
+                _interrupted_codex_threads.discard(thread_id)
+                _interrupted_codex_turns.pop(thread_id, None)
             _pending_transient_app_server_errors.pop(thread_id, None)
             _pending_image_generation_threads.discard(thread_id)
             session_manager.set_codex_turn_for_thread(thread_id, turn_id)
@@ -13346,7 +13485,9 @@ async def _handle_codex_app_server_notification(
             await asyncio.sleep(_IMAGE_GENERATION_COMPLETION_GRACE_SECONDS)
             had_final_text = _turn_has_final_text.get(thread_id, False)
         _turn_has_final_text.pop(thread_id, None)
-        _interrupted_codex_threads.discard(thread_id)
+        # Keep the fence through terminal handling so late child output stays
+        # muted; the next FIFO `turn/started` notification clears it.
+        was_interrupted = thread_id in _interrupted_codex_threads
         _pending_image_generation_threads.discard(thread_id)
         session_manager.set_codex_turn_for_thread(thread_id, "")
         transient_error = _pending_transient_app_server_errors.pop(thread_id, None)
@@ -13369,7 +13510,7 @@ async def _handle_codex_app_server_notification(
         # Any terminal turn completion should allow queued `/q` input to advance.
         # Restricting this to failed/interrupted leaves successful turns parked.
         dispatch_after_completion = True
-        clear_progress_on_completion = status in {
+        clear_progress_on_completion = was_interrupted or status in {
             "failed",
             "interrupted",
             "cancelled",
@@ -13396,6 +13537,7 @@ async def _handle_codex_app_server_notification(
                     bot,
                     user_id,
                     thread_id=bound_thread_id,
+                    chat_id=bound_chat_id,
                 )
             else:
                 # Ensure process-message tracking is reset even when no final
@@ -13405,6 +13547,7 @@ async def _handle_codex_app_server_notification(
                     user_id,
                     window_id=wid,
                     thread_id=bound_thread_id,
+                    chat_id=bound_chat_id,
                     # Always compact the finalized process message. The actual
                     # assistant response (or fallback) should be delivered as a
                     # separate message.
@@ -13415,6 +13558,7 @@ async def _handle_codex_app_server_notification(
                     fallback_final_text = get_progress_text(
                         user_id=user_id,
                         thread_id=bound_thread_id,
+                        chat_id=bound_chat_id,
                     ).strip()
                     if fallback_final_text:
                         fallback_note = fallback_final_text
@@ -13442,10 +13586,14 @@ async def _handle_codex_app_server_notification(
                         content_type="text",
                         text=fallback_note,
                         thread_id=bound_thread_id,
+                        chat_id=bound_chat_id,
                         response_mode_override=response_mode_override,
                     )
-            should_dispatch = queued_topic_input_count(user_id, bound_thread_id) > 0 and (
-                dispatch_after_completion or missing_final_text
+            should_dispatch = (
+                queued_topic_input_count(
+                    user_id, bound_thread_id, bound_chat_id
+                )
+                and (dispatch_after_completion or missing_final_text)
             )
             if should_dispatch:
                 await _dispatch_next_queued_input(
@@ -13671,6 +13819,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                         window_id=wid,
                         progress_text=progress_text,
                         thread_id=thread_id,
+                        chat_id=chat_id,
                     )
             else:
                 response_mode_override = ""
@@ -13682,6 +13831,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                         window_id=wid,
                         thread_id=thread_id,
                         compact=True,
+                        chat_id=chat_id,
                     )
                     note_run_completed(
                         user_id=user_id,
@@ -13713,6 +13863,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     content_type=msg.content_type,
                     text=delivery_text,
                     thread_id=thread_id,
+                    chat_id=chat_id,
                     image_data=combined_image_data,
                     document_data=document_data,
                     video_data=video_data,

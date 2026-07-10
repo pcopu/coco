@@ -1,5 +1,8 @@
 """Integration tests for MonitorState — real file I/O with tmp_path."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from coco.monitor_state import MonitorState, TrackedSession
@@ -32,6 +35,49 @@ class TestMonitorStateIntegration:
         state_file.write_text("{{{not json at all!!!")
         state = MonitorState(state_file=state_file)
         state.load()
+        assert state.tracked_sessions == {}
+
+    @pytest.mark.parametrize(
+        "payload",
+        [[], {"tracked_sessions": []}, {"tracked_sessions": {"bad": None}}],
+    )
+    def test_structurally_invalid_state_recovers(self, tmp_path, payload):
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+
+        state = MonitorState(state_file=state_file)
+        state.load()
+
+        assert state.tracked_sessions == {}
+
+    def test_tracked_session_fields_are_normalized(self):
+        tracked = TrackedSession.from_dict(
+            {
+                "session_id": None,
+                "file_path": 7,
+                "last_byte_offset": "bad",
+            }
+        )
+
+        assert tracked.session_id == ""
+        assert tracked.file_path == ""
+        assert tracked.last_byte_offset == 0
+
+    def test_state_read_error_recovers(self, monkeypatch, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text("{}", encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def _read_text(path, *args, **kwargs):
+            if path == state_file:
+                raise OSError("disk failed")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _read_text)
+        state = MonitorState(state_file=state_file)
+
+        state.load()
+
         assert state.tracked_sessions == {}
 
     def test_dirty_tracking_with_save_if_dirty(self, tmp_path):

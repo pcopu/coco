@@ -63,6 +63,13 @@ def _save_state(state: dict[str, object]) -> None:
     atomic_write_json(_state_path(), state, indent=2)
 
 
+def _coerce_float(value: object, *, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def reset_resource_monitor_for_tests(*, clear_persisted: bool = True) -> None:
     """Test helper to clear persisted watcher state."""
     if clear_persisted:
@@ -77,7 +84,7 @@ def _trim_samples(samples: list[dict[str, object]], *, now: float) -> list[dict[
     return [
         sample
         for sample in samples
-        if isinstance(sample, dict) and float(sample.get("ts", 0.0)) >= cutoff
+        if isinstance(sample, dict) and _coerce_float(sample.get("ts", 0.0)) >= cutoff
     ]
 
 
@@ -143,7 +150,7 @@ def _collect_weekly_summary(
     *,
     now: float,
 ) -> list[str]:
-    last_summary_ts = float(state.get("last_summary_ts", 0.0) or 0.0)
+    last_summary_ts = _coerce_float(state.get("last_summary_ts", 0.0))
     if now - last_summary_ts < WEEKLY_SUMMARY_INTERVAL_SECONDS:
         return []
     samples = state.get("samples")
@@ -294,7 +301,7 @@ def collect_due_notifications(
     """Persist one sample when due and return due alert/summary texts."""
     timestamp = time.time() if now is None else float(now)
     state = _load_state()
-    last_sample_ts = float(state.get("last_sample_ts", 0.0) or 0.0)
+    last_sample_ts = _coerce_float(state.get("last_sample_ts", 0.0))
     if not force_sample and timestamp - last_sample_ts < SAMPLE_INTERVAL_SECONDS:
         return []
 

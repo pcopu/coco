@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -319,6 +320,183 @@ async def test_ensure_started_reaps_stale_processes_after_repeated_initialize_fa
     assert not failure_file.exists()
 
 
+def test_recover_oversized_codex_logs_db_quarantines_only_logs_files(monkeypatch, tmp_path):
+    monkeypatch.setenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", "true")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    logs_db = codex_home / "logs_2.sqlite"
+    logs_wal = codex_home / "logs_2.sqlite-wal"
+    logs_shm = codex_home / "logs_2.sqlite-shm"
+    state_db = codex_home / "state_5.sqlite"
+    logs_db.write_bytes(b"database-bytes")
+    logs_wal.write_bytes(b"wal-bytes")
+    logs_shm.write_bytes(b"shm")
+    state_db.write_bytes(b"state")
+
+    monkeypatch.setattr(cas, "_CODEX_LOGS_DB_RECOVERY_MIN_BYTES", 8)
+    monkeypatch.setattr(cas, "_CODEX_LOGS_DB_WAL_RECOVERY_MIN_BYTES", 8)
+
+    backup = cas.CodexAppServerClient._recover_oversized_codex_logs_db(codex_home)
+
+    assert backup is not None
+    assert backup.parent == codex_home
+    assert backup.name.startswith("logs-sqlite-backup-")
+    assert not logs_db.exists()
+    assert not logs_wal.exists()
+    assert not logs_shm.exists()
+    assert state_db.read_bytes() == b"state"
+    assert (backup / "logs_2.sqlite").read_bytes() == b"database-bytes"
+    assert (backup / "logs_2.sqlite-wal").read_bytes() == b"wal-bytes"
+    assert (backup / "logs_2.sqlite-shm").read_bytes() == b"shm"
+
+
+def test_codex_logs_db_recovery_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", raising=False)
+
+    assert cas.CodexAppServerClient._codex_logs_db_recovery_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["tru", "enabled", "2", "recover"])
+def test_codex_logs_db_recovery_rejects_invalid_opt_in_values(monkeypatch, value):
+    monkeypatch.setenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", value)
+
+    assert cas.CodexAppServerClient._codex_logs_db_recovery_enabled() is False
+
+
+def test_codex_logs_db_recovery_rolls_back_partial_move(monkeypatch, tmp_path):
+    monkeypatch.setenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", "true")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    logs_db = codex_home / "logs_2.sqlite"
+    logs_wal = codex_home / "logs_2.sqlite-wal"
+    logs_shm = codex_home / "logs_2.sqlite-shm"
+    logs_db.write_bytes(b"database-bytes")
+    logs_wal.write_bytes(b"wal-bytes")
+    logs_shm.write_bytes(b"shm")
+    monkeypatch.setattr(cas, "_CODEX_LOGS_DB_RECOVERY_MIN_BYTES", 8)
+    monkeypatch.setattr(cas, "_CODEX_LOGS_DB_WAL_RECOVERY_MIN_BYTES", 8)
+    original_replace = Path.replace
+
+    def _replace(path: Path, target: Path):
+        if path.name.endswith("-wal"):
+            raise OSError("simulated WAL move failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", _replace)
+
+    with pytest.raises(OSError, match="simulated WAL move failure"):
+        cas.CodexAppServerClient._recover_oversized_codex_logs_db(codex_home)
+
+    assert logs_db.read_bytes() == b"database-bytes"
+    assert logs_wal.read_bytes() == b"wal-bytes"
+    assert logs_shm.read_bytes() == b"shm"
+    assert list(codex_home.glob("logs-sqlite-backup-*")) == []
+
+
+def test_recover_oversized_codex_logs_db_leaves_small_logs_in_place(monkeypatch, tmp_path):
+    monkeypatch.setenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", "true")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    logs_db = codex_home / "logs_2.sqlite"
+    logs_wal = codex_home / "logs_2.sqlite-wal"
+    logs_db.write_bytes(b"db")
+    logs_wal.write_bytes(b"wal")
+
+    monkeypatch.setattr(cas, "_CODEX_LOGS_DB_RECOVERY_MIN_BYTES", 8)
+    monkeypatch.setattr(cas, "_CODEX_LOGS_DB_WAL_RECOVERY_MIN_BYTES", 8)
+
+    backup = cas.CodexAppServerClient._recover_oversized_codex_logs_db(codex_home)
+
+    assert backup is None
+    assert logs_db.read_bytes() == b"db"
+    assert logs_wal.read_bytes() == b"wal"
+    assert list(codex_home.glob("logs-sqlite-backup-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_attempt_recovery_quarantines_oversized_logs_db_after_repeated_failures(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", "true")
+    client = cas.CodexAppServerClient()
+    events: list[object] = []
+    backup = tmp_path / "backup"
+
+    async def _fake_sleep(seconds: float):
+        events.append(("sleep", seconds))
+
+    monkeypatch.setattr(
+        client,
+        "_record_start_failure",
+        lambda: cas._APP_SERVER_START_FAILURE_RESET_THRESHOLD,
+    )
+    monkeypatch.setattr(client, "_clear_start_failure_state", lambda: events.append("clear"))
+    monkeypatch.setattr(
+        client,
+        "_reap_stale_local_app_server_processes",
+        lambda: events.append("reap"),
+    )
+    monkeypatch.setattr(
+        client,
+        "_recover_oversized_codex_logs_db",
+        lambda: events.append("recover") or backup,
+    )
+    async def _wait_for_quiet():
+        events.append("wait-for-exit")
+        return True
+
+    monkeypatch.setattr(client, "_wait_for_local_app_servers_to_exit", _wait_for_quiet)
+    monkeypatch.setattr(cas.asyncio, "sleep", _fake_sleep)
+
+    recovered = await client._attempt_recovery_after_start_failure(
+        cas.CodexAppServerError("Timed out waiting for app-server response: initialize")
+    )
+
+    assert recovered is True
+    assert events == ["clear", "reap", "wait-for-exit", "recover", ("sleep", 0.5)]
+
+
+@pytest.mark.asyncio
+async def test_attempt_recovery_skips_logs_quarantine_while_app_server_is_live(monkeypatch):
+    monkeypatch.setenv("COCO_CODEX_APP_SERVER_RECOVER_LOGS_DB", "true")
+    client = cas.CodexAppServerClient()
+    events: list[object] = []
+
+    monkeypatch.setattr(
+        client,
+        "_record_start_failure",
+        lambda: cas._APP_SERVER_START_FAILURE_RESET_THRESHOLD,
+    )
+    monkeypatch.setattr(client, "_clear_start_failure_state", lambda: events.append("clear"))
+    monkeypatch.setattr(
+        client,
+        "_reap_stale_local_app_server_processes",
+        lambda: events.append("reap"),
+    )
+
+    async def _wait_for_quiet():
+        events.append("wait-for-exit")
+        return False
+
+    async def _fake_sleep(seconds: float):
+        events.append(("sleep", seconds))
+
+    monkeypatch.setattr(client, "_wait_for_local_app_servers_to_exit", _wait_for_quiet)
+    monkeypatch.setattr(
+        client,
+        "_recover_oversized_codex_logs_db",
+        lambda: events.append("recover"),
+    )
+    monkeypatch.setattr(cas.asyncio, "sleep", _fake_sleep)
+
+    recovered = await client._attempt_recovery_after_start_failure(
+        cas.CodexAppServerError("database is locked")
+    )
+
+    assert recovered is True
+    assert events == ["clear", "reap", "wait-for-exit", ("sleep", 0.5)]
+
+
 @pytest.mark.asyncio
 async def test_successful_ensure_started_clears_persisted_failure_state(monkeypatch, tmp_path):
     client = cas.CodexAppServerClient()
@@ -380,6 +558,21 @@ def test_reap_stale_local_app_server_processes_only_kills_owned_pids(monkeypatch
 
     assert killed == [101]
     assert sorted(path.name for path in owned_pids_dir.iterdir()) == ["101.pid"]
+
+
+def test_running_local_app_server_pids_detects_npm_node_launcher(monkeypatch):
+    client = cas.CodexAppServerClient()
+    proc_result = SimpleNamespace(
+        returncode=0,
+        stdout=(
+            "101 node /home/coco/.nvm/versions/node/v24/lib/node_modules/"
+            "@openai/codex/bin/codex.js app-server --listen stdio://\n"
+            "202 python unrelated.py\n"
+        ),
+    )
+    monkeypatch.setattr(cas.subprocess, "run", lambda *_args, **_kwargs: proc_result)
+
+    assert client._running_local_app_server_pids() == {101}
 
 
 def test_reap_stale_local_app_server_processes_skips_pid_reuse_marker(monkeypatch, tmp_path):
@@ -668,6 +861,166 @@ async def test_notification_handling_does_not_block_reader_loop():
     assert client.get_active_turn_id("th_1") == "turn_1"
 
     await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_slow_notification_does_not_block_a_different_thread():
+    client = cas.CodexAppServerClient()
+    slow_gate = asyncio.Event()
+    fast_delivered = asyncio.Event()
+
+    async def _handler(_method: str, params: dict[str, object]) -> None:
+        if params.get("threadId") == "th-slow":
+            await slow_gate.wait()
+        else:
+            fast_delivered.set()
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    client._enqueue_notification("item/completed", {"threadId": "th-slow"})
+    client._enqueue_notification("turn/started", {"threadId": "th-fast"})
+
+    try:
+        await asyncio.wait_for(fast_delivered.wait(), timeout=0.2)
+    finally:
+        slow_gate.set()
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_same_thread_backlog_does_not_consume_other_delivery_slots(monkeypatch):
+    monkeypatch.setattr(cas, "APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE", 2)
+    client = cas.CodexAppServerClient()
+    slow_gate = asyncio.Event()
+    fast_delivered = asyncio.Event()
+
+    async def _handler(_method: str, params: dict[str, object]) -> None:
+        if params.get("threadId") == "th-slow":
+            await slow_gate.wait()
+        else:
+            fast_delivered.set()
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    client._enqueue_notification("item/completed", {"threadId": "th-slow", "index": 1})
+    client._enqueue_notification("item/completed", {"threadId": "th-slow", "index": 2})
+    client._enqueue_notification("turn/started", {"threadId": "th-fast"})
+
+    try:
+        await asyncio.wait_for(fast_delivered.wait(), timeout=0.2)
+    finally:
+        slow_gate.set()
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_same_thread_notification_backlog_remains_bounded(monkeypatch):
+    monkeypatch.setattr(cas, "APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE", 2)
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=20)
+    gate = asyncio.Event()
+
+    async def _handler(_method: str, _params: dict[str, object]) -> None:
+        await gate.wait()
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    for index in range(10):
+        client._enqueue_notification(
+            "thread/tokenUsage/updated",
+            {"threadId": "th-slow", "index": index},
+        )
+
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        backlog = client._notification_partition_backlog.get("th-slow")
+        assert backlog is not None
+        assert len(backlog) <= 2
+    finally:
+        gate.set()
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_notification_partition_backlogs_share_one_global_bound(monkeypatch):
+    monkeypatch.setattr(cas, "APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE", 2)
+    client = cas.CodexAppServerClient()
+
+    for partition in ("th-1", "th-2", "th-3"):
+        for index in range(2):
+            await client._append_notification_partition_backlog(
+                partition,
+                "thread/tokenUsage/updated",
+                {"threadId": partition, "index": index},
+            )
+
+    assert sum(map(len, client._notification_partition_backlog.values())) <= 2
+    assert client._notification_partition_backlog_size <= 2
+
+
+@pytest.mark.asyncio
+async def test_full_partition_backlog_preserves_critical_notifications(monkeypatch):
+    monkeypatch.setattr(cas, "APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE", 2)
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=20)
+    permits: asyncio.Queue[None] = asyncio.Queue()
+    delivered: list[int] = []
+
+    async def _handler(_method: str, params: dict[str, object]) -> None:
+        delivered.append(int(params["index"]))
+        await permits.get()
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    for index in range(4):
+        client._enqueue_notification(
+            "turn/completed",
+            {"threadId": "th-slow", "index": index},
+        )
+
+    try:
+        for _ in range(20):
+            await asyncio.sleep(0)
+        for expected_count in range(2, 5):
+            permits.put_nowait(None)
+            for _ in range(50):
+                if len(delivered) >= expected_count:
+                    break
+                await asyncio.sleep(0)
+        assert delivered == [0, 1, 2, 3]
+    finally:
+        for _ in range(4):
+            permits.put_nowait(None)
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_notification_delivery_tasks_remain_bounded(monkeypatch):
+    monkeypatch.setattr(cas, "APP_SERVER_NOTIFICATION_QUEUE_MAXSIZE", 2)
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=10)
+    gate = asyncio.Event()
+
+    async def _handler(_method: str, _params: dict[str, object]) -> None:
+        await gate.wait()
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    for idx in range(4):
+        client._enqueue_notification(
+            "item/completed",
+            {"threadId": f"th-{idx}"},
+        )
+
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(client._notification_delivery_tasks) == 2
+        assert client._notification_queue.qsize() >= 1
+    finally:
+        gate.set()
+        await client.stop()
 
 
 def test_notification_queue_drops_snapshot_when_full():
