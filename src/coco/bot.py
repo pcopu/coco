@@ -5224,7 +5224,7 @@ def _collect_coco_update_snapshot_sync(*, fetch_remote: bool) -> _CocoUpdateSnap
         errors.append("upstream branch is not configured")
 
     ok, stdout, stderr, err = _run_command_sync(
-        ["git", "status", "--porcelain"],
+        ["git", "status", "--porcelain", "--untracked-files=no"],
         timeout_seconds=_COCO_UPDATE_CHECK_TIMEOUT_SECONDS,
         cwd=repo_root,
     )

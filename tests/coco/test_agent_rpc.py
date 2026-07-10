@@ -63,6 +63,34 @@ def test_agent_rpc_resolve_codex_upgrade_command_recognizes_windows_pipx_install
     assert command == "pipx upgrade codex"
 
 
+def test_agent_rpc_coco_update_ignores_untracked_files(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(agent_rpc, "_resolve_repo_root", lambda: repo)
+    monkeypatch.setattr(agent_rpc, "env_alias", lambda _name: "")
+    monkeypatch.setattr(agent_rpc.shutil, "which", lambda _name: None)
+
+    def _run_command(argv, **_kwargs):
+        commands.append(argv)
+        if argv[:3] == ["git", "status", "--porcelain"]:
+            if "--untracked-files=no" in argv:
+                return True, "", "", ""
+            return True, "?? scratch.tmp\n", "", ""
+        if argv[:3] == ["git", "pull", "--ff-only"]:
+            return True, "Already up to date.\n", "", ""
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(agent_rpc, "_run_command_sync", _run_command)
+
+    ok, message = agent_rpc._run_remote_coco_update_sync()
+
+    assert ok is True
+    assert message == "CoCo update completed."
+    assert ["git", "pull", "--ff-only"] in commands
+
+
 @pytest.mark.asyncio
 async def test_agent_rpc_browse_round_trip(monkeypatch, tmp_path):
     root = tmp_path / "root"

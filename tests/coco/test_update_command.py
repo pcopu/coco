@@ -1,5 +1,6 @@
 """Tests for /update command, self-update checks, and update panel callbacks."""
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,52 @@ from coco.handlers.callback_data import (
     CB_UPDATE_RUN_NODE,
     CB_UPDATE_ROLL_AGENTS,
 )
+
+
+def _init_git_repo(repo):
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "coco-tests@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "CoCo Tests"],
+        cwd=repo,
+        check=True,
+    )
+    tracked = repo / "tracked.txt"
+    tracked.write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "initial"],
+        cwd=repo,
+        check=True,
+    )
+    return tracked
+
+
+def test_collect_coco_update_snapshot_ignores_untracked_files(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "scratch.tmp").write_text("keep me\n", encoding="utf-8")
+    monkeypatch.setattr(bot, "_resolve_coco_repo_root_sync", lambda: (str(repo), ""))
+
+    snapshot = bot._collect_coco_update_snapshot_sync(fetch_remote=False)
+
+    assert snapshot.dirty is False
+
+
+def test_collect_coco_update_snapshot_blocks_tracked_changes(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    tracked = _init_git_repo(repo)
+    tracked.write_text("changed\n", encoding="utf-8")
+    monkeypatch.setattr(bot, "_resolve_coco_repo_root_sync", lambda: (str(repo), ""))
+
+    snapshot = bot._collect_coco_update_snapshot_sync(fetch_remote=False)
+
+    assert snapshot.dirty is True
 
 
 def _make_update(text: str, *, thread_id: int = 77, user_id: int = 1147817421):

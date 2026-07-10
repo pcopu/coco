@@ -1241,7 +1241,10 @@ def _run_remote_coco_update_sync() -> tuple[bool, str]:
             return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'unknown error')}"
         return True, "CoCo update completed."
 
-    ok, stdout, stderr, err = _run_command_sync(["git", "status", "--porcelain"], cwd=repo_root)
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo_root,
+    )
     if not ok:
         return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'git status failed')}"
     if stdout.strip():
