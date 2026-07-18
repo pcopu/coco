@@ -696,6 +696,136 @@ class TestHostFollowTakeover:
         assert len(sent) == 1
         assert "Current native goal objective: New thread goal" in str(sent[0])
 
+    @pytest.mark.asyncio
+    async def test_remote_host_follow_inherits_resumed_model_before_send(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        mgr.inherit_window_topic_model_selection(
+            window_id="@1",
+            model_slug="gpt-5.5",
+            reasoning_effort="medium",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+        sent: list[tuple[str, str]] = []
+
+        async def _resume_latest(_machine_id: str, **_kwargs):
+            return {
+                "thread_id": "thread-new",
+                "turn_id": "",
+                "model_slug": "gpt-5.6-sol",
+                "reasoning_effort": "ultra",
+            }
+
+        async def _send_inputs(_machine_id: str, **kwargs):
+            sent.append((kwargs["model_slug"], kwargs["reasoning_effort"]))
+            return {
+                "ok": True,
+                "message": "ok",
+                "thread_id": "thread-new",
+                "turn_id": "turn-new",
+            }
+
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="continue",
+        )
+
+        assert ok is True
+        assert message == "ok"
+        assert sent == [("gpt-5.6-sol", "ultra")]
+
+
+@pytest.mark.asyncio
+async def test_local_topic_send_forwards_originating_topic_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local"))
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-shared",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="local-node",
+    )
+    mgr.set_topic_model_selection(
+        100,
+        1,
+        chat_id=-100123,
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=2,
+        chat_id=-100123,
+        codex_thread_id="thread-shared",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="local-node",
+    )
+    mgr.set_topic_model_selection(
+        100,
+        2,
+        chat_id=-100123,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    captured: list[tuple[str, str]] = []
+
+    async def _send_to_window(
+        window_id: str,
+        text: str,
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+        model_slug: str = "",
+        reasoning_effort: str = "",
+        service_tier: str = "",
+    ):
+        _ = window_id, text, steer, force_new_turn, service_tier
+        captured.append((model_slug, reasoning_effort))
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=2,
+        chat_id=-100123,
+        window_id="@1",
+        text="continue",
+    )
+
+    assert ok is True
+    assert message == "ok"
+    assert captured == [("gpt-5.6-sol", "ultra")]
+
 
 @pytest.mark.asyncio
 async def test_resume_latest_codex_session_for_window_syncs_topic_model_selection(
@@ -752,14 +882,6 @@ async def test_resume_latest_codex_session_for_window_syncs_topic_model_selectio
         cwd=str(workspace),
         display_name="proj",
     )
-    mgr.set_topic_model_selection(
-        100,
-        1,
-        chat_id=-100123,
-        model_slug="gpt-5.3-codex",
-        reasoning_effort="xhigh",
-    )
-
     async def _thread_resume(*, thread_id: str):
         assert thread_id == "thread-new"
         return {"thread": {"id": "thread-new"}}
@@ -778,6 +900,131 @@ async def test_resume_latest_codex_session_for_window_syncs_topic_model_selectio
     assert binding.codex_thread_id == "thread-new"
     assert binding.model_slug == "gpt-5.4"
     assert binding.reasoning_effort == "high"
+
+
+def test_sync_resumed_session_preserves_explicit_topic_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.set_topic_model_selection(
+        100,
+        1,
+        chat_id=-100123,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    monkeypatch.setattr(
+        mgr,
+        "get_codex_session_model_selection_for_thread",
+        lambda _thread_id, *, cwd="": ("gpt-5.5", "medium"),
+    )
+
+    changed, model_slug, reasoning_effort = (
+        mgr.sync_window_topic_model_selection_from_codex_session(
+            window_id="@1",
+            codex_thread_id="thread-resumed",
+            cwd="/tmp/proj",
+        )
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert changed is False
+    assert (model_slug, reasoning_effort) == ("gpt-5.5", "medium")
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"
+
+
+def test_later_resume_replaces_previously_inherited_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-a",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    selections = iter(
+        [
+            ("gpt-5.5", "medium"),
+            ("gpt-5.6-sol", "ultra"),
+        ]
+    )
+    monkeypatch.setattr(
+        mgr,
+        "get_codex_session_model_selection_for_thread",
+        lambda _thread_id, *, cwd="": next(selections),
+    )
+
+    mgr.sync_window_topic_model_selection_from_codex_session(
+        window_id="@1",
+        codex_thread_id="thread-a",
+        cwd="/tmp/proj",
+    )
+    mgr.sync_window_topic_model_selection_from_codex_session(
+        window_id="@1",
+        codex_thread_id="thread-b",
+        cwd="/tmp/proj",
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"
+
+
+def test_reselecting_inherited_values_marks_topic_selection_explicit(
+    mgr: SessionManager
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-a",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.inherit_window_topic_model_selection(
+        window_id="@1",
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+
+    changed = mgr.set_topic_model_selection(
+        100,
+        1,
+        chat_id=-100123,
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert changed is True
+    assert binding is not None
+    assert binding.model_selection_explicit is True
+
+
+def test_legacy_topic_model_selection_defaults_to_explicit() -> None:
+    binding = session_mod.TopicBinding.from_dict(
+        {
+            "model_slug": "gpt-5.5",
+            "reasoning_effort": "medium",
+        }
+    )
+
+    assert binding.model_selection_explicit is True
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1264,53 @@ async def test_set_topic_goal_creates_remote_thread_when_missing(
     binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
     assert binding is not None
     assert binding.codex_thread_id == "remote-thread-1"
+
+
+@pytest.mark.asyncio
+async def test_remote_goal_refresh_inherits_resumed_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local"))
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+    mgr.inherit_window_topic_model_selection(
+        window_id="@1",
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+
+    async def _resume_latest(_machine_id: str, **_kwargs):
+        return {
+            "thread_id": "thread-new",
+            "model_slug": "gpt-5.6-sol",
+            "reasoning_effort": "ultra",
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
+
+    thread_id, error = await mgr.resolve_goal_thread_for_topic(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        create=True,
+        force_refresh=True,
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert error == ""
+    assert thread_id == "thread-new"
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"
 
 
 class TestRuntimeCapabilityHint:
@@ -1880,6 +2174,61 @@ async def test_send_inputs_via_app_server_passes_topic_service_tier(
 
     assert ok is True
     assert captured_service_tiers == ["flex"]
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_via_app_server_passes_topic_model_and_effort(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    captured: list[tuple[str | None, str | None]] = []
+    mgr.bind_thread(100, 1, "@1", window_name="demo")
+    mgr.set_topic_model_selection(
+        100,
+        1,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    mgr.set_window_codex_thread_id("@1", "thread-1")
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        timeout: float = 90.0,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ):
+        _ = thread_id, inputs, approval_policy, timeout, service_tier
+        captured.append((model, effort))
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert captured == [("gpt-5.6-sol", "ultra")]
 
 
 @pytest.mark.asyncio

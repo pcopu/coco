@@ -91,6 +91,41 @@ def test_agent_rpc_coco_update_ignores_untracked_files(monkeypatch, tmp_path):
     assert ["git", "pull", "--ff-only"] in commands
 
 
+def test_agent_rpc_coco_update_reinstalls_uv_tool_without_git_checkout(
+    monkeypatch, tmp_path
+):
+    runtime_root = tmp_path / "site-packages"
+    runtime_root.mkdir()
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(agent_rpc, "_resolve_repo_root", lambda: runtime_root)
+    monkeypatch.setattr(agent_rpc, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        agent_rpc,
+        "_resolve_coco_tool_update_argv",
+        lambda: ["/home/coco/.local/bin/uv", "tool", "install", "--force", "git+https://github.com/pcopu/coco.git"],
+        raising=False,
+    )
+
+    def _run_command(argv, **_kwargs):
+        commands.append(argv)
+        return True, "Installed coco", "", ""
+
+    monkeypatch.setattr(agent_rpc, "_run_command_sync", _run_command)
+
+    ok, message = agent_rpc._run_remote_coco_update_sync()
+
+    assert ok is True
+    assert message == "CoCo package updated."
+    assert commands == [[
+        "/home/coco/.local/bin/uv",
+        "tool",
+        "install",
+        "--force",
+        "git+https://github.com/pcopu/coco.git",
+    ]]
+
+
 @pytest.mark.asyncio
 async def test_agent_rpc_browse_round_trip(monkeypatch, tmp_path):
     root = tmp_path / "root"

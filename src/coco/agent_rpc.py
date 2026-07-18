@@ -19,6 +19,7 @@ from .config import config
 from .handlers.directory_browser import clamp_browse_path, resolve_browse_root
 from .node_registry import node_registry
 from .session import session_manager
+from .self_update import resolve_coco_tool_update_argv as _resolve_coco_tool_update_argv
 from .utils import env_alias
 
 
@@ -1231,10 +1232,26 @@ def _run_remote_codex_upgrade_sync() -> tuple[bool, str]:
 
 def _run_remote_coco_update_sync() -> tuple[bool, str]:
     repo_root = _resolve_repo_root()
-    if not (repo_root / ".git").exists():
-        return False, "CoCo update unavailable: runtime is not a git checkout."
-
     custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
+    if not (repo_root / ".git").exists():
+        update_argv = (
+            ["bash", "-lc", custom]
+            if custom
+            else _resolve_coco_tool_update_argv()
+        )
+        if not update_argv:
+            return False, (
+                "CoCo update unavailable: runtime is not a git checkout and uv "
+                "was not found for package reinstall."
+            )
+        ok, stdout, stderr, err = _run_command_sync(update_argv, cwd=Path.home())
+        if not ok:
+            return False, (
+                "CoCo package update failed: "
+                f"{_tail_text(stderr or stdout or err or 'unknown error')}"
+            )
+        return True, "CoCo package updated."
+
     if custom:
         ok, stdout, stderr, err = _run_command_sync(["bash", "-lc", custom], cwd=repo_root)
         if not ok:

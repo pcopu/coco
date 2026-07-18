@@ -5,6 +5,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import coco
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,6 +28,12 @@ def test_pyproject_uses_coco_branding() -> None:
     assert sorted(scripts) == ["coco", "coco-admin"]
     assert wheel_packages == ["src/coco"]
     assert coverage_sources == ["coco"]
+
+
+def test_package_version_matches_project_metadata() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert coco.__version__ == payload["project"]["version"]
 
 
 def test_readme_uses_coco_title() -> None:

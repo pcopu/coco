@@ -64,6 +64,70 @@ def test_collect_coco_update_snapshot_blocks_tracked_changes(monkeypatch, tmp_pa
     assert snapshot.dirty is True
 
 
+def test_resolve_coco_update_command_uses_uv_tool_for_package_install(monkeypatch):
+    monkeypatch.setattr(bot, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        bot,
+        "_resolve_coco_tool_update_argv",
+        lambda: ["/home/coco/.local/bin/uv", "tool", "install", "--force", "git+https://github.com/pcopu/coco.git"],
+        raising=False,
+    )
+
+    command, source = bot._resolve_coco_update_command("", "")
+
+    assert source == "uv-tool"
+    assert command == "/home/coco/.local/bin/uv tool install --force git+https://github.com/pcopu/coco.git"
+
+
+@pytest.mark.asyncio
+async def test_run_coco_update_reinstalls_uv_tool_when_runtime_is_not_git_checkout(
+    monkeypatch,
+):
+    snapshot = bot._CocoUpdateSnapshot(
+        repo_root="",
+        current_branch="",
+        upstream_ref="",
+        current_commit="",
+        latest_commit="",
+        behind_count=0,
+        ahead_count=0,
+        dirty=False,
+        check_error="runtime is not a git checkout",
+        update_command="uv tool install --force git+https://github.com/pcopu/coco.git",
+        update_source="uv-tool",
+    )
+    commands: list[list[str]] = []
+
+    async def _collect(*, fetch_remote: bool):
+        return snapshot
+
+    def _run(argv, **_kwargs):
+        commands.append(argv)
+        return True, "Installed coco", "", ""
+
+    monkeypatch.setattr(bot, "_collect_coco_update_snapshot", _collect)
+    monkeypatch.setattr(bot, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        bot,
+        "_resolve_coco_tool_update_argv",
+        lambda: ["/home/coco/.local/bin/uv", "tool", "install", "--force", "git+https://github.com/pcopu/coco.git"],
+        raising=False,
+    )
+    monkeypatch.setattr(bot, "_run_command_sync", _run)
+
+    ok, message = await bot._run_coco_update()
+
+    assert ok is True
+    assert "CoCo package updated" in message
+    assert commands == [[
+        "/home/coco/.local/bin/uv",
+        "tool",
+        "install",
+        "--force",
+        "git+https://github.com/pcopu/coco.git",
+    ]]
+
+
 def _make_update(text: str, *, thread_id: int = 77, user_id: int = 1147817421):
     chat = SimpleNamespace(type="supergroup", id=-100123)
     message = SimpleNamespace(

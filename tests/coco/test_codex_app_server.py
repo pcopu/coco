@@ -815,6 +815,39 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_turn_start_includes_model_and_effort_overrides(monkeypatch):
+    client = cas.CodexAppServerClient()
+    calls: list[tuple[str, dict[str, object], float]] = []
+
+    async def _request(method: str, params: dict[str, object], *, timeout: float = 60.0):
+        calls.append((method, params, timeout))
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(client, "request", _request)
+
+    result = await client.turn_start(
+        thread_id="thread-1",
+        inputs=[{"type": "text", "text": "continue"}],
+        model="gpt-5.6-sol",
+        effort="ultra",
+    )
+
+    assert result == {"turn": {"id": "turn-1"}}
+    assert calls == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "continue"}],
+                "model": "gpt-5.6-sol",
+                "effort": "ultra",
+            },
+            90.0,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_write_jsonrpc_uses_jsonl_wire_format():
     client = cas.CodexAppServerClient()
     fake_stdin = _FakeStdin()

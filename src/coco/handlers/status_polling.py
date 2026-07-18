@@ -39,7 +39,7 @@ from .looper import (
     stop_looper_if_expired,
 )
 from . import autoresearch, personality
-from . import resource_monitor
+from . import quota_monitor, reset_credit_monitor, resource_monitor
 from .message_queue import get_pending_delivery_topics
 from .message_sender import safe_send
 from .topic_send import send_text_to_topic as _send_text_to_topic
@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
+QUOTA_CHECK_INTERVAL = 60 * 60.0
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
@@ -91,6 +92,91 @@ async def _emit_due_resource_monitor_notifications(bot: Bot) -> None:
                 text,
                 message_thread_id=None,
             )
+
+
+async def _emit_due_reset_credit_notifications(bot: Bot) -> None:
+    """Send due reset-credit reminders to resource-alert recipients."""
+    notifications = await asyncio.to_thread(
+        reset_credit_monitor.collect_due_notifications,
+        force_refresh=True,
+        require_fresh=True,
+    )
+    if not notifications:
+        return
+
+    recipients = sorted(config.allowed_users)
+    if not recipients:
+        return
+
+    for text in notifications:
+        delivered = False
+        for user_id in recipients:
+            try:
+                sent = await safe_send(
+                    bot,
+                    user_id,
+                    text,
+                    message_thread_id=None,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Reset-credit reminder delivery failed for user %s: %s",
+                    user_id,
+                    exc,
+                )
+                continue
+            delivered = delivered or sent is not None
+        if delivered:
+            reset_credit_monitor.acknowledge_notifications([text])
+
+
+async def _emit_due_quota_notifications(bot: Bot) -> None:
+    """Send due Codex quota threshold alerts to resource-alert recipients."""
+    try:
+        payload = await codex_app_server_client.read_rate_limits()
+    except Exception as exc:
+        logger.warning("Codex quota refresh failed: %s", exc)
+        return
+    rate_limits = payload.get("rateLimits") if isinstance(payload, dict) else None
+    if not isinstance(rate_limits, dict):
+        return
+    notifications = await asyncio.to_thread(
+        quota_monitor.collect_due_notifications,
+        rate_limits,
+    )
+    if not notifications:
+        return
+
+    recipients = sorted(config.allowed_users)
+    if not recipients:
+        return
+
+    for text in notifications:
+        delivered = False
+        for user_id in recipients:
+            try:
+                sent = await safe_send(
+                    bot,
+                    user_id,
+                    text,
+                    message_thread_id=None,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Codex quota alert delivery failed for user %s: %s",
+                    user_id,
+                    exc,
+                )
+                continue
+            delivered = delivered or sent is not None
+        if delivered:
+            quota_monitor.acknowledge_notifications([text])
+
+
+async def _emit_due_codex_account_notifications(bot: Bot) -> None:
+    """Refresh reset credits and usage windows in one hourly monitor cycle."""
+    await _emit_due_reset_credit_notifications(bot)
+    await _emit_due_quota_notifications(bot)
 
 
 def _local_machine_identity() -> tuple[str, str]:
@@ -882,6 +968,7 @@ async def status_poll_loop(bot: Bot) -> None:
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
     last_topic_check = 0.0
     last_local_node_heartbeat = 0.0
+    last_quota_check = time.monotonic() - QUOTA_CHECK_INTERVAL
     while True:
         try:
             now = time.monotonic()
@@ -892,6 +979,9 @@ async def status_poll_loop(bot: Bot) -> None:
             await _probe_stale_nodes(bot, now=current_ts)
             await _emit_node_status_notifications(bot)
             await _emit_due_resource_monitor_notifications(bot)
+            if now - last_quota_check >= QUOTA_CHECK_INTERVAL:
+                last_quota_check = now
+                await _emit_due_codex_account_notifications(bot)
 
             raw_bindings = list(session_manager.iter_topic_window_bindings())
             bindings: list[tuple[int, int | None, int, str]] = []

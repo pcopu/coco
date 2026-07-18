@@ -1,6 +1,6 @@
 [project]
 name = "coco"
-version = "0.1.0"
+version = "0.1.1"
 description = "Telegram operations overlay for OpenAI Codex, derived from ccbot."
 readme = "README.md"
 requires-python = ">=3.12"

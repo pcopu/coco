@@ -197,6 +197,7 @@ class TopicBinding:
     machine_display_name: str = ""
     model_slug: str = ""
     reasoning_effort: str = ""
+    model_selection_explicit: bool = False
     service_tier: str = ""
     response_mode: str = ""
 
@@ -226,6 +227,8 @@ class TopicBinding:
             d["model_slug"] = self.model_slug
         if self.reasoning_effort:
             d["reasoning_effort"] = self.reasoning_effort
+        if self.model_slug or self.reasoning_effort:
+            d["model_selection_explicit"] = self.model_selection_explicit
         if self.service_tier:
             d["service_tier"] = self.service_tier
         if self.response_mode:
@@ -258,6 +261,10 @@ class TopicBinding:
         machine_display_name = _text("machine_display_name")
         model_slug = _text("model_slug")
         reasoning_effort = _text("reasoning_effort")
+        if "model_selection_explicit" in data:
+            model_selection_explicit = data.get("model_selection_explicit") is True
+        else:
+            model_selection_explicit = bool(model_slug or reasoning_effort)
         raw_service_tier = data.get("service_tier", "")
         service_tier = (
             str(raw_service_tier).strip().lower()
@@ -296,6 +303,7 @@ class TopicBinding:
             machine_display_name=machine_display_name,
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
+            model_selection_explicit=model_selection_explicit,
             service_tier=service_tier,
             response_mode=response_mode,
         )
@@ -538,6 +546,7 @@ class SessionManager:
                     machine_display_name=binding.machine_display_name,
                     model_slug=binding.model_slug,
                     reasoning_effort=binding.reasoning_effort,
+                    model_selection_explicit=binding.model_selection_explicit,
                     service_tier=binding.service_tier,
                     response_mode=binding.response_mode,
                 )
@@ -1098,6 +1107,21 @@ class SessionManager:
         )
         if not model_slug and not reasoning_effort:
             return False, "", ""
+        changed = self.inherit_window_topic_model_selection(
+            window_id=window_id,
+            model_slug=model_slug,
+            reasoning_effort=reasoning_effort,
+        )
+        return changed, model_slug, reasoning_effort
+
+    def inherit_window_topic_model_selection(
+        self,
+        *,
+        window_id: str,
+        model_slug: str,
+        reasoning_effort: str,
+    ) -> bool:
+        """Fill unset topic selections from resumed local or remote session metadata."""
         changed = self._sync_topic_bindings_for_window_model_selection(
             window_id=window_id,
             model_slug=model_slug,
@@ -1105,7 +1129,7 @@ class SessionManager:
         )
         if changed:
             self._save_state()
-        return changed, model_slug, reasoning_effort
+        return changed
 
     def _codex_cwd_matches(self, target_cwd: str, file_cwd: str) -> bool:
         """Return True when the Codex transcript cwd exactly matches window cwd."""
@@ -1604,13 +1628,15 @@ class SessionManager:
         model_slug: str,
         reasoning_effort: str,
     ) -> bool:
-        """Keep topic bindings in sync when a window inherits a session model."""
+        """Fill unset topic selections when a window inherits a session model."""
         normalized_model = model_slug.strip()
         normalized_effort = reasoning_effort.strip()
         changed = False
         for bindings in self.topic_bindings_v2.values():
             for binding in bindings.values():
                 if binding.window_id.strip() != window_id:
+                    continue
+                if binding.model_selection_explicit:
                     continue
                 if normalized_model and binding.model_slug != normalized_model:
                     binding.model_slug = normalized_model
@@ -2355,6 +2381,23 @@ class SessionManager:
             thread_id=thread_id,
             chat_id=chat_id,
         ).strip()
+        model_slug, reasoning_effort = self.get_topic_model_selection(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        service_tier = self.get_topic_service_tier_selection(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        topic_send_kwargs: dict[str, str] = {}
+        if model_slug:
+            topic_send_kwargs["model_slug"] = model_slug
+        if reasoning_effort:
+            topic_send_kwargs["reasoning_effort"] = reasoning_effort
+        if service_tier:
+            topic_send_kwargs["service_tier"] = service_tier
         if (
             thread_id is not None
             and self._codex_app_server_mode_enabled()
@@ -2382,6 +2425,27 @@ class SessionManager:
                         window_id,
                         str(resume_result.get("turn_id", "")).strip(),
                     )
+                    self.inherit_window_topic_model_selection(
+                        window_id=window_id,
+                        model_slug=str(resume_result.get("model_slug", "")).strip(),
+                        reasoning_effort=str(
+                            resume_result.get("reasoning_effort", "")
+                        ).strip(),
+                    )
+                    model_slug, reasoning_effort = self.get_topic_model_selection(
+                        user_id,
+                        thread_id,
+                        chat_id=chat_id,
+                    )
+                    topic_send_kwargs = {
+                        key: value
+                        for key, value in {
+                            "model_slug": model_slug,
+                            "reasoning_effort": reasoning_effort,
+                            "service_tier": service_tier,
+                        }.items()
+                        if value
+                    }
             else:
                 resumed_thread_id = await self.resume_latest_codex_session_for_window(
                     window_id=window_id,
@@ -2412,16 +2476,6 @@ class SessionManager:
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
-                model_slug, reasoning_effort = self.get_topic_model_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
-                service_tier = self.get_topic_service_tier_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
                 remote_result = await agent_rpc_client.send_inputs(
                     machine_id,
                     window_id=window_id,
@@ -2459,6 +2513,7 @@ class SessionManager:
                     text,
                     steer=steer,
                     force_new_turn=force_new_turn,
+                    **topic_send_kwargs,
                 )
             if ok:
                 self.mark_topic_telegram_live(
@@ -2500,16 +2555,6 @@ class SessionManager:
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
-                model_slug, reasoning_effort = self.get_topic_model_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
-                service_tier = self.get_topic_service_tier_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
                 remote_result = await agent_rpc_client.send_inputs(
                     machine_id,
                     window_id=window_id,
@@ -2547,6 +2592,7 @@ class SessionManager:
                     inputs,
                     steer=steer,
                     force_new_turn=force_new_turn,
+                    **topic_send_kwargs,
                 )
             if ok:
                 self.mark_topic_telegram_live(
@@ -2859,6 +2905,11 @@ class SessionManager:
                     machine_id=machine_id,
                     machine_display_name=machine_name,
                 )
+                self.inherit_window_topic_model_selection(
+                    window_id=window_id,
+                    model_slug=str(resumed.get("model_slug", "")).strip(),
+                    reasoning_effort=str(resumed.get("reasoning_effort", "")).strip(),
+                )
                 return resumed_thread_id, ""
 
             try:
@@ -3098,10 +3149,12 @@ class SessionManager:
         if (
             binding.model_slug == normalized_model
             and binding.reasoning_effort == normalized_effort
+            and binding.model_selection_explicit
         ):
             return False
         binding.model_slug = normalized_model
         binding.reasoning_effort = normalized_effort
+        binding.model_selection_explicit = bool(normalized_model or normalized_effort)
         self._save_state()
         return True
 
@@ -3302,6 +3355,9 @@ class SessionManager:
         )
         resolved_model_slug = existing.model_slug if existing else ""
         resolved_reasoning_effort = existing.reasoning_effort if existing else ""
+        resolved_model_selection_explicit = (
+            existing.model_selection_explicit if existing else False
+        )
         resolved_service_tier = existing.service_tier if existing else ""
         resolved_response_mode = existing.response_mode if existing else ""
         binding = TopicBinding(
@@ -3317,6 +3373,7 @@ class SessionManager:
             machine_display_name=resolved_machine_display_name,
             model_slug=resolved_model_slug,
             reasoning_effort=resolved_reasoning_effort,
+            model_selection_explicit=resolved_model_selection_explicit,
             service_tier=resolved_service_tier,
             response_mode=resolved_response_mode,
         )
@@ -3376,6 +3433,7 @@ class SessionManager:
             machine_display_name=binding.machine_display_name,
             model_slug=binding.model_slug,
             reasoning_effort=binding.reasoning_effort,
+            model_selection_explicit=binding.model_selection_explicit,
             service_tier=binding.service_tier,
             response_mode=binding.response_mode,
         )
@@ -3486,6 +3544,9 @@ class SessionManager:
             ),
             model_slug=existing.model_slug if existing else "",
             reasoning_effort=existing.reasoning_effort if existing else "",
+            model_selection_explicit=(
+                existing.model_selection_explicit if existing else False
+            ),
             service_tier=existing.service_tier if existing else "",
         )
         self._set_topic_binding(
@@ -3966,6 +4027,8 @@ class SessionManager:
         thread_id: str,
         inputs: list[dict[str, Any]],
         approval_policy: str,
+        model_slug: str = "",
+        reasoning_effort: str = "",
         service_tier: str = "",
     ) -> dict[str, Any]:
         """Start a turn with one guarded retry for transient timeout cases."""
@@ -3973,12 +4036,18 @@ class SessionManager:
         last_err: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
+                turn_kwargs: dict[str, Any] = {}
+                if model_slug:
+                    turn_kwargs["model"] = model_slug
+                if reasoning_effort:
+                    turn_kwargs["effort"] = reasoning_effort
                 return await codex_app_server_client.turn_start(
                     thread_id=thread_id,
                     inputs=inputs,
                     approval_policy=approval_policy,
                     service_tier=service_tier.strip() or None,
                     timeout=APP_SERVER_TURN_START_TIMEOUT_SECONDS,
+                    **turn_kwargs,
                 )
             except Exception as e:
                 last_err = e
@@ -4431,11 +4500,17 @@ class SessionManager:
                 else active_turn
             )
         else:
+            turn_start_kwargs: dict[str, str] = {}
+            if model_slug:
+                turn_start_kwargs["model_slug"] = model_slug
+            if reasoning_effort:
+                turn_start_kwargs["reasoning_effort"] = reasoning_effort
             result = await self._turn_start_with_retry(
                 thread_id=thread_id,
                 inputs=turn_inputs,
                 approval_policy=approval_policy,
                 service_tier=service_tier,
+                **turn_start_kwargs,
             )
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -4593,6 +4668,9 @@ class SessionManager:
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        model_slug: str = "",
+        reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> tuple[bool, str]:
         """Send plain text input to a window.
 
@@ -4612,6 +4690,9 @@ class SessionManager:
             payload,
             steer=steer,
             force_new_turn=force_new_turn,
+            model_slug=model_slug,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
         )
 
     # --- Message history ---

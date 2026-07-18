@@ -201,6 +201,7 @@ from .session import (
     session_manager,
 )
 from .session_monitor import NewMessage, SessionMonitor
+from .self_update import resolve_coco_tool_update_argv as _resolve_coco_tool_update_argv
 from .skills import resolve_skill_identifier
 from .telemetry import emit_telemetry
 from .telegram_memory import log_incoming_message
@@ -5155,7 +5156,12 @@ def _resolve_coco_update_command(repo_root: str, upstream_ref: str) -> tuple[str
     if custom:
         return custom, "custom"
     remote, branch = _split_upstream_ref(upstream_ref)
-    if not repo_root or not remote or not branch:
+    if not repo_root:
+        tool_argv = _resolve_coco_tool_update_argv()
+        if tool_argv:
+            return shlex.join(tool_argv), "uv-tool"
+        return "", "none"
+    if not remote or not branch:
         return "", "none"
     command = f"git pull --ff-only {shlex.quote(remote)} {shlex.quote(branch)}"
     if shutil.which("uv") and (Path(repo_root) / "pyproject.toml").is_file():
@@ -5872,9 +5878,29 @@ async def _run_codex_upgrade() -> tuple[bool, str]:
 async def _run_coco_update() -> tuple[bool, str]:
     """Run the CoCo self-update command without restarting CoCo."""
     before = await _collect_coco_update_snapshot(fetch_remote=True)
+    custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
     if not before.repo_root:
-        detail = before.check_error or "runtime is not a git checkout"
-        return False, f"CoCo update unavailable: {_tail_text(detail)}"
+        update_argv = (
+            ["bash", "-lc", custom]
+            if custom
+            else _resolve_coco_tool_update_argv()
+        )
+        if not update_argv:
+            detail = before.check_error or "runtime is not a git checkout"
+            return False, (
+                "CoCo update unavailable: "
+                f"{_tail_text(detail)}; uv was not found for package reinstall."
+            )
+        ok, stdout, stderr, err = await asyncio.to_thread(
+            _run_command_sync,
+            update_argv,
+            timeout_seconds=_COCO_UPDATE_TIMEOUT_SECONDS,
+            cwd=Path.home(),
+        )
+        if not ok:
+            detail = _tail_text(stderr or stdout or err or "unknown error")
+            return False, f"CoCo package update failed ({err or 'error'}): {detail}"
+        return True, "CoCo package updated."
     if before.dirty:
         return False, "CoCo update blocked: worktree has local changes."
     if before.ahead_count > 0:
@@ -5882,10 +5908,9 @@ async def _run_coco_update() -> tuple[bool, str]:
             "CoCo update blocked: local branch is ahead of upstream. "
             "Push or reconcile local commits first."
         )
-    if not before.upstream_ref:
+    if not before.upstream_ref and not custom:
         return False, "CoCo update unavailable: upstream branch is not configured."
 
-    custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
     if custom:
         ok, stdout, stderr, err = await asyncio.to_thread(
             _run_command_sync,
@@ -6620,10 +6645,8 @@ async def _bind_selected_folder_to_topic(
         )
         if resume_thread_id:
             if machine_id and machine_id != local_machine_id:
-                changed = session_manager.set_topic_model_selection(
-                    user_id,
-                    pending_thread_id,
-                    chat_id=chat_id,
+                changed = session_manager.inherit_window_topic_model_selection(
+                    window_id=created_wid,
                     model_slug=resumed_model,
                     reasoning_effort=resumed_effort,
                 )
@@ -11231,10 +11254,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     resumed_model = str(result.get("model_slug", "")).strip()
                     resumed_effort = str(result.get("reasoning_effort", "")).strip()
                     if resumed_model or resumed_effort:
-                        session_manager.set_topic_model_selection(
-                            user.id,
-                            cb_thread_id,
-                            chat_id=cb_chat_id,
+                        session_manager.inherit_window_topic_model_selection(
+                            window_id=wid,
                             model_slug=resumed_model,
                             reasoning_effort=resumed_effort,
                         )
@@ -11369,10 +11390,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if machine_id and machine_id != local_machine_id:
             resumed_model = str(result.get("model_slug", "")).strip() if isinstance(result, dict) else ""
             resumed_effort = str(result.get("reasoning_effort", "")).strip() if isinstance(result, dict) else ""
-            changed = session_manager.set_topic_model_selection(
-                user.id,
-                cb_thread_id,
-                chat_id=cb_chat_id,
+            changed = session_manager.inherit_window_topic_model_selection(
+                window_id=wid,
                 model_slug=resumed_model,
                 reasoning_effort=resumed_effort,
             )

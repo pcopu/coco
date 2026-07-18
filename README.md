@@ -15,7 +15,8 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> ·
+  <a href="#agent-guided-install-copy-and-paste">Agent-guided install</a> ·
+  <a href="#install">Manual install</a> ·
   <a href="#fastest-secure-setup">Setup</a> ·
   <a href="#what-it-actually-does">How It Works</a> ·
   <a href="#faq">FAQ</a> ·
@@ -23,6 +24,229 @@
   <a href="#additional-docs">Docs</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
+
+## Agent-guided install: copy and paste
+
+This is the easiest way to install CoCo. Start on the machine that will run
+CoCo, open Codex in the CLI or desktop app, copy the entire prompt below, and
+paste it into Codex. The agent will inspect the machine, perform the local
+installation, and pause whenever you need to complete a step in Telegram.
+
+CoCo launches the Codex CLI's `app-server` transport in the background. Opening
+the Codex desktop app is a fine place to begin the guided setup, but the target
+machine must also have the Codex CLI installed and authenticated before CoCo
+can run.
+
+<details>
+<summary><strong>Copy this complete CoCo installation prompt</strong></summary>
+
+````text
+You are installing CoCo, a Telegram control layer for real OpenAI Codex
+sessions, on this machine. Guide me through the entire installation from start
+to finish. Perform safe local steps yourself, pause for the Telegram steps only
+I can complete, verify every stage, and do not declare success until the final
+Telegram test works.
+
+Repository: https://github.com/pcopu/coco
+
+Operating rules:
+
+1. Work on the machine where CoCo will run.
+2. Explain each phase briefly before acting, but keep the process moving.
+3. Inspect the OS, shell, user, home directory, PATH, service manager, and
+   existing Codex/CoCo installations before changing anything.
+4. Preserve existing CoCo configuration and state if this is an upgrade. Never
+   overwrite working files without showing me what will change.
+5. Ask before using sudo, installing system packages, enabling login lingering,
+   replacing a service, or making another privileged/system-wide change.
+6. Never ask me to paste the Telegram bot token into this Codex conversation.
+   Have me enter it in a hidden local terminal prompt so it is not printed or
+   stored in shell history. Never print the token in logs or summaries.
+7. Use the secure allowlist flow. Do not add the CoCo bot to a group until its
+   Telegram user ID and supergroup ID have been written to local configuration.
+8. Do not weaken firewall, SSH, Telegram, or filesystem security merely to make
+   setup easier.
+9. Prefer the official installer. Use a source checkout only when I request it
+   or when the installer cannot work.
+10. If a command fails, diagnose it and give me the exact next action. Do not
+    silently skip a failed requirement.
+
+Phase 1 — Verify Codex on this machine
+
+1. Check whether `codex`, `node`, and `npm` are available and record their
+   versions and resolved paths without exposing credentials.
+2. If the Codex CLI is missing, install its prerequisite Node.js using the
+   appropriate supported method for this OS, then install the official CLI:
+
+   ```bash
+   npm install --global @openai/codex
+   ```
+
+3. Verify the CLI with `codex --version`.
+4. Check authentication with `codex login status`.
+5. If it is not authenticated, pause and guide me through `codex login`. On a
+   headless or remote machine, offer `codex login --device-auth` if the normal
+   browser callback is not practical.
+6. Re-run `codex login status`. Do not continue until Codex authentication is
+   valid on this machine.
+
+Phase 2 — Install or update CoCo
+
+1. Check whether `coco` is already installed and whether `~/.coco` contains an
+   existing configuration. If it does, treat this as an upgrade and preserve
+   the configuration.
+2. For a normal installation or update, run:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/pcopu/coco/main/install.sh | bash
+   ```
+
+3. If the command is not immediately on PATH, refresh the shell command cache
+   and add the installer-reported user binary directory to PATH. Do not guess a
+   hardcoded path when `command -v coco` can resolve it.
+4. Verify the installation with `coco init --help` and record the resolved
+   paths for both `coco` and `codex`.
+5. Create a sensible project browse root if one does not exist. Default to
+   `~/env`, but ask me if I want a different directory.
+
+Phase 3 — Help me create the Telegram bot
+
+Pause while I complete these steps in Telegram. Give me one short checklist at
+a time and wait for confirmation after each numbered group.
+
+1. Open `@BotFather` and run `/newbot`.
+2. Choose the display name and a unique username ending in `bot`.
+3. Save the bot token privately. Tell me not to paste it into this chat.
+4. In BotFather, run `/setprivacy`, select the new bot, and choose **Disable**.
+   Explain that this lets CoCo receive ordinary messages inside Telegram topics,
+   which is the recommended experience. Mention-only/command-only operation can
+   be configured later if I deliberately want stricter behavior.
+5. In the bot's BotFather settings, enable **Threaded Mode**.
+
+Phase 4 — Create the Telegram supergroup and collect IDs securely
+
+1. Have me create the Telegram group that CoCo will use.
+2. In the group settings, enable **Topics**. Telegram will use supergroup/forum
+   behavior; this is required because each topic becomes an independent CoCo
+   project/session lane.
+3. Have me DM `@userinfobot` and copy my numeric Telegram user ID.
+4. Before CoCo joins the group, have me temporarily add `@RawDataBot`, send one
+   message, and copy the numeric `chat.id` from its reply. Confirm the group ID
+   begins with `-100`.
+5. Have me remove RawDataBot from the group.
+6. Ask me for the numeric user ID and supergroup ID. These are not secrets and
+   may be pasted into this conversation. Validate that they are integers and
+   that the group ID begins with `-100`.
+
+Phase 5 — Write the secure CoCo configuration
+
+1. Do not ask for the bot token here. Instead, give me a local terminal block
+   that reads the token without echo and invokes `coco init`. Fill in the actual
+   user ID, group ID, and browse root that we already confirmed. Use this shape:
+
+   ```bash
+   read -rsp "Telegram bot token: " COCO_BOT_TOKEN; echo
+   coco init \
+     --bot-token "$COCO_BOT_TOKEN" \
+     --admin-user YOUR_NUMERIC_USER_ID \
+     --group-id YOUR_NEGATIVE_100_GROUP_ID \
+     --browse-root "$HOME/env"
+   unset COCO_BOT_TOKEN
+   ```
+
+2. Have me run that block directly in my local terminal, then confirm completion
+   without revealing the token.
+3. Verify that `~/.coco/.env` and `~/.coco/allowed_users_meta.json` exist, have
+   restrictive permissions, and contain the expected user/group IDs. Never
+   print the token. If inspecting the env file, redact `TELEGRAM_BOT_TOKEN`.
+4. If this machine needs multiple approved groups, repeat `--group-id` during
+   initialization or update `ALLOWED_GROUP_IDS` carefully.
+
+Phase 6 — Run CoCo persistently
+
+1. Detect the service manager. On a Linux machine with systemd, create a user
+   service named `coco.service` under `~/.config/systemd/user/`.
+2. Resolve the absolute `coco` and `codex` binary paths first. Build the service
+   with:
+   - network-online ordering;
+   - `Type=simple`;
+   - `WorkingDirectory` set to my home or approved browse root, not an arbitrary
+     repository containing a conflicting `.env`;
+   - `ExecStart` set to the resolved CoCo executable;
+   - `Restart=always` and a short restart delay;
+   - `COCO_DIR=%h/.coco` and `PYTHONUNBUFFERED=1`;
+   - a PATH that includes the resolved directories containing both `coco` and
+     `codex`, plus standard system binary directories;
+   - `WantedBy=default.target`.
+3. Show me the proposed unit before writing it if an existing unit is present.
+4. Run `systemctl --user daemon-reload`, enable and start the service, then
+   inspect `systemctl --user status coco.service --no-pager` and recent logs via
+   `journalctl --user -u coco.service -n 100 --no-pager`.
+5. If I need CoCo to continue after logout, explain user lingering and ask before
+   running the privileged command needed to enable it.
+6. If this OS does not use systemd, create the equivalent safe per-user service
+   using its native service manager. If that cannot be done safely, run `coco`
+   in the foreground for the initial test and clearly document the remaining
+   persistence step.
+
+Phase 7 — Add CoCo to Telegram and grant only useful permissions
+
+Only begin this phase after the local allowlist is verified and the CoCo process
+is healthy.
+
+1. Have me add the new CoCo bot to the approved supergroup.
+2. Promote it to administrator so topic/session features work reliably.
+3. Enable the permissions needed to post messages, manage topics, delete its
+   transient UI messages, and pin/unpin topic messages. Do not grant unrelated
+   permissions such as adding administrators or anonymous admin mode.
+4. Create or open a normal topic in the supergroup.
+
+Phase 8 — End-to-end verification
+
+1. Have me send `/start` inside the topic.
+2. Have me send `/folder`, select this machine and a real project folder, and
+   start a fresh session or resume an existing Codex session.
+3. Send a harmless test request such as: `Reply with the current workspace path
+   and do not modify files.`
+4. Confirm the response appears in the same Telegram topic.
+5. Run `/status` and confirm the machine, folder, Codex session, model, and
+   reasoning information are sensible.
+6. Confirm that another topic can be used as a separate project lane if desired.
+7. Re-check the service and logs for authentication, permission, polling,
+   app-server, or Telegram errors.
+
+Completion report
+
+When everything works, give me a concise report containing:
+
+- OS and service manager
+- Codex CLI version and authentication status (never credentials)
+- CoCo version/install method and executable path
+- CoCo service status
+- approved Telegram user ID and supergroup ID
+- configuration and state paths
+- browse root
+- successful Telegram test topic
+- how to view logs
+- how to update from Telegram with `/update`
+- any optional hardening or multi-machine work not yet configured
+
+Do not restart a working service merely to produce the report. Do not claim the
+installation is complete until the Telegram request receives a Codex response.
+````
+
+</details>
+
+### What you need before starting
+
+- Access to the machine that will stay online and run CoCo
+- A Telegram account allowed to create a bot and manage a group
+- A ChatGPT/Codex account or OpenAI API key for Codex authentication
+- Permission to install user-level software on the target machine
+
+The guided prompt defaults to a secure single-machine setup. After that works,
+see [Multi-machine setup](doc/multi-machine-setup.md) to add private worker
+machines over Tailscale.
 
 ## Install
 

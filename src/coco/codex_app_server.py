@@ -1590,6 +1590,8 @@ class CodexAppServerClient:
         thread_id: str,
         inputs: list[dict[str, Any]],
         approval_policy: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
         service_tier: str | None = None,
         timeout: float = 90.0,
     ) -> dict[str, Any]:
@@ -1599,6 +1601,10 @@ class CodexAppServerClient:
         }
         if approval_policy:
             params["approvalPolicy"] = approval_policy
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
         if service_tier:
             params["serviceTier"] = service_tier
         result = await self.request("turn/start", params, timeout=timeout)
