@@ -1,5 +1,6 @@
 """Tests for host resource usage watcher state and notifications."""
 
+import json
 from pathlib import Path
 
 import coco.handlers.resource_monitor as resource_monitor
@@ -84,3 +85,31 @@ def test_state_file_persists_under_coco_dir(monkeypatch, tmp_path):
     )
 
     assert (Path(tmp_path) / "resource_monitor_state.json").is_file()
+
+
+def test_corrupt_sample_values_do_not_crash_monitor(monkeypatch, tmp_path):
+    monkeypatch.setenv("COCO_DIR", str(tmp_path))
+    state_path = Path(tmp_path) / "resource_monitor_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {"ts": "bad", "cpu": "bad"},
+                    None,
+                    {"ts": 1.0, "cpu": 10.0},
+                ],
+                "last_summary_ts": "bad",
+                "last_sample_ts": "bad",
+                "alert_active": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    notifications = resource_monitor.collect_due_notifications(
+        now=resource_monitor.WEEKLY_SUMMARY_INTERVAL_SECONDS + 10,
+        sample=_sample(cpu=20.0, ram=30.0, disk=40.0),
+        force_sample=True,
+    )
+
+    assert isinstance(notifications, list)

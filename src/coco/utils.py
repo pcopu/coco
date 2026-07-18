@@ -74,8 +74,10 @@ def read_cwd_from_jsonl(file_path: str | Path) -> str:
                     continue
                 try:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     cwd = data.get("cwd")
-                    if cwd:
+                    if isinstance(cwd, str) and cwd:
                         return cwd
                 except json.JSONDecodeError:
                     continue

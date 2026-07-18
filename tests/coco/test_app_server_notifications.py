@@ -1,5 +1,7 @@
 """Tests for app-server notification fanout in Telegram bridge."""
 
+import asyncio
+
 import pytest
 
 import coco.bot as bot
@@ -281,6 +283,128 @@ async def test_raw_response_completed_ignores_late_text_after_interrupt(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_interrupt_fence_survives_parent_completion_and_blocks_late_child_text(
+    monkeypatch,
+):
+    handled = []
+
+    async def _handle_new_message(msg, _bot):
+        handled.append(msg)
+
+    monkeypatch.setattr(bot, "handle_new_message", _handle_new_message)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [],
+    )
+    bot._interrupted_codex_threads.add("th-child")
+
+    try:
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": "th-child",
+                "turn": {"id": "turn-parent", "status": "interrupted"},
+            },
+            bot=object(),
+        )
+        await bot._handle_codex_app_server_notification(
+            "item/completed",
+            {
+                "threadId": "th-child",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "late-child-message",
+                    "text": "sub-agent finished after escape",
+                },
+            },
+            bot=object(),
+        )
+
+        assert "th-child" in bot._interrupted_codex_threads
+        assert handled == []
+    finally:
+        bot._interrupted_codex_threads.discard("th-child")
+
+
+@pytest.mark.asyncio
+async def test_interrupt_fence_ignores_stale_turn_started_for_same_turn(monkeypatch):
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    thread_id = "th-fenced"
+    bot._interrupted_codex_threads.add(thread_id)
+    bot._interrupted_codex_turns[thread_id] = "turn-old"
+
+    try:
+        await bot._handle_codex_app_server_notification(
+            "turn/started",
+            {"threadId": thread_id, "turn": {"id": "turn-old"}},
+            bot=object(),
+        )
+        assert thread_id in bot._interrupted_codex_threads
+
+        await bot._handle_codex_app_server_notification(
+            "turn/started",
+            {"threadId": thread_id, "turn": {"id": "turn-new"}},
+            bot=object(),
+        )
+        assert thread_id not in bot._interrupted_codex_threads
+    finally:
+        bot._interrupted_codex_threads.discard(thread_id)
+        bot._interrupted_codex_turns.pop(thread_id, None)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_completion_dispatches_input_queued_after_escape(monkeypatch):
+    dispatched: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        bot,
+        "enqueue_progress_clear",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    async def _dispatch_next(**kwargs):
+        dispatched.append(kwargs)
+
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch_next)
+    bot._interrupted_codex_threads.add("th-interrupted-queue")
+    try:
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": "th-interrupted-queue",
+                "turn": {"id": "turn-old", "status": "interrupted"},
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard("th-interrupted-queue")
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["thread_id"] == 111
+
+
+@pytest.mark.asyncio
 async def test_raw_response_image_generation_routes_image_output(monkeypatch):
     handled = []
 
@@ -361,10 +485,10 @@ async def test_turn_completed_finalizes_progress_and_clears_active_turn(monkeypa
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **kwargs: completed.append(kwargs))
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
-    async def _enqueue_clear(_bot, user_id, thread_id=None):
+    async def _enqueue_clear(_bot, user_id, thread_id=None, chat_id=None):
         cleared.append((user_id, thread_id))
 
     async def _dispatch_next(**_kwargs):
@@ -414,10 +538,10 @@ async def test_turn_completed_failed_clears_progress_and_dispatches_queue(monkey
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
-    async def _enqueue_clear(_bot, user_id, thread_id=None):
+    async def _enqueue_clear(_bot, user_id, thread_id=None, chat_id=None):
         cleared.append((user_id, thread_id))
 
     async def _dispatch_next(**kwargs):
@@ -464,10 +588,10 @@ async def test_turn_completed_completed_dispatches_queued_input(monkeypatch):
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
-    async def _enqueue_clear(_bot, user_id, thread_id=None):
+    async def _enqueue_clear(_bot, user_id, thread_id=None, chat_id=None):
         cleared.append((user_id, thread_id))
 
     async def _dispatch_next(**kwargs):
@@ -530,10 +654,10 @@ async def test_turn_completed_failed_retries_pending_text_after_transient_stream
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **kwargs: completed.append(kwargs))
 
-    async def _enqueue_clear(_bot, user_id, thread_id=None):
+    async def _enqueue_clear(_bot, user_id, thread_id=None, chat_id=None):
         cleared.append((user_id, thread_id))
 
-    async def _enqueue_progress_start(_bot, user_id, window_id, thread_id=None):
+    async def _enqueue_progress_start(_bot, user_id, window_id, thread_id=None, chat_id=None):
         progress_started.append((user_id, window_id, thread_id))
 
     async def _dispatch_next(**kwargs):
@@ -631,7 +755,7 @@ async def test_turn_completed_promotes_progress_when_no_final_text(monkeypatch):
         lambda *_args, **_kwargs: "promoted from progress",
     )
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content(**kwargs):
@@ -684,7 +808,7 @@ async def test_turn_completed_uses_warning_when_progress_empty(monkeypatch):
         lambda *_args, **_kwargs: "   ",
     )
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content(**kwargs):
@@ -724,7 +848,7 @@ async def test_turn_completed_skips_warning_after_image_only_tool_result(monkeyp
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content(**kwargs):
@@ -764,7 +888,7 @@ async def test_turn_completed_waits_for_late_image_generation_result(monkeypatch
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content(**kwargs):
@@ -817,7 +941,7 @@ async def test_turn_completed_image_generation_still_warns_after_grace_when_no_r
         lambda *_args, **_kwargs: "   ",
     )
 
-    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content(**kwargs):

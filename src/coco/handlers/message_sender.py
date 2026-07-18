@@ -17,10 +17,12 @@ RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
 
 import io
 import logging
+from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..telegram_memory import log_outgoing_edit, log_outgoing_send
@@ -66,11 +68,73 @@ _VOICE_EXTENSION_BY_MEDIA_TYPE = {
     "audio/mp4": ".m4a",
     "audio/ogg": ".ogg",
 }
+_RICH_TEXT_FORMATS = {"html", "markdown"}
 
 
 def _thread_id_from_kwargs(kwargs: dict[str, Any]) -> int | None:
     tid = kwargs.get("message_thread_id")
     return tid if isinstance(tid, int) else None
+
+
+def _build_rich_message(
+    *,
+    rich_text: str,
+    rich_format: str,
+    rich_is_rtl: bool = False,
+    rich_skip_entity_detection: bool = False,
+) -> dict[str, Any]:
+    rich_format = rich_format.strip().lower()
+    if rich_format not in _RICH_TEXT_FORMATS:
+        raise ValueError(f"Unsupported rich text format: {rich_format}")
+    payload: dict[str, Any] = {rich_format: rich_text}
+    if rich_is_rtl:
+        payload["is_rtl"] = True
+    if rich_skip_entity_detection:
+        payload["skip_entity_detection"] = True
+    return payload
+
+
+async def _send_rich_message(
+    bot: Bot,
+    *,
+    chat_id: int,
+    rich_message: dict[str, Any],
+    **kwargs: Any,
+) -> Message | SimpleNamespace:
+    # sendRichMessage does not accept the regular text method's preview option.
+    kwargs.pop("link_preview_options", None)
+    result = await bot._post(
+        "sendRichMessage",
+        {
+            "chat_id": chat_id,
+            "rich_message": rich_message,
+            **kwargs,
+        },
+    )
+    if isinstance(result, Message):
+        return result
+    if isinstance(result, dict):
+        return SimpleNamespace(message_id=result.get("message_id"))
+    return SimpleNamespace(message_id=None)
+
+
+async def _edit_rich_message(
+    target: Any,
+    *,
+    rich_message: dict[str, Any],
+    **kwargs: Any,
+) -> Any:
+    """Edit rich content without PTB's currently required text argument."""
+    chat_id, message_id, _thread_id = _target_message_meta(target)
+    data: dict[str, Any] = {"rich_message": rich_message, **kwargs}
+    if chat_id is not None and message_id is not None:
+        data.update(chat_id=chat_id, message_id=message_id)
+    else:
+        inline_message_id = getattr(target, "inline_message_id", None)
+        if not isinstance(inline_message_id, str) or not inline_message_id:
+            raise ValueError("Rich edit target has no Telegram message identifier")
+        data["inline_message_id"] = inline_message_id
+    return await target.get_bot()._post("editMessageText", data)
 
 
 def _target_message_meta(target: Any) -> tuple[int | None, int | None, int | None]:
@@ -93,23 +157,43 @@ async def send_with_fallback(
     chat_id: int,
     text: str,
     **kwargs: Any,
-) -> Message | None:
+) -> Message:
     """Send message with MarkdownV2, falling back to plain text on failure.
 
-    Returns the sent Message on success, None on failure.
-    RetryAfter is re-raised for caller handling.
+    Returns the sent Message on success. Terminal delivery errors and
+    RetryAfter are re-raised for caller handling.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     thread_id = _thread_id_from_kwargs(kwargs)
+    rich_text = kwargs.pop("rich_text", None)
+    fallback_text = rich_text if isinstance(rich_text, str) else text
+    rich_format = kwargs.pop("rich_format", "markdown")
+    rich_is_rtl = bool(kwargs.pop("rich_is_rtl", False))
+    rich_skip_entity_detection = bool(kwargs.pop("rich_skip_entity_detection", False))
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=convert_markdown(text),
-            parse_mode="MarkdownV2",
-            **kwargs,
-        )
+        if isinstance(rich_text, str):
+            sent = await _send_rich_message(
+                bot,
+                chat_id=chat_id,
+                rich_message=_build_rich_message(
+                    rich_text=rich_text,
+                    rich_format=rich_format,
+                    rich_is_rtl=rich_is_rtl,
+                    rich_skip_entity_detection=rich_skip_entity_detection,
+                ),
+                **kwargs,
+            )
+            logged_text = rich_text
+        else:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=convert_markdown(text),
+                parse_mode="MarkdownV2",
+                **kwargs,
+            )
+            logged_text = text
         log_outgoing_send(
-            text=text,
+            text=logged_text,
             chat_id=chat_id,
             thread_id=thread_id,
             message_id=sent.message_id,
@@ -118,30 +202,33 @@ async def send_with_fallback(
         return sent
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
         try:
             sent = await bot.send_message(
-                chat_id=chat_id, text=_strip_sentinels(text), **kwargs
+                chat_id=chat_id, text=_strip_sentinels(fallback_text), **kwargs
             )
             log_outgoing_send(
-                text=text,
+                text=fallback_text,
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=sent.message_id,
                 source="message_sender.send_with_fallback",
             )
             return sent
-        except RetryAfter:
+        except (RetryAfter, NetworkError):
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
-            return None
+            raise
 
 
 async def send_photo(
     bot: Bot,
     chat_id: int,
     image_data: list[tuple[str, bytes]],
+    delivery_is_current: Callable[[], bool] | None = None,
     **kwargs: Any,
 ) -> None:
     """Send photo(s) to chat. Sends as media group if multiple images.
@@ -177,9 +264,13 @@ async def send_photo(
     except RetryAfter:
         raise
     except Exception as e:
+        if isinstance(e, NetworkError) and not isinstance(e, BadRequest):
+            raise
         logger.warning("Photo send failed for %d; falling back to documents: %s", chat_id, e)
         try:
             for index, (media_type, raw_bytes) in enumerate(image_data, start=1):
+                if delivery_is_current is not None and not delivery_is_current():
+                    return
                 extension = _IMAGE_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
                 await bot.send_document(
                     chat_id=chat_id,
@@ -187,10 +278,11 @@ async def send_photo(
                     filename=f"image-{index}{extension}",
                     **kwargs,
                 )
-        except RetryAfter:
+        except (RetryAfter, NetworkError):
             raise
         except Exception as doc_exc:
             logger.error("Failed to send image fallback document to %d: %s", chat_id, doc_exc)
+            raise
 
 
 async def send_video(
@@ -210,6 +302,8 @@ async def send_video(
     except RetryAfter:
         raise
     except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
         logger.warning("Video send failed for %d; falling back to document: %s", chat_id, exc)
         extension = _VIDEO_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
         try:
@@ -219,7 +313,7 @@ async def send_video(
                 filename=f"video{extension}",
                 **kwargs,
             )
-        except RetryAfter:
+        except (RetryAfter, NetworkError):
             raise
         except Exception as doc_exc:
             logger.error("Failed to send video fallback document to %d: %s", chat_id, doc_exc)
@@ -243,10 +337,11 @@ async def send_documents(
                 filename=filename,
                 **kwargs,
             )
-    except RetryAfter:
+    except (RetryAfter, NetworkError):
         raise
     except Exception as e:
         logger.error("Failed to send document to %d: %s", chat_id, e)
+        raise
 
 
 async def send_voice(
@@ -268,6 +363,8 @@ async def send_voice(
     except RetryAfter:
         raise
     except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
         logger.warning("Voice send failed for %d; falling back to audio/document: %s", chat_id, exc)
         try:
             await bot.send_audio(
@@ -276,7 +373,7 @@ async def send_voice(
                 filename=f"voice{extension}",
                 **kwargs,
             )
-        except RetryAfter:
+        except (RetryAfter, NetworkError):
             raise
         except Exception as audio_exc:
             logger.warning("Audio fallback failed for %d; falling back to document: %s", chat_id, audio_exc)
@@ -287,24 +384,36 @@ async def send_voice(
                     filename=f"voice{extension}",
                     **kwargs,
                 )
-            except RetryAfter:
+            except (RetryAfter, NetworkError):
                 raise
             except Exception as doc_exc:
                 logger.error("Failed to send voice fallback document to %d: %s", chat_id, doc_exc)
+                raise
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
     """Reply with MarkdownV2, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     thread_id = getattr(message, "message_thread_id", None)
+    rich_text = kwargs.pop("rich_text", None)
+    if isinstance(rich_text, str):
+        raise ValueError(
+            "Rich Telegram replies are not supported; use a standalone rich send or a plain reply"
+        )
+    reply_source = text
+    fallback_text = reply_source
+    kwargs.pop("rich_format", None)
+    kwargs.pop("rich_is_rtl", None)
+    kwargs.pop("rich_skip_entity_detection", None)
     try:
         sent = await message.reply_text(
-            convert_markdown(text),
+            convert_markdown(reply_source),
             parse_mode="MarkdownV2",
             **kwargs,
         )
+        logged_text = reply_source
         log_outgoing_send(
-            text=text,
+            text=logged_text,
             chat_id=message.chat_id,
             thread_id=thread_id if isinstance(thread_id, int) else None,
             message_id=sent.message_id,
@@ -313,18 +422,20 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
         return sent
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
         try:
-            sent = await message.reply_text(_strip_sentinels(text), **kwargs)
+            sent = await message.reply_text(_strip_sentinels(fallback_text), **kwargs)
             log_outgoing_send(
-                text=text,
+                text=fallback_text,
                 chat_id=message.chat_id,
                 thread_id=thread_id if isinstance(thread_id, int) else None,
                 message_id=sent.message_id,
                 source="message_sender.safe_reply",
             )
             return sent
-        except RetryAfter:
+        except (RetryAfter, NetworkError):
             raise
         except Exception as e:
             logger.error(f"Failed to reply: {e}")
@@ -335,15 +446,34 @@ async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
     """Edit message with MarkdownV2, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     chat_id, message_id, thread_id = _target_message_meta(target)
+    rich_text = kwargs.pop("rich_text", None)
+    fallback_text = rich_text if isinstance(rich_text, str) else text
+    rich_format = kwargs.pop("rich_format", "markdown")
+    rich_is_rtl = bool(kwargs.pop("rich_is_rtl", False))
+    rich_skip_entity_detection = bool(kwargs.pop("rich_skip_entity_detection", False))
     try:
-        await target.edit_message_text(
-            convert_markdown(text),
-            parse_mode="MarkdownV2",
-            **kwargs,
-        )
+        logged_text = text
+        if isinstance(rich_text, str):
+            await _edit_rich_message(
+                target,
+                rich_message=_build_rich_message(
+                    rich_text=rich_text,
+                    rich_format=rich_format,
+                    rich_is_rtl=rich_is_rtl,
+                    rich_skip_entity_detection=rich_skip_entity_detection,
+                ),
+                **kwargs,
+            )
+            logged_text = rich_text
+        else:
+            await target.edit_message_text(
+                convert_markdown(text),
+                parse_mode="MarkdownV2",
+                **kwargs,
+            )
         if chat_id is not None and message_id is not None:
             log_outgoing_edit(
-                text=text,
+                text=logged_text,
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
@@ -351,12 +481,14 @@ async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
             )
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
         try:
-            await target.edit_message_text(_strip_sentinels(text), **kwargs)
+            await target.edit_message_text(_strip_sentinels(fallback_text), **kwargs)
             if chat_id is not None and message_id is not None:
                 log_outgoing_edit(
-                    text=text,
+                    text=fallback_text,
                     chat_id=chat_id,
                     thread_id=thread_id,
                     message_id=message_id,
@@ -374,40 +506,65 @@ async def safe_send(
     text: str,
     message_thread_id: int | None = None,
     **kwargs: Any,
-) -> None:
+) -> Message | SimpleNamespace | None:
     """Send message with MarkdownV2, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
+    rich_text = kwargs.pop("rich_text", None)
+    fallback_text = rich_text if isinstance(rich_text, str) else text
+    rich_format = kwargs.pop("rich_format", "markdown")
+    rich_is_rtl = bool(kwargs.pop("rich_is_rtl", False))
+    rich_skip_entity_detection = bool(kwargs.pop("rich_skip_entity_detection", False))
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=convert_markdown(text),
-            parse_mode="MarkdownV2",
-            **kwargs,
-        )
+        if isinstance(rich_text, str):
+            sent = await _send_rich_message(
+                bot,
+                chat_id=chat_id,
+                rich_message=_build_rich_message(
+                    rich_text=rich_text,
+                    rich_format=rich_format,
+                    rich_is_rtl=rich_is_rtl,
+                    rich_skip_entity_detection=rich_skip_entity_detection,
+                ),
+                **kwargs,
+            )
+            logged_text = rich_text
+        else:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=convert_markdown(text),
+                parse_mode="MarkdownV2",
+                **kwargs,
+            )
+            logged_text = text
         log_outgoing_send(
-            text=text,
+            text=logged_text,
             chat_id=chat_id,
             thread_id=message_thread_id,
             message_id=sent.message_id,
             source="message_sender.safe_send",
         )
+        return sent
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
         try:
             sent = await bot.send_message(
-                chat_id=chat_id, text=_strip_sentinels(text), **kwargs
+                chat_id=chat_id, text=_strip_sentinels(fallback_text), **kwargs
             )
             log_outgoing_send(
-                text=text,
+                text=fallback_text,
                 chat_id=chat_id,
                 thread_id=message_thread_id,
                 message_id=sent.message_id,
                 source="message_sender.safe_send",
             )
-        except RetryAfter:
+            return sent
+        except (RetryAfter, NetworkError):
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
+            return None

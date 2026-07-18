@@ -40,6 +40,68 @@ def _append_memory_entries(path: Path, entries: list[dict[str, object]]) -> None
             handle.write("\n")
 
 
+def test_recent_activity_skips_malformed_numeric_memory_fields(
+    mgr: SessionManager,
+    telegram_memory_path: Path,
+):
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=8,
+        chat_id=-100123,
+        codex_thread_id="thread-8",
+        window_id="@8",
+        display_name="demo",
+    )
+    _append_memory_entries(
+        telegram_memory_path,
+        [
+            {
+                "direction": "in",
+                "chat_id": "not-a-chat",
+                "thread_id": "not-a-thread",
+                "from_user_id": "not-a-user",
+                "text": "corrupt",
+            },
+            {
+                "direction": "in",
+                "chat_id": -100123,
+                "thread_id": 8,
+                "from_user_id": 100,
+                "text": "valid activity",
+            },
+        ],
+    )
+
+    summary = mgr._build_coco_recent_activity_summary(
+        user_id=100,
+        chat_id=-100123,
+        current_thread_id=5,
+    )
+
+    assert summary == ["demo: User: valid activity"]
+
+
+@pytest.mark.asyncio
+async def test_session_summary_skips_non_object_jsonl_entries(
+    mgr: SessionManager,
+    monkeypatch,
+    tmp_path: Path,
+):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("[]\nnull\n7\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mgr,
+        "_build_session_file_path",
+        lambda _session_id, _cwd: transcript,
+    )
+
+    result = await mgr._get_session_direct("session-1", str(tmp_path))
+
+    assert result is not None
+    assert result.summary == "Untitled"
+    assert result.message_count == 0
+
+
 class TestThreadBindings:
     def test_bind_and_get(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "@1")
@@ -250,6 +312,33 @@ class TestTopicBindingsV2:
         assert binding.model_slug == "gpt-5.4"
         assert binding.reasoning_effort == "high"
         assert mgr.get_topic_model_selection(100, 1) == ("gpt-5.4", "high")
+
+    def test_invalidate_topic_codex_thread_clears_window_and_binding(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            chat_id=-100123,
+            codex_thread_id="thread-1",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.set_window_codex_active_turn_id("@1", "turn-1")
+
+        changed = mgr.invalidate_topic_codex_thread(
+            user_id=100,
+            thread_id=1,
+            chat_id=-100123,
+        )
+
+        binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+        assert changed is True
+        assert mgr.get_window_codex_thread_id("@1") == ""
+        assert mgr.get_window_codex_active_turn_id("@1") == ""
+        assert binding is not None
+        assert binding.codex_thread_id == ""
 
     def test_topic_service_tier_selection_roundtrip(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "@1", window_name="proj")
@@ -552,6 +641,191 @@ class TestHostFollowTakeover:
         assert mgr.get_topic_sync_mode(100, 1) == TOPIC_SYNC_MODE_TELEGRAM_LIVE
         assert mgr.is_window_external_turn_active("@1") is False
 
+    @pytest.mark.asyncio
+    async def test_host_follow_refreshes_goal_after_resuming_latest_thread(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+        resumed = False
+        sent: list[list[dict[str, object]]] = []
+
+        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+            nonlocal resumed
+            assert window_id == "@1"
+            assert cwd == "/tmp/proj"
+            resumed = True
+            mgr.set_window_codex_thread_id("@1", "thread-new")
+            return "thread-new"
+
+        async def _get_topic_goal(**_kwargs):
+            assert resumed is True
+            return True, {"goal": {"objective": "New thread goal", "status": "active"}}, ""
+
+        async def _send_inputs_to_window(
+            window_id: str,
+            inputs: list[dict[str, object]],
+            *,
+            steer: bool = False,
+            force_new_turn: bool = False,
+        ):
+            _ = window_id, steer, force_new_turn
+            sent.append(inputs)
+            return True, "ok"
+
+        monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest)
+        monkeypatch.setattr(mgr, "get_topic_goal", _get_topic_goal)
+        monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
+
+        ok, _message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="should we change the goal?",
+        )
+
+        assert ok is True
+        assert len(sent) == 1
+        assert "Current native goal objective: New thread goal" in str(sent[0])
+
+    @pytest.mark.asyncio
+    async def test_remote_host_follow_inherits_resumed_model_before_send(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        mgr.inherit_window_topic_model_selection(
+            window_id="@1",
+            model_slug="gpt-5.5",
+            reasoning_effort="medium",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+        sent: list[tuple[str, str]] = []
+
+        async def _resume_latest(_machine_id: str, **_kwargs):
+            return {
+                "thread_id": "thread-new",
+                "turn_id": "",
+                "model_slug": "gpt-5.6-sol",
+                "reasoning_effort": "ultra",
+            }
+
+        async def _send_inputs(_machine_id: str, **kwargs):
+            sent.append((kwargs["model_slug"], kwargs["reasoning_effort"]))
+            return {
+                "ok": True,
+                "message": "ok",
+                "thread_id": "thread-new",
+                "turn_id": "turn-new",
+            }
+
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="continue",
+        )
+
+        assert ok is True
+        assert message == "ok"
+        assert sent == [("gpt-5.6-sol", "ultra")]
+
+
+@pytest.mark.asyncio
+async def test_local_topic_send_forwards_originating_topic_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local"))
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-shared",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="local-node",
+    )
+    mgr.set_topic_model_selection(
+        100,
+        1,
+        chat_id=-100123,
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=2,
+        chat_id=-100123,
+        codex_thread_id="thread-shared",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="local-node",
+    )
+    mgr.set_topic_model_selection(
+        100,
+        2,
+        chat_id=-100123,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    captured: list[tuple[str, str]] = []
+
+    async def _send_to_window(
+        window_id: str,
+        text: str,
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+        model_slug: str = "",
+        reasoning_effort: str = "",
+        service_tier: str = "",
+    ):
+        _ = window_id, text, steer, force_new_turn, service_tier
+        captured.append((model_slug, reasoning_effort))
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=2,
+        chat_id=-100123,
+        window_id="@1",
+        text="continue",
+    )
+
+    assert ok is True
+    assert message == "ok"
+    assert captured == [("gpt-5.6-sol", "ultra")]
+
 
 @pytest.mark.asyncio
 async def test_resume_latest_codex_session_for_window_syncs_topic_model_selection(
@@ -608,14 +882,6 @@ async def test_resume_latest_codex_session_for_window_syncs_topic_model_selectio
         cwd=str(workspace),
         display_name="proj",
     )
-    mgr.set_topic_model_selection(
-        100,
-        1,
-        chat_id=-100123,
-        model_slug="gpt-5.3-codex",
-        reasoning_effort="xhigh",
-    )
-
     async def _thread_resume(*, thread_id: str):
         assert thread_id == "thread-new"
         return {"thread": {"id": "thread-new"}}
@@ -634,6 +900,131 @@ async def test_resume_latest_codex_session_for_window_syncs_topic_model_selectio
     assert binding.codex_thread_id == "thread-new"
     assert binding.model_slug == "gpt-5.4"
     assert binding.reasoning_effort == "high"
+
+
+def test_sync_resumed_session_preserves_explicit_topic_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.set_topic_model_selection(
+        100,
+        1,
+        chat_id=-100123,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    monkeypatch.setattr(
+        mgr,
+        "get_codex_session_model_selection_for_thread",
+        lambda _thread_id, *, cwd="": ("gpt-5.5", "medium"),
+    )
+
+    changed, model_slug, reasoning_effort = (
+        mgr.sync_window_topic_model_selection_from_codex_session(
+            window_id="@1",
+            codex_thread_id="thread-resumed",
+            cwd="/tmp/proj",
+        )
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert changed is False
+    assert (model_slug, reasoning_effort) == ("gpt-5.5", "medium")
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"
+
+
+def test_later_resume_replaces_previously_inherited_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-a",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    selections = iter(
+        [
+            ("gpt-5.5", "medium"),
+            ("gpt-5.6-sol", "ultra"),
+        ]
+    )
+    monkeypatch.setattr(
+        mgr,
+        "get_codex_session_model_selection_for_thread",
+        lambda _thread_id, *, cwd="": next(selections),
+    )
+
+    mgr.sync_window_topic_model_selection_from_codex_session(
+        window_id="@1",
+        codex_thread_id="thread-a",
+        cwd="/tmp/proj",
+    )
+    mgr.sync_window_topic_model_selection_from_codex_session(
+        window_id="@1",
+        codex_thread_id="thread-b",
+        cwd="/tmp/proj",
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"
+
+
+def test_reselecting_inherited_values_marks_topic_selection_explicit(
+    mgr: SessionManager
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-a",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.inherit_window_topic_model_selection(
+        window_id="@1",
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+
+    changed = mgr.set_topic_model_selection(
+        100,
+        1,
+        chat_id=-100123,
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert changed is True
+    assert binding is not None
+    assert binding.model_selection_explicit is True
+
+
+def test_legacy_topic_model_selection_defaults_to_explicit() -> None:
+    binding = session_mod.TopicBinding.from_dict(
+        {
+            "model_slug": "gpt-5.5",
+            "reasoning_effort": "medium",
+        }
+    )
+
+    assert binding.model_selection_explicit is True
 
 
 @pytest.mark.asyncio
@@ -873,6 +1264,53 @@ async def test_set_topic_goal_creates_remote_thread_when_missing(
     binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
     assert binding is not None
     assert binding.codex_thread_id == "remote-thread-1"
+
+
+@pytest.mark.asyncio
+async def test_remote_goal_refresh_inherits_resumed_model_selection(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(mgr, "_local_machine_identity", lambda: ("local-node", "Local"))
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+    mgr.inherit_window_topic_model_selection(
+        window_id="@1",
+        model_slug="gpt-5.5",
+        reasoning_effort="medium",
+    )
+
+    async def _resume_latest(_machine_id: str, **_kwargs):
+        return {
+            "thread_id": "thread-new",
+            "model_slug": "gpt-5.6-sol",
+            "reasoning_effort": "ultra",
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
+
+    thread_id, error = await mgr.resolve_goal_thread_for_topic(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        create=True,
+        force_refresh=True,
+    )
+
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert error == ""
+    assert thread_id == "thread-new"
+    assert binding is not None
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"
 
 
 class TestRuntimeCapabilityHint:
@@ -1232,6 +1670,78 @@ def test_load_state_ignores_legacy_thread_bindings_payload(monkeypatch, tmp_path
     loaded = SessionManager()
 
     assert loaded.resolve_topic_binding(100, 7) is None
+
+
+@pytest.mark.parametrize("payload", [[], None, "bad", 7])
+def test_load_state_recovers_from_non_object_json(monkeypatch, tmp_path, payload):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(session_mod.config, "state_file", state_file)
+
+    loaded = SessionManager()
+
+    assert loaded.window_states == {}
+    assert loaded.topic_bindings_v2 == {}
+
+
+def test_load_state_salvages_valid_entries_from_malformed_maps(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "window_states": {
+                    "@bad": None,
+                    "@2": {"cwd": None, "window_name": 7},
+                },
+                "user_window_offsets": {
+                    "bad-user": {},
+                    "100": {"@bad": "bad", "@2": 5},
+                },
+                "window_display_names": [],
+                "group_chat_ids": {"valid": -100, "bad": "not-an-id"},
+                "topic_bindings_v2": {
+                    "100": {
+                        "3": {
+                            "window_id": None,
+                            "codex_thread_id": None,
+                            "cwd": None,
+                            "display_name": None,
+                            "machine_id": None,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(session_mod.config, "state_file", state_file)
+
+    loaded = SessionManager()
+
+    assert loaded.get_window_state("@2").cwd == ""
+    assert loaded.get_window_state("@2").window_name == ""
+    assert loaded.user_window_offsets == {100: {"@2": 5}}
+    assert loaded.window_display_names == {}
+    assert loaded.group_chat_ids == {"valid": -100}
+    binding = loaded.resolve_topic_binding(100, 3)
+    assert binding is not None
+    assert binding.window_id == ""
+    assert binding.codex_thread_id == ""
+    assert binding.cwd == ""
+    assert binding.display_name == ""
+
+
+def test_load_state_skips_non_finite_window_offset(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        '{"user_window_offsets":{"100":{"@infinite":1e10000,"@valid":7}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(session_mod.config, "state_file", state_file)
+
+    loaded = SessionManager()
+
+    assert loaded.user_window_offsets == {100: {"@valid": 7}}
 
 
 def test_load_state_preserves_topic_bindings_v2(
@@ -1667,6 +2177,61 @@ async def test_send_inputs_via_app_server_passes_topic_service_tier(
 
 
 @pytest.mark.asyncio
+async def test_send_inputs_via_app_server_passes_topic_model_and_effort(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    captured: list[tuple[str | None, str | None]] = []
+    mgr.bind_thread(100, 1, "@1", window_name="demo")
+    mgr.set_topic_model_selection(
+        100,
+        1,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    mgr.set_window_codex_thread_id("@1", "thread-1")
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        timeout: float = 90.0,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ):
+        _ = thread_id, inputs, approval_policy, timeout, service_tier
+        captured.append((model, effort))
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert captured == [("gpt-5.6-sol", "ultra")]
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_to_window_app_server_only_uses_cached_state_without_legacy_window(
     mgr: SessionManager,
     monkeypatch,
@@ -1865,6 +2430,115 @@ async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
     assert "transport.app_server.thread_missing_retry" in event_names
     assert "transport.app_server.thread_missing_recovered" in event_names
     assert "transport.app_server.send_failed" not in event_names
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_to_window_thread_not_found_skips_subagent_session(
+    mgr: SessionManager,
+    monkeypatch,
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_root = tmp_path / "sessions"
+    sessions_dir = sessions_root / "2026" / "07"
+    sessions_dir.mkdir(parents=True)
+
+    subagent_transcript = sessions_dir / "session-subagent.jsonl"
+    subagent_transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-10T22:15:44Z",
+                "payload": {
+                    "id": "thread-subagent",
+                    "cwd": str(workspace.resolve()),
+                    "parent_thread_id": "thread-parent",
+                    "thread_source": "subagent",
+                    "multi_agent_version": "v2",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": "thread-parent",
+                                "depth": 1,
+                            }
+                        }
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    state = mgr.get_window_state("@900009")
+    state.cwd = str(workspace)
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-subagent"
+    state.codex_active_turn_id = "turn-old"
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=7,
+        codex_thread_id="thread-subagent",
+        cwd=str(workspace),
+        display_name="demo",
+        window_id="@900009",
+    )
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "sessions_path", sessions_root)
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    resume_calls: list[str] = []
+
+    async def _thread_resume(*, thread_id: str):
+        resume_calls.append(thread_id)
+        return {"thread": {"id": thread_id}}
+
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_resume", _thread_resume)
+
+    call_states: list[str] = []
+
+    async def _send_inputs_via_codex_app_server(
+        *,
+        window_id: str,
+        inputs: list[dict[str, object]],
+        steer: bool,
+        force_new_turn: bool = False,
+        window_name: str,
+        cwd: str,
+    ):
+        _ = window_id, inputs, window_name, cwd, force_new_turn
+        thread_id = mgr.get_window_codex_thread_id("@900009")
+        call_states.append(thread_id)
+        if len(call_states) == 1:
+            assert steer is False
+            raise session_mod.CodexAppServerError("thread not found: thread-subagent")
+        if thread_id == "thread-subagent":
+            raise session_mod.CodexAppServerError(
+                "direct app-server input is not allowed for multi-agent v2 sub-agents"
+            )
+        assert steer is False
+        mgr.set_window_codex_thread_id("@900009", "thread-new-root")
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "_send_inputs_via_codex_app_server", _send_inputs_via_codex_app_server)
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900009",
+        [{"type": "text", "text": "hello"}],
+        steer=False,
+    )
+
+    assert ok is True
+    assert msg == "ok"
+    assert resume_calls == []
+    assert call_states == ["thread-subagent", ""]
+    assert mgr.get_window_codex_thread_id("@900009") == "thread-new-root"
+    binding = mgr.resolve_topic_binding(100, 7)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-new-root"
 
 
 @pytest.mark.asyncio
@@ -2330,6 +3004,67 @@ async def test_send_topic_text_to_window_injects_app_context_for_app_server(
 
 
 @pytest.mark.asyncio
+async def test_send_topic_text_to_window_injects_live_goal_context_for_plain_goal_requests(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    mgr.bind_thread(100, 5, "@1")
+
+    captured: dict[str, object] = {}
+
+    async def _get_topic_goal(**_kwargs):
+        return False, None, "No goal is set for this Codex thread."
+
+    async def _send_inputs_to_window(
+        window_id: str,
+        inputs: list[dict[str, object]],
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+    ):
+        captured["window_id"] = window_id
+        captured["inputs"] = inputs
+        captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "get_topic_goal", _get_topic_goal)
+    monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
+
+    ok, _msg = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=5,
+        window_id="@1",
+        text="please change the goal to ship the docs",
+        steer=False,
+    )
+
+    assert ok is True
+    assert captured["window_id"] == "@1"
+    inputs = captured["inputs"]
+    assert isinstance(inputs, list)
+    assert inputs[0]["type"] == "text"
+    goal_context = str(inputs[0]["text"])
+    assert "[coco goal context]" in goal_context
+    assert "Live native goal state for this topic: no goal is currently set." in goal_context
+    assert "Trust this live goal state over stale session memory." in goal_context
+    assert inputs[1] == {"type": "text", "text": "please change the goal to ship the docs"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Help me fix this Objective-C build",
+        "Compare Objective-C and Swift",
+        "We need goal-oriented programming examples",
+    ],
+)
+def test_goal_context_trigger_ignores_hyphenated_compounds(text):
+    assert SessionManager._message_requests_live_goal_context(text) is False
+
+
+@pytest.mark.asyncio
 async def test_send_topic_text_to_window_uses_codex_skill_inputs_for_app_server(
     mgr: SessionManager,
     monkeypatch,
@@ -2384,6 +3119,67 @@ async def test_send_topic_text_to_window_uses_codex_skill_inputs_for_app_server(
 
 
 @pytest.mark.asyncio
+async def test_send_topic_text_to_window_injects_live_goal_context_into_app_server_inputs(
+    mgr: SessionManager,
+    monkeypatch,
+    tmp_path: Path,
+):
+    codex_root = tmp_path / "codex-skills"
+    codex_dir = codex_root / "reviewer"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "SKILL.md").write_text(
+        "---\nname: reviewer\ndescription: Review skill\n---\n# Review\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(session_mod.config, "codex_skills_paths", [codex_root])
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    mgr.bind_thread(100, 5, "@1")
+    mgr.set_thread_codex_skills(100, 5, ["reviewer"])
+
+    captured: dict[str, object] = {}
+
+    async def _get_topic_goal(**_kwargs):
+        return True, {"goal": {"objective": "Ship the docs", "status": "active"}}, ""
+
+    async def _send_inputs_to_window(
+        window_id: str,
+        inputs: list[dict[str, object]],
+        *,
+        steer: bool = False,
+        force_new_turn: bool = False,
+    ):
+        captured["window_id"] = window_id
+        captured["inputs"] = inputs
+        captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
+        return True, "ok"
+
+    monkeypatch.setattr(mgr, "get_topic_goal", _get_topic_goal)
+    monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
+
+    ok, _msg = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=5,
+        window_id="@1",
+        text="check whether the goal should change",
+        steer=False,
+    )
+
+    assert ok is True
+    assert captured["window_id"] == "@1"
+    inputs = captured["inputs"]
+    assert isinstance(inputs, list)
+    assert inputs[0]["type"] == "skill"
+    assert inputs[1]["type"] == "text"
+    goal_context = str(inputs[1]["text"])
+    assert "[coco goal context]" in goal_context
+    assert "Current native goal status: active." in goal_context
+    assert "Current native goal objective: Ship the docs" in goal_context
+    assert inputs[2] == {"type": "text", "text": "check whether the goal should change"}
+
+
+@pytest.mark.asyncio
 async def test_send_topic_text_to_window_injects_legacy_skill_context(
     mgr: SessionManager,
     monkeypatch,
@@ -2420,10 +3216,10 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
         steer: bool = False,
         force_new_turn: bool = False,
     ):
-        _ = force_new_turn
         captured["window_id"] = window_id
         captured["text"] = text
         captured["steer"] = steer
+        captured["force_new_turn"] = force_new_turn
         return True, "ok"
 
     monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
@@ -2434,6 +3230,7 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
         window_id="@1",
         text="hello world",
         steer=True,
+        force_new_turn=True,
     )
 
     assert ok is True
@@ -2443,6 +3240,7 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
     assert "app `demo`" in injected
     assert "skill `reviewer`" in injected
     assert injected.endswith("hello world")
+    assert captured["force_new_turn"] is True
 
 
 @pytest.mark.asyncio

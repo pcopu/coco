@@ -127,7 +127,7 @@ async def test_handle_new_message_routes_only_final_text_in_host_follow_mode(
     finalized: list[tuple[int, str, int | None, bool]] = []
     delivered: list[str] = []
 
-    async def _enqueue_progress_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_progress_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content_message(*, text: str, **_kwargs):
@@ -327,7 +327,7 @@ async def test_handle_new_message_extracts_hidden_document_attachments(
     finalized: list[tuple[int, str, int | None, bool]] = []
     delivered: list[dict[str, object]] = []
 
-    async def _enqueue_progress_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False):
+    async def _enqueue_progress_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
         finalized.append((user_id, window_id, thread_id, compact))
 
     async def _enqueue_content_message(**kwargs):

@@ -246,8 +246,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
         session_manager.unbind_thread(user.id, thread_id, chat_id=chat_id)
-        clear_queued_topic_inputs(user.id, thread_id)
-        await clear_queued_topic_dock(context.bot, user.id, thread_id)
+        clear_queued_topic_inputs(user.id, thread_id, chat_id)
+        await clear_queued_topic_dock(
+            context.bot, user.id, thread_id, chat_id
+        )
 
     if not _can_user_create_sessions(user.id):
         await safe_reply(
@@ -384,6 +386,30 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+def _extract_active_turn_id(payload: object) -> str:
+    """Return the newest in-progress turn id from a thread/read payload."""
+    if not isinstance(payload, dict):
+        return ""
+    thread = payload.get("thread")
+    thread_payload = thread if isinstance(thread, dict) else payload
+    turns = thread_payload.get("turns")
+    if not isinstance(turns, list):
+        return ""
+    for turn in reversed(turns):
+        if not isinstance(turn, dict):
+            continue
+        status = turn.get("status")
+        turn_id = turn.get("id")
+        if (
+            isinstance(status, str)
+            and status.strip().lower() in {"inprogress", "in_progress", "running"}
+            and isinstance(turn_id, str)
+            and turn_id.strip()
+        ):
+            return turn_id.strip()
+    return ""
+
+
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_bot_globals()
     """Send Escape key to interrupt the assistant."""
@@ -409,6 +435,40 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if _codex_app_server_enabled():
+        async def _notify_esc_status(text: str) -> None:
+            try:
+                await safe_reply(update.message, text)
+            except Exception as exc:
+                logger.warning(
+                    "Failed sending /esc status notice (user=%d thread=%s): %s",
+                    user.id,
+                    thread_id,
+                    exc,
+                )
+                emit_telemetry(
+                    "esc.telegram_notice_failed",
+                    user_id=user.id,
+                    thread_id=thread_id,
+                    error=str(exc),
+                )
+
+        async def _cleanup_esc_ui() -> None:
+            try:
+                await clear_queued_topic_dock(
+                    context.bot, user.id, thread_id, chat_id
+                )
+            except Exception as exc:
+                logger.warning("Failed clearing /esc queue dock: %s", exc)
+            try:
+                await enqueue_progress_clear(
+                    context.bot,
+                    user.id,
+                    thread_id=thread_id,
+                    chat_id=chat_id,
+                )
+            except Exception as exc:
+                logger.warning("Failed clearing /esc progress message: %s", exc)
+
         codex_thread_id = ""
         binding = session_manager.resolve_topic_binding(
             user.id,
@@ -419,31 +479,78 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             codex_thread_id = binding.codex_thread_id.strip()
         if not codex_thread_id:
             codex_thread_id = session_manager.get_window_codex_thread_id(wid)
+
+        if codex_thread_id:
+            # Fence first: notification handling checks this synchronously, so
+            # child/sub-agent output already queued behind the command is muted.
+            import coco.bot as bot_mod
+
+            bot_mod._interrupted_codex_threads.add(codex_thread_id)
+            bot_mod._interrupted_codex_turns[codex_thread_id] = ""
+            clear_queued_topic_inputs(user.id, thread_id, chat_id)
+            purged = await cancel_topic_delivery(
+                user.id, thread_id, chat_id=chat_id
+            )
+        else:
+            purged = 0
+
         active_turn_id = session_manager.get_window_codex_active_turn_id(wid)
         if codex_thread_id and not active_turn_id:
             active_turn_id = codex_app_server_client.get_active_turn_id(codex_thread_id) or ""
+        if codex_thread_id and not active_turn_id:
+            try:
+                thread_payload = await codex_app_server_client.thread_read(
+                    thread_id=codex_thread_id,
+                    timeout=5.0,
+                )
+                active_turn_id = _extract_active_turn_id(thread_payload)
+            except Exception as e:
+                logger.warning(
+                    "App-server active-turn recovery failed (thread=%s): %s",
+                    codex_thread_id,
+                    e,
+                )
         if codex_thread_id and active_turn_id:
+            bot_mod._interrupted_codex_turns[codex_thread_id] = active_turn_id
             try:
                 await codex_app_server_client.turn_interrupt(
                     thread_id=codex_thread_id,
                     turn_id=active_turn_id,
                 )
-                import coco.bot as bot_mod
-
-                bot_mod._interrupted_codex_threads.add(codex_thread_id)
-                session_manager.clear_window_codex_turn(wid)
-                await safe_reply(update.message, "⎋ Interrupted active turn")
-                return
             except Exception as e:
+                # The turn is still live when the interrupt transport fails.
+                # Roll back the output fence so its remaining updates are not
+                # muted indefinitely while the cached active turn continues.
+                bot_mod._interrupted_codex_threads.discard(codex_thread_id)
+                bot_mod._interrupted_codex_turns.pop(codex_thread_id, None)
                 logger.warning(
                     "App-server interrupt failed (thread=%s turn=%s): %s",
                     codex_thread_id,
                     active_turn_id,
                     e,
                 )
-                await safe_reply(update.message, f"❌ App-server interrupt failed: {e}")
+                await _cleanup_esc_ui()
+                await _notify_esc_status(f"❌ App-server interrupt failed: {e}")
                 return
-        await safe_reply(update.message, "ℹ️ No active turn to interrupt.")
+            session_manager.clear_window_codex_turn(wid)
+            codex_app_server_client.clear_active_turn(codex_thread_id)
+            suffix = f"; discarded {purged} queued update(s)" if purged else ""
+            await _cleanup_esc_ui()
+            await _notify_esc_status(f"⎋ Interrupted active turn{suffix}")
+            return
+        if codex_thread_id:
+            # No interrupt was sent because no active turn could be confirmed.
+            # Do not leave a potentially live turn permanently output-fenced.
+            bot_mod._interrupted_codex_threads.discard(codex_thread_id)
+            bot_mod._interrupted_codex_turns.pop(codex_thread_id, None)
+            session_manager.clear_window_codex_turn(wid)
+            codex_app_server_client.clear_active_turn(codex_thread_id)
+            await _cleanup_esc_ui()
+            await _notify_esc_status(
+                "⎋ No foreground turn was visible; queued updates were cleared, but no running turn could be interrupted.",
+            )
+            return
+        await _notify_esc_status("ℹ️ No active turn to interrupt.")
         return
 
     await safe_reply(update.message, "❌ App-server transport is unavailable.")
@@ -531,6 +638,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             user.id,
             thread_id,
             window_id=wid,
+            chat_id=update.message.chat_id,
         )
         emit_telemetry(
             "queue.q_internal_enqueued",
@@ -585,6 +693,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         user.id,
         thread_id,
         window_id=wid,
+        chat_id=update.message.chat_id,
     )
     await _set_eyes_reaction(update.message)
 
@@ -2119,7 +2228,17 @@ async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(update.message, "✅ Goal cleared.")
         return
 
-    await safe_reply(update.message, f"❌ Unknown goal command `{normalized_action}`.\n{usage}")
+    implicit_goal_text = raw_args.strip()
+    ok, payload, message = await session_manager.set_topic_goal(
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        goal_text=implicit_goal_text,
+    )
+    if not ok:
+        await safe_reply(update.message, f"❌ {message}")
+        return
+    await safe_reply(update.message, _render_goal_text(payload, prefix="✅ Goal updated."))
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2304,6 +2423,7 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     target_user_id,
                     target_thread_id,
                     window_id=wid,
+                    chat_id=update.message.chat_id,
                 )
                 await safe_reply(
                     update.message,

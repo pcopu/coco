@@ -126,6 +126,43 @@ async def test_ensure_tts_server_started_raises_when_bootstrap_fails(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_ensure_tts_server_started_stops_process_after_health_timeout(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(tts_runtime, "_tts_base_url", lambda: "http://127.0.0.1:7788")
+    monkeypatch.setattr(tts_runtime, "_resolve_tts_command", lambda: ["supertonic", "serve"])
+    monkeypatch.setattr(tts_runtime, "_tts_binary_exists", lambda: True)
+    monkeypatch.setattr(tts_runtime, "_tts_server_start_timeout", lambda: 0.0)
+    monkeypatch.setattr(tts_runtime, "is_tts_server_healthy", lambda: asyncio.sleep(0, result=False))
+
+    class _FakeProc:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append("terminate")
+            self.returncode = 0
+
+        def kill(self):
+            calls.append("kill")
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            calls.append(f"wait:{timeout}")
+            return self.returncode
+
+    monkeypatch.setattr(tts_runtime.subprocess, "Popen", lambda *_args, **_kwargs: _FakeProc())
+    monkeypatch.setattr(tts_runtime, "_tts_server_process", None)
+
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        await tts_runtime.ensure_tts_server_started()
+
+    assert calls == ["terminate", "wait:5.0"]
+    assert tts_runtime._tts_server_process is None
+
+
+@pytest.mark.asyncio
 async def test_stop_tts_server_terminates_managed_process(monkeypatch):
     calls: list[str] = []
 

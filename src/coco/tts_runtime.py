@@ -325,16 +325,22 @@ async def _ensure_tts_server_started_locked() -> None:
         )
 
     deadline = time.monotonic() + _tts_server_start_timeout()
-    while time.monotonic() < deadline:
-        proc = _tts_server_process
-        if proc is not None and proc.poll() is not None:
-            raise RuntimeError(
-                f"managed TTS server exited before becoming healthy (code {proc.returncode})"
-            )
-        if await is_tts_server_healthy():
-            return
-        await asyncio.sleep(_tts_server_poll_interval())
+    try:
+        while time.monotonic() < deadline:
+            proc = _tts_server_process
+            if proc is not None and proc.poll() is not None:
+                await _terminate_tts_server_process_locked()
+                raise RuntimeError(
+                    f"managed TTS server exited before becoming healthy (code {proc.returncode})"
+                )
+            if await is_tts_server_healthy():
+                return
+            await asyncio.sleep(_tts_server_poll_interval())
+    except asyncio.CancelledError:
+        await _terminate_tts_server_process_locked()
+        raise
 
+    await _terminate_tts_server_process_locked()
     raise RuntimeError("managed TTS server did not become healthy before timeout")
 
 
@@ -353,6 +359,13 @@ async def _stop_tts_server_locked() -> None:
     if task is not None and task is not current and not task.done():
         task.cancel()
 
+    await _terminate_tts_server_process_locked()
+
+
+async def _terminate_tts_server_process_locked() -> None:
+    """Stop and forget the managed child without changing usage accounting."""
+    global _tts_server_process
+
     proc = _tts_server_process
     _tts_server_process = None
     if proc is None:
@@ -360,9 +373,15 @@ async def _stop_tts_server_locked() -> None:
     if proc.poll() is not None:
         return
 
-    proc.terminate()
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
     try:
         await asyncio.to_thread(proc.wait, 5.0)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
         await asyncio.to_thread(proc.wait, 5.0)

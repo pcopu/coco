@@ -65,6 +65,10 @@ APP_SERVER_NO_GOAL_EXISTS_RE = re.compile(
     r"\bno goal exists\b",
     re.IGNORECASE,
 )
+GOAL_CONTEXT_TRIGGER_RE = re.compile(
+    r"(^|\s|[`'\"(])(?:/goal(?![\w-])|goal(?![\w-])|objective(?![\w-]))",
+    re.IGNORECASE,
+)
 STATE_SCHEMA_VERSION = 6
 TOPIC_BINDING_TRANSPORT_WINDOW = "window"
 TOPIC_BINDING_TRANSPORT_CODEX_THREAD = "codex_thread"
@@ -160,15 +164,20 @@ class WindowState:
             }
         else:
             mention_only = False
+
+        def _text(key: str) -> str:
+            value = data.get(key, "")
+            return value if isinstance(value, str) else ""
+
         return cls(
-            session_id=data.get("session_id", ""),
-            cwd=data.get("cwd", ""),
-            window_name=data.get("window_name", ""),
+            session_id=_text("session_id"),
+            cwd=_text("cwd"),
+            window_name=_text("window_name"),
             last_input_ts=last_input_ts,
-            approval_mode=data.get("approval_mode", ""),
+            approval_mode=_text("approval_mode"),
             mention_only=mention_only,
-            codex_thread_id=data.get("codex_thread_id", ""),
-            codex_active_turn_id=data.get("codex_active_turn_id", ""),
+            codex_thread_id=_text("codex_thread_id"),
+            codex_active_turn_id=_text("codex_active_turn_id"),
         )
 
 
@@ -188,6 +197,7 @@ class TopicBinding:
     machine_display_name: str = ""
     model_slug: str = ""
     reasoning_effort: str = ""
+    model_selection_explicit: bool = False
     service_tier: str = ""
     response_mode: str = ""
 
@@ -217,6 +227,8 @@ class TopicBinding:
             d["model_slug"] = self.model_slug
         if self.reasoning_effort:
             d["reasoning_effort"] = self.reasoning_effort
+        if self.model_slug or self.reasoning_effort:
+            d["model_selection_explicit"] = self.model_selection_explicit
         if self.service_tier:
             d["service_tier"] = self.service_tier
         if self.response_mode:
@@ -225,6 +237,10 @@ class TopicBinding:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TopicBinding":
+        def _text(key: str) -> str:
+            value = data.get(key, "")
+            return value.strip() if isinstance(value, str) else ""
+
         raw_transport = data.get("transport", "")
         transport = str(raw_transport).strip().lower() if isinstance(raw_transport, str) else ""
         try:
@@ -235,16 +251,20 @@ class TopicBinding:
             thread_id = int(data.get("thread_id", 0) or 0)
         except (TypeError, ValueError):
             thread_id = 0
-        window_id = str(data.get("window_id", "")).strip()
-        codex_thread_id = str(data.get("codex_thread_id", "")).strip()
-        cwd = str(data.get("cwd", "")).strip()
-        display_name = str(data.get("display_name", "")).strip()
+        window_id = _text("window_id")
+        codex_thread_id = _text("codex_thread_id")
+        cwd = _text("cwd")
+        display_name = _text("display_name")
         raw_sync_mode = data.get("sync_mode", TOPIC_SYNC_MODE_TELEGRAM_LIVE)
         sync_mode = SessionManager._normalize_topic_sync_mode(raw_sync_mode)
-        machine_id = str(data.get("machine_id", "")).strip()
-        machine_display_name = str(data.get("machine_display_name", "")).strip()
-        model_slug = str(data.get("model_slug", "")).strip()
-        reasoning_effort = str(data.get("reasoning_effort", "")).strip()
+        machine_id = _text("machine_id")
+        machine_display_name = _text("machine_display_name")
+        model_slug = _text("model_slug")
+        reasoning_effort = _text("reasoning_effort")
+        if "model_selection_explicit" in data:
+            model_selection_explicit = data.get("model_selection_explicit") is True
+        else:
+            model_selection_explicit = bool(model_slug or reasoning_effort)
         raw_service_tier = data.get("service_tier", "")
         service_tier = (
             str(raw_service_tier).strip().lower()
@@ -283,6 +303,7 @@ class TopicBinding:
             machine_display_name=machine_display_name,
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
+            model_selection_explicit=model_selection_explicit,
             service_tier=service_tier,
             response_mode=response_mode,
         )
@@ -525,6 +546,7 @@ class SessionManager:
                     machine_display_name=binding.machine_display_name,
                     model_slug=binding.model_slug,
                     reasoning_effort=binding.reasoning_effort,
+                    model_selection_explicit=binding.model_selection_explicit,
                     service_tier=binding.service_tier,
                     response_mode=binding.response_mode,
                 )
@@ -600,6 +622,8 @@ class SessionManager:
         if config.state_file.exists():
             try:
                 state = json.loads(config.state_file.read_text())
+                if not isinstance(state, dict):
+                    raise ValueError("state root must be a JSON object")
                 raw_schema_version = state.get("state_schema_version", 1)
                 try:
                     self.state_schema_version = int(raw_schema_version)
@@ -607,14 +631,37 @@ class SessionManager:
                     self.state_schema_version = 1
                 if self.state_schema_version < 1:
                     self.state_schema_version = 1
+                raw_window_states = state.get("window_states", {})
+                if not isinstance(raw_window_states, dict):
+                    raw_window_states = {}
                 self.window_states = {
-                    k: WindowState.from_dict(v)
-                    for k, v in state.get("window_states", {}).items()
+                    str(key): WindowState.from_dict(value)
+                    for key, value in raw_window_states.items()
+                    if isinstance(key, str) and isinstance(value, dict)
                 }
-                self.user_window_offsets = {
-                    int(uid): offsets
-                    for uid, offsets in state.get("user_window_offsets", {}).items()
-                }
+                raw_offsets = state.get("user_window_offsets", {})
+                if not isinstance(raw_offsets, dict):
+                    raw_offsets = {}
+                self.user_window_offsets = {}
+                for raw_uid, raw_window_offsets in raw_offsets.items():
+                    if not isinstance(raw_window_offsets, dict):
+                        continue
+                    try:
+                        uid = int(raw_uid)
+                    except (TypeError, ValueError):
+                        continue
+                    offsets: dict[str, int] = {}
+                    for raw_window_id, raw_offset in raw_window_offsets.items():
+                        if not isinstance(raw_window_id, str):
+                            continue
+                        try:
+                            offset = int(raw_offset)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if offset >= 0:
+                            offsets[raw_window_id] = offset
+                    if offsets:
+                        self.user_window_offsets[uid] = offsets
                 raw_topic_bindings = state.get("topic_bindings_v2", {})
                 if not isinstance(raw_topic_bindings, dict):
                     raw_topic_bindings = {}
@@ -707,10 +754,24 @@ class SessionManager:
                         ]
                     if per_user:
                         self.thread_codex_skills[user_id] = per_user
-                self.window_display_names = state.get("window_display_names", {})
-                self.group_chat_ids = {
-                    k: int(v) for k, v in state.get("group_chat_ids", {}).items()
-                }
+                raw_display_names = state.get("window_display_names", {})
+                self.window_display_names = (
+                    {
+                        str(key): value
+                        for key, value in raw_display_names.items()
+                        if isinstance(key, str) and isinstance(value, str)
+                    }
+                    if isinstance(raw_display_names, dict)
+                    else {}
+                )
+                raw_group_chat_ids = state.get("group_chat_ids", {})
+                self.group_chat_ids = {}
+                if isinstance(raw_group_chat_ids, dict):
+                    for key, raw_chat_id in raw_group_chat_ids.items():
+                        try:
+                            self.group_chat_ids[str(key)] = int(raw_chat_id)
+                        except (TypeError, ValueError):
+                            continue
                 raw_default_mode = state.get("default_approval_mode", "")
                 self.default_approval_mode = (
                     raw_default_mode.strip()
@@ -769,7 +830,7 @@ class SessionManager:
                     self.state_schema_version = STATE_SCHEMA_VERSION
                     self._save_state()
 
-            except (json.JSONDecodeError, ValueError) as e:
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
                 logger.warning("Failed to load state: %s", e)
                 self.window_states = {}
                 self.user_window_offsets = {}
@@ -883,6 +944,8 @@ class SessionManager:
     def _extract_codex_session_summary(
         self,
         file_path: Path,
+        *,
+        resumable_only: bool = False,
     ) -> tuple[CodexSessionSummary, str] | None:
         """Read Codex session summary + cwd from a transcript JSONL file."""
         try:
@@ -911,6 +974,8 @@ class SessionManager:
                     payload = data.get("payload", {})
                     if not isinstance(payload, dict):
                         continue
+                    if resumable_only and self._is_codex_subagent_session_meta(payload):
+                        return None
                     raw_thread_id = payload.get("id", "")
                     raw_cwd = payload.get("cwd", "")
                     if isinstance(raw_thread_id, str) and raw_thread_id.strip():
@@ -935,6 +1000,17 @@ class SessionManager:
             ),
             file_cwd,
         )
+
+    @staticmethod
+    def _is_codex_subagent_session_meta(payload: dict[str, Any]) -> bool:
+        """Return whether session metadata identifies a non-resumable sub-agent."""
+        thread_source = payload.get("thread_source")
+        if isinstance(thread_source, str) and thread_source.strip().lower() == "subagent":
+            return True
+        source = payload.get("source")
+        if isinstance(source, str):
+            return source.strip().lower() == "subagent"
+        return isinstance(source, dict) and "subagent" in source
 
     @staticmethod
     def _extract_codex_session_model_selection(file_path: Path) -> tuple[str, str]:
@@ -1031,6 +1107,21 @@ class SessionManager:
         )
         if not model_slug and not reasoning_effort:
             return False, "", ""
+        changed = self.inherit_window_topic_model_selection(
+            window_id=window_id,
+            model_slug=model_slug,
+            reasoning_effort=reasoning_effort,
+        )
+        return changed, model_slug, reasoning_effort
+
+    def inherit_window_topic_model_selection(
+        self,
+        *,
+        window_id: str,
+        model_slug: str,
+        reasoning_effort: str,
+    ) -> bool:
+        """Fill unset topic selections from resumed local or remote session metadata."""
         changed = self._sync_topic_bindings_for_window_model_selection(
             window_id=window_id,
             model_slug=model_slug,
@@ -1038,7 +1129,7 @@ class SessionManager:
         )
         if changed:
             self._save_state()
-        return changed, model_slug, reasoning_effort
+        return changed
 
     def _codex_cwd_matches(self, target_cwd: str, file_cwd: str) -> bool:
         """Return True when the Codex transcript cwd exactly matches window cwd."""
@@ -1116,7 +1207,10 @@ class SessionManager:
             reverse=True,
         )[:300]
         for file_path in candidates:
-            extracted = self._extract_codex_session_summary(file_path)
+            extracted = self._extract_codex_session_summary(
+                file_path,
+                resumable_only=True,
+            )
             if not extracted:
                 continue
             summary, file_cwd = extracted
@@ -1534,13 +1628,15 @@ class SessionManager:
         model_slug: str,
         reasoning_effort: str,
     ) -> bool:
-        """Keep topic bindings in sync when a window inherits a session model."""
+        """Fill unset topic selections when a window inherits a session model."""
         normalized_model = model_slug.strip()
         normalized_effort = reasoning_effort.strip()
         changed = False
         for bindings in self.topic_bindings_v2.values():
             for binding in bindings.values():
                 if binding.window_id.strip() != window_id:
+                    continue
+                if binding.model_selection_explicit:
                     continue
                 if normalized_model and binding.model_slug != normalized_model:
                     binding.model_slug = normalized_model
@@ -1657,6 +1753,8 @@ class SessionManager:
                         continue
                     try:
                         data = json.loads(line)
+                        if not isinstance(data, dict):
+                            continue
                         parsed = TranscriptParser.parse_message(data)
                         if parsed:
                             message_count += 1
@@ -2047,6 +2145,104 @@ class SessionManager:
         return "\n".join(lines)
 
     @staticmethod
+    def _message_requests_live_goal_context(text: str) -> bool:
+        """Return whether one user message likely needs fresh native goal state."""
+        if not isinstance(text, str):
+            return False
+        normalized = text.strip()
+        if not normalized:
+            return False
+        return bool(GOAL_CONTEXT_TRIGGER_RE.search(normalized))
+
+    @staticmethod
+    def _extract_goal_status_and_text(payload: object) -> tuple[str, str]:
+        """Normalize one native goal payload into (status, objective text)."""
+        if not isinstance(payload, dict):
+            return "", ""
+
+        status = ""
+        text = ""
+        goal_block = payload.get("goal")
+        if isinstance(goal_block, dict):
+            for key in ("objective", "text", "goal"):
+                value = goal_block.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+            raw_status = goal_block.get("status")
+            if isinstance(raw_status, str) and raw_status.strip():
+                status = raw_status.strip().lower()
+        elif isinstance(goal_block, str) and goal_block.strip():
+            text = goal_block.strip()
+
+        if not text:
+            for key in ("objective", "text"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+        if not status:
+            raw_status = payload.get("status")
+            if isinstance(raw_status, str) and raw_status.strip():
+                status = raw_status.strip().lower()
+        return status, text
+
+    @staticmethod
+    def _goal_error_means_no_goal(message: str) -> bool:
+        """Return whether one goal read failure clearly means no goal is set."""
+        normalized = message.strip().lower()
+        if not normalized:
+            return False
+        return "no goal" in normalized or "no persisted codex thread is bound yet" in normalized
+
+    async def _build_live_goal_context(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+        user_text: str,
+    ) -> str:
+        """Build one fresh goal-state note for goal-sensitive user messages."""
+        if thread_id is None or not self._message_requests_live_goal_context(user_text):
+            return ""
+
+        lines = [
+            "[coco goal context]",
+            "Trust this live goal state over stale session memory.",
+        ]
+        ok, payload, message = await self.get_topic_goal(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        if ok:
+            status, goal_text = self._extract_goal_status_and_text(payload)
+            if status:
+                lines.append(f"Current native goal status: {status}.")
+            if goal_text:
+                lines.append(f"Current native goal objective: {goal_text}")
+            if not status and not goal_text:
+                lines.append("Live native goal state for this topic: no goal is currently set.")
+            lines.append(
+                "If the user wants to change the goal, re-check native goal tools from current state before deciding between create and update."
+            )
+            return "\n".join(lines)
+
+        if self._goal_error_means_no_goal(message):
+            lines.append("Live native goal state for this topic: no goal is currently set.")
+            lines.append(
+                "If the user wants to set a goal, do not claim an older completed goal is still attached unless the live tool confirms it."
+            )
+            return "\n".join(lines)
+
+        lines.append(f"Live native goal refresh failed: {message}")
+        lines.append(
+            "Do not assume earlier goal state is still correct; verify with native goal tools before describing goal constraints."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
     def _telegram_memory_log_path() -> Path:
         raw = env_alias("COCO_TELEGRAM_MEMORY_LOG_PATH")
         if raw:
@@ -2101,14 +2297,22 @@ class SessionManager:
                 continue
             if not isinstance(data, dict):
                 continue
-            if int(data.get("chat_id", 0) or 0) != chat_id:
+            try:
+                entry_chat_id = int(data.get("chat_id", 0) or 0)
+                raw_thread_id = int(data.get("thread_id", 0) or 0)
+            except (TypeError, ValueError):
                 continue
-            raw_thread_id = int(data.get("thread_id", 0) or 0)
+            if entry_chat_id != chat_id:
+                continue
             if raw_thread_id not in recent_by_thread:
                 continue
             direction = str(data.get("direction", "")).strip()
             if direction == "in":
-                if int(data.get("from_user_id", 0) or 0) != user_id:
+                try:
+                    from_user_id = int(data.get("from_user_id", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if from_user_id != user_id:
                     continue
                 speaker = "User"
             elif direction in {"out_send", "out_edit"}:
@@ -2177,6 +2381,23 @@ class SessionManager:
             thread_id=thread_id,
             chat_id=chat_id,
         ).strip()
+        model_slug, reasoning_effort = self.get_topic_model_selection(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        service_tier = self.get_topic_service_tier_selection(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        topic_send_kwargs: dict[str, str] = {}
+        if model_slug:
+            topic_send_kwargs["model_slug"] = model_slug
+        if reasoning_effort:
+            topic_send_kwargs["reasoning_effort"] = reasoning_effort
+        if service_tier:
+            topic_send_kwargs["service_tier"] = service_tier
         if (
             thread_id is not None
             and self._codex_app_server_mode_enabled()
@@ -2204,6 +2425,27 @@ class SessionManager:
                         window_id,
                         str(resume_result.get("turn_id", "")).strip(),
                     )
+                    self.inherit_window_topic_model_selection(
+                        window_id=window_id,
+                        model_slug=str(resume_result.get("model_slug", "")).strip(),
+                        reasoning_effort=str(
+                            resume_result.get("reasoning_effort", "")
+                        ).strip(),
+                    )
+                    model_slug, reasoning_effort = self.get_topic_model_selection(
+                        user_id,
+                        thread_id,
+                        chat_id=chat_id,
+                    )
+                    topic_send_kwargs = {
+                        key: value
+                        for key, value in {
+                            "model_slug": model_slug,
+                            "reasoning_effort": reasoning_effort,
+                            "service_tier": service_tier,
+                        }.items()
+                        if value
+                    }
             else:
                 resumed_thread_id = await self.resume_latest_codex_session_for_window(
                     window_id=window_id,
@@ -2212,11 +2454,18 @@ class SessionManager:
             if not resumed_thread_id:
                 return False, "Failed to resume the latest Codex session for this folder."
 
+        goal_context = await self._build_live_goal_context(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            user_text=text,
+        )
+
         apps = self.resolve_thread_skills(user_id, thread_id, chat_id=chat_id)
         codex_skills = self.resolve_thread_codex_skills(
             user_id, thread_id, chat_id=chat_id
         )
-        if not apps and not codex_skills and not operator_context:
+        if not apps and not codex_skills and not operator_context and not goal_context:
             if machine_id and machine_id != local_machine_id:
                 from .agent_rpc import agent_rpc_client
 
@@ -2227,16 +2476,6 @@ class SessionManager:
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
-                model_slug, reasoning_effort = self.get_topic_model_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
-                service_tier = self.get_topic_service_tier_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
                 remote_result = await agent_rpc_client.send_inputs(
                     machine_id,
                     window_id=window_id,
@@ -2274,6 +2513,7 @@ class SessionManager:
                     text,
                     steer=steer,
                     force_new_turn=force_new_turn,
+                    **topic_send_kwargs,
                 )
             if ok:
                 self.mark_topic_telegram_live(
@@ -2302,6 +2542,8 @@ class SessionManager:
                     codex_skills=[],
                 ).strip()
                 inputs.insert(0, {"type": "text", "text": app_context})
+            if goal_context:
+                inputs.append({"type": "text", "text": goal_context})
             inputs.append({"type": "text", "text": text})
             if machine_id and machine_id != local_machine_id:
                 from .agent_rpc import agent_rpc_client
@@ -2313,16 +2555,6 @@ class SessionManager:
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
-                model_slug, reasoning_effort = self.get_topic_model_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
-                service_tier = self.get_topic_service_tier_selection(
-                    user_id,
-                    thread_id,
-                    chat_id=chat_id,
-                )
                 remote_result = await agent_rpc_client.send_inputs(
                     machine_id,
                     window_id=window_id,
@@ -2360,6 +2592,7 @@ class SessionManager:
                     inputs,
                     steer=steer,
                     force_new_turn=force_new_turn,
+                    **topic_send_kwargs,
                 )
             if ok:
                 self.mark_topic_telegram_live(
@@ -2370,15 +2603,23 @@ class SessionManager:
                 )
             return ok, msg
 
+        injected_text = text
+        if goal_context:
+            injected_text = f"{goal_context}\n\n{injected_text}"
         injected = self._inject_topic_context(
-            text,
+            injected_text,
             user_id=user_id,
             thread_id=thread_id,
             chat_id=chat_id,
             apps=apps,
             codex_skills=codex_skills,
         )
-        ok, msg = await self.send_to_window(window_id, injected, steer=steer)
+        ok, msg = await self.send_to_window(
+            window_id,
+            injected,
+            steer=steer,
+            force_new_turn=force_new_turn,
+        )
         if ok:
             self.mark_topic_telegram_live(
                 user_id=user_id,
@@ -2664,6 +2905,11 @@ class SessionManager:
                     machine_id=machine_id,
                     machine_display_name=machine_name,
                 )
+                self.inherit_window_topic_model_selection(
+                    window_id=window_id,
+                    model_slug=str(resumed.get("model_slug", "")).strip(),
+                    reasoning_effort=str(resumed.get("reasoning_effort", "")).strip(),
+                )
                 return resumed_thread_id, ""
 
             try:
@@ -2903,11 +3149,35 @@ class SessionManager:
         if (
             binding.model_slug == normalized_model
             and binding.reasoning_effort == normalized_effort
+            and binding.model_selection_explicit
         ):
             return False
         binding.model_slug = normalized_model
         binding.reasoning_effort = normalized_effort
+        binding.model_selection_explicit = bool(normalized_model or normalized_effort)
         self._save_state()
+        return True
+
+    def invalidate_topic_codex_thread(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        *,
+        chat_id: int | None = None,
+    ) -> bool:
+        """Clear the active Codex thread binding for one topic.
+
+        This forces the next turn to create a fresh thread so updated
+        topic-scoped model or reasoning settings actually take effect.
+        """
+        if thread_id is None:
+            return False
+        window_id = self.get_window_for_thread(user_id, thread_id, chat_id=chat_id)
+        if not window_id:
+            return False
+        if not self.get_window_codex_thread_id(window_id) and not self.get_window_codex_active_turn_id(window_id):
+            return False
+        self.set_window_codex_thread_id(window_id, "")
         return True
 
     def set_topic_service_tier_selection(
@@ -3085,6 +3355,9 @@ class SessionManager:
         )
         resolved_model_slug = existing.model_slug if existing else ""
         resolved_reasoning_effort = existing.reasoning_effort if existing else ""
+        resolved_model_selection_explicit = (
+            existing.model_selection_explicit if existing else False
+        )
         resolved_service_tier = existing.service_tier if existing else ""
         resolved_response_mode = existing.response_mode if existing else ""
         binding = TopicBinding(
@@ -3100,6 +3373,7 @@ class SessionManager:
             machine_display_name=resolved_machine_display_name,
             model_slug=resolved_model_slug,
             reasoning_effort=resolved_reasoning_effort,
+            model_selection_explicit=resolved_model_selection_explicit,
             service_tier=resolved_service_tier,
             response_mode=resolved_response_mode,
         )
@@ -3159,6 +3433,7 @@ class SessionManager:
             machine_display_name=binding.machine_display_name,
             model_slug=binding.model_slug,
             reasoning_effort=binding.reasoning_effort,
+            model_selection_explicit=binding.model_selection_explicit,
             service_tier=binding.service_tier,
             response_mode=binding.response_mode,
         )
@@ -3269,6 +3544,9 @@ class SessionManager:
             ),
             model_slug=existing.model_slug if existing else "",
             reasoning_effort=existing.reasoning_effort if existing else "",
+            model_selection_explicit=(
+                existing.model_selection_explicit if existing else False
+            ),
             service_tier=existing.service_tier if existing else "",
         )
         self._set_topic_binding(
@@ -3749,6 +4027,8 @@ class SessionManager:
         thread_id: str,
         inputs: list[dict[str, Any]],
         approval_policy: str,
+        model_slug: str = "",
+        reasoning_effort: str = "",
         service_tier: str = "",
     ) -> dict[str, Any]:
         """Start a turn with one guarded retry for transient timeout cases."""
@@ -3756,12 +4036,18 @@ class SessionManager:
         last_err: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
+                turn_kwargs: dict[str, Any] = {}
+                if model_slug:
+                    turn_kwargs["model"] = model_slug
+                if reasoning_effort:
+                    turn_kwargs["effort"] = reasoning_effort
                 return await codex_app_server_client.turn_start(
                     thread_id=thread_id,
                     inputs=inputs,
                     approval_policy=approval_policy,
                     service_tier=service_tier.strip() or None,
                     timeout=APP_SERVER_TURN_START_TIMEOUT_SECONDS,
+                    **turn_kwargs,
                 )
             except Exception as e:
                 last_err = e
@@ -4214,11 +4500,17 @@ class SessionManager:
                 else active_turn
             )
         else:
+            turn_start_kwargs: dict[str, str] = {}
+            if model_slug:
+                turn_start_kwargs["model_slug"] = model_slug
+            if reasoning_effort:
+                turn_start_kwargs["reasoning_effort"] = reasoning_effort
             result = await self._turn_start_with_retry(
                 thread_id=thread_id,
                 inputs=turn_inputs,
                 approval_policy=approval_policy,
                 service_tier=service_tier,
+                **turn_start_kwargs,
             )
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -4376,6 +4668,9 @@ class SessionManager:
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        model_slug: str = "",
+        reasoning_effort: str = "",
+        service_tier: str = "",
     ) -> tuple[bool, str]:
         """Send plain text input to a window.
 
@@ -4395,6 +4690,9 @@ class SessionManager:
             payload,
             steer=steer,
             force_new_turn=force_new_turn,
+            model_slug=model_slug,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
         )
 
     # --- Message history ---

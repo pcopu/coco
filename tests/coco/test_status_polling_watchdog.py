@@ -11,6 +11,39 @@ from coco.handlers.run_watchdog import RunWatchCheck
 
 
 @pytest.mark.asyncio
+async def test_probe_stale_nodes_bounds_unreachable_agent_delay(monkeypatch):
+    marked: list[float] = []
+    stale_nodes = [
+        SimpleNamespace(
+            machine_id=f"offline-node-{index}",
+            display_name=f"Offline Node {index}",
+            is_local=False,
+            status=status_polling.NODE_STATUS_ONLINE,
+            last_seen_ts=1.0,
+        )
+        for index in range(3)
+    ]
+    registry = SimpleNamespace(
+        offline_timeout_seconds=1.0,
+        iter_nodes=lambda: stale_nodes,
+        mark_stale_nodes_offline=lambda *, now: marked.append(now),
+    )
+    monkeypatch.setattr(status_polling, "node_registry", registry)
+    monkeypatch.setattr(status_polling, "NODE_PROBE_TIMEOUT", 0.05)
+    monkeypatch.setattr(status_polling, "_iter_monitor_workers", lambda **_kwargs: [])
+    monkeypatch.setattr(status_polling, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    async def _never_returns(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(status_polling, "_probe_machine_from_monitor", _never_returns)
+
+    await asyncio.wait_for(status_polling._probe_stale_nodes(None, now=10.0), timeout=0.08)
+
+    assert marked == [10.0]
+
+
+@pytest.mark.asyncio
 async def test_emit_due_watchdog_skips_resend_when_active_turn(monkeypatch):
     sent_messages: list[str] = []
     telemetry: list[tuple[str, dict[str, object]]] = []

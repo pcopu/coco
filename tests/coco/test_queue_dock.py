@@ -12,7 +12,7 @@ async def test_sync_queued_topic_dock_edits_in_place_then_deletes_when_empty(mon
     user_id = 17
     thread_id = 71
 
-    mq.clear_queued_topic_inputs(user_id, thread_id)
+    mq.clear_queued_topic_inputs(user_id, thread_id, -100123)
     mq._queue_dock_msg_info.clear()
 
     class _FakeBot:
@@ -46,21 +46,27 @@ async def test_sync_queued_topic_dock_edits_in_place_then_deletes_when_empty(mon
     monkeypatch.setattr(mq.session_manager, "get_display_name", lambda _wid: "demo")
 
     mq.enqueue_queued_topic_input(user_id, thread_id, "first queued item", -100123, 1)
-    await mq.sync_queued_topic_dock(fake_bot, user_id, thread_id, window_id="@1")
+    await mq.sync_queued_topic_dock(
+        fake_bot, user_id, thread_id, window_id="@1", chat_id=-100123
+    )
     assert len(fake_bot.sent) == 1
     assert fake_bot.sent[0][1].startswith("⏳ Queue")
     assert not fake_bot.edited
     assert not fake_bot.deleted
 
     mq.enqueue_queued_topic_input(user_id, thread_id, "second queued item", -100123, 2)
-    await mq.sync_queued_topic_dock(fake_bot, user_id, thread_id, window_id="@1")
+    await mq.sync_queued_topic_dock(
+        fake_bot, user_id, thread_id, window_id="@1", chat_id=-100123
+    )
     assert len(fake_bot.sent) == 1
     assert len(fake_bot.edited) == 1
     assert not fake_bot.deleted
     assert fake_bot.edited[0][2].startswith("⏳ Queue")
 
-    mq.clear_queued_topic_inputs(user_id, thread_id)
-    await mq.sync_queued_topic_dock(fake_bot, user_id, thread_id, window_id="@1")
+    mq.clear_queued_topic_inputs(user_id, thread_id, -100123)
+    await mq.sync_queued_topic_dock(
+        fake_bot, user_id, thread_id, window_id="@1", chat_id=-100123
+    )
     assert len(fake_bot.deleted) == 1
 
     mq._queue_dock_msg_info.clear()

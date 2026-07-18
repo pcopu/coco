@@ -56,6 +56,8 @@ async def send_message_to_topic(
     thread_id: int,
     chat_id: int | None = None,
     text: str = "",
+    rich_text: str = "",
+    rich_format: str = "markdown",
     image_url: str = "",
     image_file: str = "",
     video_url: str = "",
@@ -75,12 +77,19 @@ async def send_message_to_topic(
         return False, "No chat binding for this topic."
 
     if not any(media_sources):
+        if not (text or rich_text):
+            return False, "Provide text or rich_text."
         try:
             sent = await safe_send(
                 bot,
                 resolved_chat_id,
                 text,
                 message_thread_id=thread_id,
+                **(
+                    {"rich_text": rich_text, "rich_format": rich_format}
+                    if rich_text
+                    else {}
+                ),
             )
         except Exception as exc:
             return False, str(exc)
@@ -166,6 +175,8 @@ async def send_text_to_topic(
     thread_id: int,
     chat_id: int | None = None,
     text: str,
+    rich_text: str = "",
+    rich_format: str = "markdown",
 ) -> tuple[bool, str]:
     """Send one text message to a bound Telegram topic."""
     return await send_message_to_topic(
@@ -174,4 +185,6 @@ async def send_text_to_topic(
         thread_id=thread_id,
         chat_id=chat_id,
         text=text,
+        rich_text=rich_text,
+        rich_format=rich_format,
     )

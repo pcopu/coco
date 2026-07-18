@@ -106,6 +106,7 @@ def test_generate_digest_summarizes_yesterday_sessions(tmp_path, monkeypatch):
 
 
 def test_claim_due_delivery_only_sends_once_after_nine(tmp_path, monkeypatch):
+    monkeypatch.setattr(personality, "_local_timezone", lambda _now=None: UTC)
     memory_path = tmp_path / "TELEGRAM_CHAT_MEMORY.jsonl"
     _write_memory_entries(
         memory_path,

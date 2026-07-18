@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import coco.bot as bot
+import coco.agent_rpc as agent_rpc_mod
 import coco.session as session_mod
 from coco.handlers.callback_data import (
     CB_DIR_CONFIRM,
@@ -113,7 +114,7 @@ async def test_folder_confirm_with_prior_codex_sessions_shows_resume_picker(
 
 
 @pytest.mark.asyncio
-async def test_folder_session_resume_callback_binds_selected_thread(
+async def test_folder_session_resume_callback_preserves_explicit_topic_model(
     monkeypatch, mgr: SessionManager, tmp_path: Path
 ):
     selected_path = tmp_path / "demo"
@@ -211,10 +212,74 @@ async def test_folder_session_resume_callback_binds_selected_thread(
     assert binding.codex_thread_id == "thread-1"
     assert binding.cwd == str(selected_path)
     assert binding.display_name == "demo"
-    assert binding.model_slug == "gpt-5.4"
-    assert binding.reasoning_effort == "high"
+    assert binding.model_slug == "gpt-5.3-codex"
+    assert binding.reasoning_effort == "xhigh"
     assert renamed_topics == [(-100123, 77, "demo")]
     assert edits
     assert "Resumed app-server session" in edits[-1][0]
-    assert "Model inherited from resumed session" in edits[-1][0]
+    assert "Model inherited from resumed session" not in edits[-1][0]
     assert query.answers[-1] == ("Resumed", False)
+
+
+@pytest.mark.asyncio
+async def test_remote_folder_resume_preserves_explicit_topic_model(
+    monkeypatch, mgr: SessionManager
+):
+    mgr.bind_topic_to_codex_thread(
+        user_id=1147817421,
+        thread_id=77,
+        chat_id=-100123,
+        codex_thread_id="thread-old",
+        window_id="@old",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    mgr.set_topic_model_selection(
+        1147817421,
+        77,
+        chat_id=-100123,
+        model_slug="gpt-5.6-sol",
+        reasoning_effort="ultra",
+    )
+    monkeypatch.setattr(bot, "session_manager", mgr)
+    monkeypatch.setattr(mgr, "allocate_virtual_window_id", lambda: "@remote")
+    monkeypatch.setattr(bot, "_local_machine_identity", lambda: ("local-node", "Local"))
+
+    async def _resume_thread(
+        machine_id: str,
+        *,
+        window_id: str,
+        cwd: str,
+        thread_id: str,
+        window_name: str,
+        approval_mode: str,
+    ):
+        _ = window_id, cwd, window_name, approval_mode
+        assert machine_id == "remote-node"
+        assert thread_id == "thread-remote"
+        return {
+            "thread_id": "thread-remote",
+            "turn_id": "",
+            "model_slug": "gpt-5.5",
+            "reasoning_effort": "medium",
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_thread", _resume_thread)
+
+    ok, _message, _window_id = await bot._bind_selected_folder_to_topic(
+        user_id=1147817421,
+        chat_id=-100123,
+        pending_thread_id=77,
+        machine_id="remote-node",
+        machine_name="Remote",
+        selected_path="/tmp/demo",
+        window_name="demo",
+        resume_thread_id="thread-remote",
+    )
+
+    binding = mgr.resolve_topic_binding(1147817421, 77, chat_id=-100123)
+    assert ok is True
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-remote"
+    assert binding.model_slug == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "ultra"

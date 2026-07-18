@@ -23,24 +23,24 @@ def test_extract_command_args():
 def test_queued_topic_input_fifo_and_count():
     user_id = 11
     thread_id = 22
-    mq.clear_queued_topic_inputs(user_id, thread_id)
+    mq.clear_queued_topic_inputs(user_id, thread_id, -100)
 
-    assert mq.queued_topic_input_count(user_id, thread_id) == 0
+    assert mq.queued_topic_input_count(user_id, thread_id, -100) == 0
 
     assert mq.enqueue_queued_topic_input(user_id, thread_id, "first", -100, 1) == 1
     assert mq.enqueue_queued_topic_input(user_id, thread_id, "second", -100, 2) == 2
-    assert mq.queued_topic_input_count(user_id, thread_id) == 2
+    assert mq.queued_topic_input_count(user_id, thread_id, -100) == 2
 
-    assert mq.pop_queued_topic_input(user_id, thread_id) == ("first", -100, 1)
-    assert mq.pop_queued_topic_input(user_id, thread_id) == ("second", -100, 2)
-    assert mq.pop_queued_topic_input(user_id, thread_id) is None
-    assert mq.queued_topic_input_count(user_id, thread_id) == 0
+    assert mq.pop_queued_topic_input(user_id, thread_id, -100) == ("first", -100, 1)
+    assert mq.pop_queued_topic_input(user_id, thread_id, -100) == ("second", -100, 2)
+    assert mq.pop_queued_topic_input(user_id, thread_id, -100) is None
+    assert mq.queued_topic_input_count(user_id, thread_id, -100) == 0
 
 
 def test_is_progress_active_uses_topic_key():
     user_id = 33
     thread_id = 44
-    key = (user_id, thread_id)
+    key = (user_id, 0, thread_id)
     mq._progress_msg_info[key] = (123, "@9", "working")
     try:
         assert mq.is_progress_active(user_id, thread_id) is True
@@ -52,7 +52,7 @@ def test_is_progress_active_uses_topic_key():
 def test_get_progress_text_uses_topic_key():
     user_id = 35
     thread_id = 46
-    key = (user_id, thread_id)
+    key = (user_id, 0, thread_id)
     mq._progress_msg_info[key] = (321, "@7", "overview line")
     try:
         assert mq.get_progress_text(user_id, thread_id) == "overview line"
@@ -135,7 +135,7 @@ def test_render_progress_message_keeps_working_view_compact():
 async def test_progress_update_ignores_message_not_modified(monkeypatch):
     user_id = 91
     thread_id = 92
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7001, "@7", "Ready")
     calls = {"send_new": 0}
 
@@ -181,7 +181,7 @@ async def test_progress_update_ignores_message_not_modified(monkeypatch):
 async def test_progress_finalize_ignores_message_not_modified(monkeypatch):
     user_id = 93
     thread_id = 94
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7002, "@8", "Still running")
 
     class _Bot:
@@ -213,7 +213,7 @@ async def test_progress_finalize_ignores_message_not_modified(monkeypatch):
 async def test_progress_finalize_clears_empty_placeholder(monkeypatch):
     user_id = 95
     thread_id = 96
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7003, "@9", "")
 
     class _Bot:
@@ -250,7 +250,7 @@ async def test_progress_finalize_clears_empty_placeholder(monkeypatch):
 async def test_progress_finalize_compact_mode_hides_body(monkeypatch):
     user_id = 97
     thread_id = 98
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7004, "@10", "Long progress body")
     edits: list[str] = []
 
@@ -285,7 +285,7 @@ async def test_progress_finalize_compact_mode_hides_body(monkeypatch):
 async def test_progress_finalize_clears_tracking_when_all_edits_fail(monkeypatch):
     user_id = 99
     thread_id = 100
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7005, "@11", "Working on it")
     mq._progress_text_cache[skey] = ("@11", "Working on it")
     edit_attempts: list[int] = []
@@ -320,7 +320,7 @@ async def test_progress_finalize_clears_tracking_when_all_edits_fail(monkeypatch
 async def test_convert_status_to_content_deletes_orphan_when_all_edits_fail(monkeypatch):
     user_id = 101
     thread_id = 102
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._status_msg_info[skey] = (7006, "@12", "waiting")
     deleted: list[tuple[int, int]] = []
     edit_attempts: list[int] = []
@@ -358,7 +358,7 @@ async def test_convert_status_to_content_deletes_orphan_when_all_edits_fail(monk
 async def test_do_send_status_message_preserves_old_tracking_when_delete_and_send_fail(monkeypatch):
     user_id = 103
     thread_id = 104
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._status_msg_info[skey] = (7007, "@13", "old status")
 
     class _Bot:
@@ -393,7 +393,7 @@ async def test_do_send_status_message_preserves_old_tracking_when_delete_and_sen
 async def test_do_send_progress_message_preserves_old_tracking_when_delete_and_send_fail(monkeypatch):
     user_id = 105
     thread_id = 106
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7008, "@14", "old progress")
 
     class _Bot:
@@ -425,7 +425,7 @@ async def test_do_send_progress_message_preserves_old_tracking_when_delete_and_s
 async def test_do_send_status_message_does_not_clobber_newer_tracking_on_send_failure(monkeypatch):
     user_id = 107
     thread_id = 108
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._status_msg_info[skey] = (7009, "@15", "old status")
 
     class _Bot:
@@ -461,7 +461,7 @@ async def test_do_send_status_message_does_not_clobber_newer_tracking_on_send_fa
 async def test_do_send_progress_message_does_not_clobber_newer_tracking_on_send_failure(monkeypatch):
     user_id = 109
     thread_id = 110
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7011, "@16", "old progress")
 
     class _Bot:
@@ -494,7 +494,7 @@ async def test_do_send_progress_message_does_not_clobber_newer_tracking_on_send_
 async def test_status_update_edit_fallback_does_not_preemptively_drop_tracking(monkeypatch):
     user_id = 111
     thread_id = 112
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._status_msg_info[skey] = (7013, "@17", "old status")
 
     class _Bot:
@@ -506,9 +506,9 @@ async def test_status_update_edit_fallback_does_not_preemptively_drop_tracking(m
 
     observed_before_send: list[tuple[int, str, str] | None] = []
 
-    async def _fake_send_status(_bot, _user_id, tid, wid, text):
-        observed_before_send.append(mq._status_msg_info.get((user_id, tid)))
-        mq._status_msg_info[(user_id, tid)] = (7014, wid, text)
+    async def _fake_send_status(_bot, _user_id, tid, wid, text, *, chat_id=None):
+        observed_before_send.append(mq._status_msg_info.get((user_id, 0, tid)))
+        mq._status_msg_info[(user_id, 0, tid)] = (7014, wid, text)
 
     monkeypatch.setattr(
         mq.session_manager,
@@ -536,7 +536,7 @@ async def test_status_update_edit_fallback_does_not_preemptively_drop_tracking(m
 async def test_progress_update_edit_fallback_does_not_preemptively_drop_tracking(monkeypatch):
     user_id = 113
     thread_id = 114
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7015, "@18", "old progress")
 
     class _Bot:
@@ -549,8 +549,8 @@ async def test_progress_update_edit_fallback_does_not_preemptively_drop_tracking
     observed_before_send: list[tuple[int, str, str] | None] = []
 
     async def _fake_send_progress(_bot, _user_id, tid, wid, accumulated_text, **_kwargs):
-        observed_before_send.append(mq._progress_msg_info.get((user_id, tid)))
-        mq._progress_msg_info[(user_id, tid)] = (7016, wid, accumulated_text)
+        observed_before_send.append(mq._progress_msg_info.get((user_id, 0, tid)))
+        mq._progress_msg_info[(user_id, 0, tid)] = (7016, wid, accumulated_text)
 
     monkeypatch.setattr(
         mq.session_manager,
@@ -579,7 +579,7 @@ async def test_progress_update_edit_fallback_does_not_preemptively_drop_tracking
 async def test_do_clear_status_message_preserves_tracking_when_delete_fails(monkeypatch):
     user_id = 115
     thread_id = 116
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._status_msg_info[skey] = (7017, "@19", "status text")
 
     class _Bot:
@@ -601,7 +601,7 @@ async def test_do_clear_status_message_preserves_tracking_when_delete_fails(monk
 async def test_do_clear_progress_message_preserves_tracking_when_delete_fails(monkeypatch):
     user_id = 117
     thread_id = 118
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._progress_msg_info[skey] = (7018, "@20", "progress text")
     mq._progress_text_cache[skey] = ("@20", "progress text")
 
@@ -625,7 +625,7 @@ async def test_do_clear_progress_message_preserves_tracking_when_delete_fails(mo
 async def test_do_clear_progress_message_does_not_clear_newer_cache_after_successful_delete(monkeypatch):
     user_id = 119
     thread_id = 120
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     old = (7019, "@21", "old progress")
     newer = (7020, "@21", "newer progress")
     mq._progress_msg_info[skey] = old
@@ -647,6 +647,30 @@ async def test_do_clear_progress_message_does_not_clear_newer_cache_after_succes
 
     assert mq._progress_msg_info[skey] == newer
     assert mq._progress_text_cache[skey] == ("@21", "newer progress")
+
+
+@pytest.mark.asyncio
+async def test_do_clear_progress_message_clears_default_scope_cache(monkeypatch):
+    user_id = 121
+    thread_id = 122
+    skey = (user_id, 0, thread_id)
+    mq._progress_msg_info[skey] = (7021, "@22", "old progress")
+    mq._progress_text_cache[skey] = ("@22", "old progress")
+
+    class _Bot:
+        async def delete_message(self, **_kwargs):
+            return True
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda *_args, **_kwargs: -100915,
+    )
+
+    await mq._do_clear_progress_message(_Bot(), user_id, thread_id)
+
+    assert skey not in mq._progress_msg_info
+    assert skey not in mq._progress_text_cache
 
 
 @pytest.mark.asyncio
@@ -770,7 +794,7 @@ async def test_progress_update_coalescing_keeps_pending_topic_index_single():
             thread_id=thread_id,
         )
 
-        assert mq._queued_delivery_topic_counts[user_id] == {thread_id: 1}
+        assert mq._queued_delivery_topic_counts[user_id] == {(0, thread_id): 1}
         assert await mq.get_pending_delivery_topics(user_id) == {thread_id}
     finally:
         while not queue.empty():
@@ -779,7 +803,7 @@ async def test_progress_update_coalescing_keeps_pending_topic_index_single():
         mq._message_queues.pop(user_id, None)
         mq._queue_locks.pop(user_id, None)
         mq._queued_delivery_topic_counts.pop(user_id, None)
-        mq._progress_text_cache.pop((user_id, thread_id), None)
+        mq._progress_text_cache.pop((user_id, 0, thread_id), None)
 
 
 @pytest.mark.asyncio
@@ -794,6 +818,7 @@ async def test_merge_content_tasks_removes_merged_tasks_from_pending_topic_index
         window_id="@5",
         thread_id=thread_id,
         parts=["hello"],
+        delivery_generation=0,
     )
     mergeable = mq.MessageTask(
         task_type="content",
@@ -821,7 +846,7 @@ async def test_merge_content_tasks_removes_merged_tasks_from_pending_topic_index
 
         assert merge_count == 1
         assert merged.parts == ["hello", " world"]
-        assert mq._queued_delivery_topic_counts[user_id] == {thread_id: 1}
+        assert mq._queued_delivery_topic_counts[user_id] == {(0, thread_id): 1}
         assert await mq.get_pending_delivery_topics(user_id) == {thread_id}
         assert queue.get_nowait() is retained
     finally:
@@ -865,9 +890,52 @@ async def test_merge_content_tasks_does_not_merge_across_topics():
 
         assert merged is first
         assert merge_count == 0
-        assert mq._queued_delivery_topic_counts[user_id] == {queued_thread_id: 1}
+        assert mq._queued_delivery_topic_counts[user_id] == {(0, queued_thread_id): 1}
         assert await mq.get_pending_delivery_topics(user_id) == {queued_thread_id}
         assert queue.get_nowait() is different_topic
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_merge_content_tasks_does_not_consume_newer_delivery_generation():
+    user_id = 215
+    thread_id = 216
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    first = mq.MessageTask(
+        task_type="content",
+        window_id="@8",
+        thread_id=thread_id,
+        parts=["stale"],
+        delivery_generation=0,
+    )
+    newer = mq.MessageTask(
+        task_type="content",
+        window_id="@8",
+        thread_id=thread_id,
+        parts=["fresh"],
+        delivery_generation=1,
+    )
+
+    try:
+        mq._put_queued_task(user_id, queue, newer)
+
+        merged, merge_count = await mq._merge_content_tasks(
+            queue,
+            first,
+            lock,
+            user_id=user_id,
+        )
+
+        assert merged is first
+        assert merge_count == 0
+        assert queue.get_nowait() is newer
     finally:
         while not queue.empty():
             queue.get_nowait()
@@ -907,8 +975,8 @@ async def test_requeue_task_front_tracks_retried_task_and_preserves_existing_cou
         )
 
         assert mq._queued_delivery_topic_counts[user_id] == {
-            queued_thread_id: 1,
-            retry_thread_id: 1,
+            (0, queued_thread_id): 1,
+            (0, retry_thread_id): 1,
         }
         assert await mq.get_pending_delivery_topics(user_id) == {
             queued_thread_id,
@@ -1137,7 +1205,7 @@ async def test_enqueue_status_clear_survives_active_flood_control(monkeypatch):
 async def test_sync_queued_topic_dock_edits_existing_message_in_place(monkeypatch):
     user_id = 304
     thread_id = 304
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._queued_topic_inputs[skey] = [("second item", -100304, 1)]
     mq._queue_dock_msg_info[skey] = (55, "⏳ Queue\n1. first item")
     events: list[tuple[str, int]] = []
@@ -1168,7 +1236,7 @@ async def test_sync_queued_topic_dock_edits_existing_message_in_place(monkeypatc
 async def test_sync_queued_topic_dock_preserves_tracking_when_empty_delete_fails(monkeypatch):
     user_id = 305
     thread_id = 305
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._queued_topic_inputs.pop(skey, None)
     mq._queue_dock_msg_info[skey] = (56, "⏳ Queue\n1. item")
 
@@ -1189,7 +1257,7 @@ async def test_sync_queued_topic_dock_preserves_tracking_when_empty_delete_fails
 async def test_clear_queued_topic_dock_preserves_tracking_when_delete_fails(monkeypatch):
     user_id = 306
     thread_id = 306
-    skey = (user_id, thread_id)
+    skey = (user_id, 0, thread_id)
     mq._queue_dock_msg_info[skey] = (57, "⏳ Queue\n1. item")
 
     class _Bot:
@@ -1251,7 +1319,7 @@ async def test_steer_message_keeps_progress_block_active(monkeypatch):
         ),
     )
 
-    async def _is_in_progress(_uid: int, _tid: int | None, _wid: str) -> bool:
+    async def _is_in_progress(_uid: int, _tid: int | None, _wid: str, **_kwargs) -> bool:
         return True
 
     async def _send_topic_text_to_window(
@@ -1424,7 +1492,7 @@ async def test_text_handler_bound_topic_app_server_only_skips_legacy_window_look
         raise AssertionError("legacy lookup should not run in app_server_only bound flow")
 
 
-    async def _is_window_in_progress(_uid: int, _tid: int | None, _wid: str) -> bool:
+    async def _is_window_in_progress(_uid: int, _tid: int | None, _wid: str, **_kwargs) -> bool:
         return False
 
     async def _send_topic_text_to_window(
@@ -1470,6 +1538,252 @@ async def test_text_handler_bound_topic_app_server_only_skips_legacy_window_look
     assert "progress_start" in events
     assert "started" in events
     assert "eyes" in events
+    assert events.index("eyes") < events.index("send:@900000")
+
+
+@pytest.mark.asyncio
+async def test_cancel_topic_delivery_discards_only_target_topic_tasks():
+    user_id = 7711
+    canceled_thread_id = 111
+    retained_thread_id = 222
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = lock
+
+    canceled = mq.MessageTask(
+        task_type="content",
+        parts=["late child update"],
+        thread_id=canceled_thread_id,
+    )
+    retained = mq.MessageTask(
+        task_type="content",
+        parts=["other topic"],
+        thread_id=retained_thread_id,
+    )
+    mq._put_queued_task(user_id, queue, canceled)
+    mq._put_queued_task(user_id, queue, retained)
+
+    try:
+        removed = await mq.cancel_topic_delivery(user_id, canceled_thread_id)
+
+        assert removed == 1
+        assert queue.get_nowait() is retained
+        queue.task_done()
+        assert await mq.get_pending_delivery_topics(user_id) == {retained_thread_id}
+    finally:
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
+async def test_cancel_topic_delivery_is_scoped_to_chat():
+    user_id = 7716
+    thread_id = 77
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    canceled = mq.MessageTask(
+        task_type="content", parts=["chat one"], thread_id=thread_id, chat_id=-1001
+    )
+    retained = mq.MessageTask(
+        task_type="content", parts=["chat two"], thread_id=thread_id, chat_id=-1002
+    )
+    mq._put_queued_task(user_id, queue, canceled)
+    mq._put_queued_task(user_id, queue, retained)
+
+    try:
+        assert await mq.get_pending_delivery_topics(user_id, -1001) == {thread_id}
+        assert await mq.get_pending_delivery_topics(user_id, -1002) == {thread_id}
+        removed = await mq.cancel_topic_delivery(user_id, thread_id, chat_id=-1001)
+
+        assert removed == 1
+        assert await mq.get_pending_delivery_topics(user_id, -1001) == set()
+        assert await mq.get_pending_delivery_topics(user_id, -1002) == {thread_id}
+        assert queue.get_nowait() is retained
+        queue.task_done()
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, -1001, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_progress_and_status_tracking_are_scoped_to_chat(monkeypatch):
+    user_id = 7717
+    thread_id = 77
+    sent_id = 8000
+
+    async def _send(*_args, **_kwargs):
+        nonlocal sent_id
+        sent_id += 1
+        return SimpleNamespace(message_id=sent_id)
+
+    class _Bot:
+        async def delete_message(self, **_kwargs):
+            raise AssertionError("one chat must not delete the other chat's message")
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send)
+    try:
+        for chat_id in (-1001, -1002):
+            await mq._do_send_progress_message(
+                _Bot(), user_id, thread_id, "@7", "working", chat_id=chat_id
+            )
+            await mq._do_send_status_message(
+                _Bot(), user_id, thread_id, "@7", "status", chat_id=chat_id
+            )
+
+        assert (user_id, -1001, thread_id) in mq._progress_msg_info
+        assert (user_id, -1002, thread_id) in mq._progress_msg_info
+        assert (user_id, -1001, thread_id) in mq._status_msg_info
+        assert (user_id, -1002, thread_id) in mq._status_msg_info
+    finally:
+        for chat_id in (-1001, -1002):
+            mq._progress_msg_info.pop((user_id, chat_id, thread_id), None)
+            mq._status_msg_info.pop((user_id, chat_id, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_cancel_topic_delivery_preserves_task_enqueued_after_generation_advance(monkeypatch):
+    user_id = 7714
+    thread_id = 444
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    stale = mq.MessageTask(task_type="content", parts=["stale"], thread_id=thread_id)
+    fresh = mq.MessageTask(task_type="content", parts=["fresh"], thread_id=thread_id)
+    mq._put_queued_task(user_id, queue, stale)
+    original_inspect = mq._inspect_queue
+
+    def _inspect_after_concurrent_enqueue(target_queue):
+        mq._put_queued_task(user_id, target_queue, fresh)
+        return original_inspect(target_queue)
+
+    monkeypatch.setattr(mq, "_inspect_queue", _inspect_after_concurrent_enqueue)
+
+    try:
+        removed = await mq.cancel_topic_delivery(user_id, thread_id)
+
+        assert removed == 1
+        assert queue.get_nowait() is fresh
+        queue.task_done()
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, 0, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_cancel_topic_delivery_invalidates_already_dequeued_task():
+    user_id = 7712
+    thread_id = 333
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    task = mq.MessageTask(task_type="content", parts=["stale"], thread_id=thread_id)
+    mq._put_queued_task(user_id, queue, task)
+    dequeued = queue.get_nowait()
+    mq._untrack_queued_task(user_id, dequeued)
+
+    try:
+        assert mq.is_task_delivery_current(user_id, dequeued) is True
+
+        await mq.cancel_topic_delivery(user_id, thread_id)
+
+        assert mq.is_task_delivery_current(user_id, dequeued) is False
+    finally:
+        queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, 0, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_worker_rechecks_delivery_generation_after_content_merge(monkeypatch):
+    user_id = 7713
+    thread_id = 334
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    delivered: list[mq.MessageTask] = []
+
+    async def _merge(_queue, task, _lock, *, user_id):
+        await mq.cancel_topic_delivery(user_id, thread_id)
+        return task, 0
+
+    async def _process(_bot, _user_id, task):
+        delivered.append(task)
+
+    monkeypatch.setattr(mq, "_merge_content_tasks", _merge)
+    monkeypatch.setattr(mq, "_process_content_task", _process)
+    mq._put_queued_task(
+        user_id,
+        queue,
+        mq.MessageTask(task_type="content", parts=["stale"], thread_id=thread_id),
+    )
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=0.5)
+        assert delivered == []
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, 0, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_content_task_stops_between_parts_after_topic_cancellation(monkeypatch):
+    user_id = 7715
+    thread_id = 445
+    sent_parts: list[str] = []
+    mq._topic_delivery_generations[(user_id, 0, thread_id)] = 0
+    task = mq.MessageTask(
+        task_type="content",
+        window_id="@9",
+        thread_id=thread_id,
+        parts=["first", "late second"],
+        delivery_generation=0,
+    )
+
+    monkeypatch.setattr(mq.session_manager, "resolve_chat_id", lambda *_args: -100123)
+    monkeypatch.setattr(mq, "_convert_status_to_content", lambda *_args, **_kwargs: None)
+
+    async def _convert(*_args, **_kwargs):
+        return None
+
+    async def _send(_bot, _chat_id, text, **_kwargs):
+        sent_parts.append(text)
+        if text == "first":
+            await mq.cancel_topic_delivery(user_id, thread_id)
+        return SimpleNamespace(message_id=len(sent_parts))
+
+    async def _status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mq, "_convert_status_to_content", _convert)
+    monkeypatch.setattr(mq, "send_with_fallback", _send)
+    monkeypatch.setattr(mq, "_check_and_send_status", _status)
+
+    try:
+        await mq._process_content_task(object(), user_id, task)
+        assert sent_parts == ["first"]
+    finally:
+        mq._topic_delivery_generations.pop((user_id, 0, thread_id), None)
 
 
 @pytest.mark.asyncio
@@ -1554,7 +1868,7 @@ async def test_text_handler_auto_queues_when_host_turn_is_active(monkeypatch):
 
     try:
         await bot.text_handler(update, context)
-        assert mq.queued_topic_input_count(user_id, thread_id) == 1
+        assert mq.queued_topic_input_count(user_id, thread_id, -100123) == 1
         assert "dock" in events
         assert "hourglass" in events
         assert not any(item.startswith("safe_reply:") for item in events)
@@ -1617,7 +1931,7 @@ async def test_text_handler_mentions_only_skips_non_mention_text(monkeypatch):
         lambda _wid: True,
     )
 
-    async def _is_window_in_progress(_uid: int, _tid: int | None, _wid: str) -> bool:
+    async def _is_window_in_progress(_uid: int, _tid: int | None, _wid: str, **_kwargs) -> bool:
         events.append("checked_progress")
         return False
 
@@ -1694,7 +2008,7 @@ async def test_text_handler_mentions_only_allows_bot_mentions(monkeypatch):
         lambda _wid: True,
     )
 
-    async def _is_window_in_progress(_uid: int, _tid: int | None, _wid: str) -> bool:
+    async def _is_window_in_progress(_uid: int, _tid: int | None, _wid: str, **_kwargs) -> bool:
         return False
 
     async def _send_topic_text_to_window(
@@ -1999,7 +2313,9 @@ async def test_q_enqueues_internal_queue_and_updates_dock_when_in_progress(monke
         events.append("internal_queue")
         return 1
 
-    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
+    async def _sync_dock(
+        _bot, _uid: int, _tid: int, *, window_id: str | None = None, chat_id=None
+    ):
         events.append(f"dock_sync:{window_id}")
 
     monkeypatch.setattr(bot, "_set_hourglass_reaction", _set_hourglass)
@@ -2087,7 +2403,7 @@ async def test_q_uses_internal_queue_when_app_server_turn_is_active(monkeypatch)
         events.append("internal_queue")
         return 1
 
-    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
+    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None, **_kwargs):
         events.append(f"dock_sync:{window_id}")
 
     monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
@@ -2189,7 +2505,7 @@ async def test_q_does_not_attempt_native_queue_when_turn_is_active(monkeypatch):
         events.append("internal_queue")
         return 1
 
-    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
+    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None, **_kwargs):
         events.append(f"dock_sync:{window_id}")
 
     monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
@@ -2344,8 +2660,8 @@ async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch)
         lambda _uid, _tid, **_kwargs: -100321,
     )
 
-    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
-        events.append(f"dock_sync:{mq.queued_topic_input_count(1147817421, 777)}:{window_id}")
+    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None, **_kwargs):
+        events.append(f"dock_sync:{mq.queued_topic_input_count(1147817421, 777, -100321)}:{window_id}")
 
     async def _send_topic_text_to_window(
         *,
@@ -2380,6 +2696,7 @@ async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch)
         user_id=1147817421,
         thread_id=777,
         window_id="@77",
+        chat_id=-100321,
     )
 
     assert events[0] == "dock_sync:1:@77"
@@ -2387,7 +2704,7 @@ async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch)
     assert "run_started" in events
     assert not any(event.startswith("safe_send:") for event in events)
     assert any(ev.startswith("reaction:-100321:111") for ev in events)
-    assert mq.queued_topic_input_count(1147817421, 777) == 1
+    assert mq.queued_topic_input_count(1147817421, 777, -100321) == 1
 
     mq.clear_queued_topic_inputs(1147817421, 777)
 
@@ -2411,9 +2728,11 @@ async def test_dispatch_next_q_requeues_when_send_fails(monkeypatch):
         lambda _uid, _tid, **_kwargs: -100321,
     )
 
-    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
+    async def _sync_dock(
+        _bot, _uid: int, _tid: int, *, window_id: str | None = None, chat_id=None
+    ):
         _ = window_id
-        sync_counts.append(mq.queued_topic_input_count(1147817421, 888))
+        sync_counts.append(mq.queued_topic_input_count(1147817421, 888, -100321))
 
     async def _send_topic_text_to_window(
         *,
@@ -2442,10 +2761,11 @@ async def test_dispatch_next_q_requeues_when_send_fails(monkeypatch):
         user_id=1147817421,
         thread_id=888,
         window_id="@88",
+        chat_id=-100321,
     )
 
     assert sync_counts == [0, 1]
-    assert mq.queued_topic_input_count(1147817421, 888) == 1
+    assert mq.queued_topic_input_count(1147817421, 888, -100321) == 1
     assert sent_text
     assert "Failed to send queued" in sent_text[0]
 
@@ -2467,9 +2787,11 @@ async def test_dispatch_next_q_defers_when_window_still_in_progress(monkeypatch)
     async def _is_window_in_progress(*_args, **_kwargs):
         return True
 
-    async def _sync_dock(_bot, _uid: int, _tid: int, *, window_id: str | None = None):
+    async def _sync_dock(
+        _bot, _uid: int, _tid: int, *, window_id: str | None = None, chat_id=None
+    ):
         _ = window_id
-        sync_counts.append(mq.queued_topic_input_count(1147817421, 999))
+        sync_counts.append(mq.queued_topic_input_count(1147817421, 999, -100321))
 
     async def _unexpected_send_topic_text_to_window(**_kwargs):
         raise AssertionError("queued item should not send while the turn is still active")
@@ -2492,10 +2814,11 @@ async def test_dispatch_next_q_defers_when_window_still_in_progress(monkeypatch)
         user_id=1147817421,
         thread_id=999,
         window_id="@99",
+        chat_id=-100321,
     )
 
     assert sync_counts == [1]
-    assert mq.queued_topic_input_count(1147817421, 999) == 1
+    assert mq.queued_topic_input_count(1147817421, 999, -100321) == 1
     assert "queue.dispatch.deferred_active_turn:999" in events
 
     mq.clear_queued_topic_inputs(1147817421, 999)

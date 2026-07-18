@@ -276,13 +276,17 @@ async def test_model_callback_preserves_thread_on_model_change(monkeypatch):
 
     monkeypatch.setattr(bot, "safe_edit", _safe_edit)
 
+    mgr.set_window_codex_active_turn_id("@1", "turn-legacy")
     assert mgr.get_window_codex_thread_id("@1") == "thread-legacy"
+    assert mgr.get_window_codex_active_turn_id("@1") == "turn-legacy"
 
     await bot.callback_handler(update, context)
 
     assert mgr.get_window_codex_thread_id("@1") == "thread-legacy"
+    assert mgr.get_window_codex_active_turn_id("@1") == "turn-legacy"
     binding = mgr.resolve_topic_binding(1147817421, 77, chat_id=-100123)
     assert binding is not None
+    assert binding.codex_thread_id == "thread-legacy"
     assert binding.model_slug == "gpt-5.3-codex-spark"
     assert binding.reasoning_effort == "high"
     assert edits
@@ -365,13 +369,17 @@ async def test_model_effort_callback_preserves_thread_on_change(monkeypatch):
 
     monkeypatch.setattr(bot, "safe_edit", _safe_edit)
 
+    mgr.set_window_codex_active_turn_id("@1", "turn-legacy")
     assert mgr.get_window_codex_thread_id("@1") == "thread-legacy"
+    assert mgr.get_window_codex_active_turn_id("@1") == "turn-legacy"
 
     await bot.callback_handler(update, context)
 
     assert mgr.get_window_codex_thread_id("@1") == "thread-legacy"
+    assert mgr.get_window_codex_active_turn_id("@1") == "turn-legacy"
     binding = mgr.resolve_topic_binding(1147817421, 77, chat_id=-100123)
     assert binding is not None
+    assert binding.codex_thread_id == "thread-legacy"
     assert binding.model_slug == "gpt-5.4"
     assert binding.reasoning_effort == "xhigh"
     assert edits

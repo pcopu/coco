@@ -1,4 +1,5 @@
 import json
+import math
 
 from coco.node_registry import NODE_STATUS_OFFLINE, NODE_STATUS_ONLINE, NodeRegistry
 import coco.node_registry as node_registry_mod
@@ -158,3 +159,95 @@ def test_ensure_local_node_includes_runtime_capabilities(tmp_path, monkeypatch):
         "transcription": {"mode": "compatible", "model_name": "base"},
         "tts": {"available": True, "default_voice": "F2", "default_speed": 1.4},
     }
+
+
+def test_registry_load_tolerates_malformed_persisted_endpoint_and_flags(tmp_path):
+    state_file = tmp_path / "nodes.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "broken": {
+                        "machine_id": "broken",
+                        "display_name": "Broken",
+                        "rpc_port": "not-a-port",
+                        "rpc_host": None,
+                        "tailnet_name": None,
+                        "transport": None,
+                        "status": "nonsense",
+                        "browse_roots": None,
+                        "capabilities": 7,
+                        "is_local": "false",
+                        "controller_active": "false",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = NodeRegistry(state_file=state_file, offline_timeout_seconds=45.0)
+
+    node = registry.get_node("broken")
+    assert node is not None
+    assert node.rpc_port == 0
+    assert node.rpc_host == ""
+    assert node.tailnet_name == ""
+    assert node.transport == "local"
+    assert node.status == NODE_STATUS_OFFLINE
+    assert node.browse_roots == []
+    assert node.capabilities == []
+    assert node.is_local is False
+    assert node.controller_active is False
+
+
+def test_registry_load_recovers_from_non_object_json(tmp_path):
+    state_file = tmp_path / "nodes.json"
+    state_file.write_text("[]", encoding="utf-8")
+
+    registry = NodeRegistry(state_file=state_file, offline_timeout_seconds=45.0)
+
+    assert registry.iter_nodes() == []
+
+
+def test_registry_load_rejects_non_finite_timestamp_and_invalid_port(tmp_path):
+    state_file = tmp_path / "nodes.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "broken": {
+                        "machine_id": "broken",
+                        "last_seen_ts": math.inf,
+                        "rpc_port": 70000,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = NodeRegistry(state_file=state_file, offline_timeout_seconds=45.0)
+
+    node = registry.get_node("broken")
+    assert node is not None
+    assert node.last_seen_ts == 0.0
+    assert node.rpc_port == 0
+
+
+def test_note_heartbeat_rejects_out_of_range_rpc_port(tmp_path):
+    registry = NodeRegistry(
+        state_file=tmp_path / "nodes.json",
+        offline_timeout_seconds=45.0,
+    )
+
+    node = registry.note_heartbeat(
+        machine_id="remote",
+        display_name="Remote",
+        transport="agent_rpc",
+        rpc_port=70000,
+        is_local=False,
+        now=100.0,
+    )
+
+    assert node.rpc_port == 0

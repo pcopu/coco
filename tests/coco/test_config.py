@@ -30,6 +30,23 @@ class TestConfigValid:
         cfg = Config()
         assert cfg.monitor_poll_interval == 5.0
 
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("MONITOR_POLL_INTERVAL", "0"),
+            ("MONITOR_POLL_INTERVAL", "nan"),
+            ("COCO_NODE_HEARTBEAT_INTERVAL", "-1"),
+            ("COCO_NODE_HEARTBEAT_INTERVAL", "inf"),
+            ("COCO_NODE_OFFLINE_TIMEOUT", "0"),
+            ("COCO_NODE_OFFLINE_TIMEOUT", "nan"),
+        ],
+    )
+    def test_polling_intervals_must_be_positive_and_finite(self, monkeypatch, name, value):
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(ValueError, match=rf"{name} must be a positive finite number"):
+            Config()
+
     def test_runtime_mode_defaults_to_app_server_only(self):
         cfg = Config()
         assert cfg.runtime_mode == "app_server_only"
@@ -193,6 +210,21 @@ class TestConfigMissingEnv:
     def test_invalid_rpc_port_raises_coco_message(self, monkeypatch):
         monkeypatch.setenv("COCO_RPC_PORT", "not-a-port")
         with pytest.raises(ValueError, match="COCO_RPC_PORT must be an integer"):
+            Config()
+
+    @pytest.mark.parametrize("value", ["-1", "65536"])
+    def test_out_of_range_rpc_port_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv("COCO_RPC_PORT", value)
+        with pytest.raises(ValueError, match="COCO_RPC_PORT must be between 1 and 65535"):
+            Config()
+
+    @pytest.mark.parametrize("value", ["0", "70000"])
+    def test_out_of_range_controller_rpc_port_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv("COCO_CONTROLLER_RPC_PORT", value)
+        with pytest.raises(
+            ValueError,
+            match="COCO_CONTROLLER_RPC_PORT must be between 1 and 65535",
+        ):
             Config()
 
     def test_default_machine_id_uses_coco_node_when_hostname_missing(self, monkeypatch):

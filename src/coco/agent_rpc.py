@@ -19,6 +19,7 @@ from .config import config
 from .handlers.directory_browser import clamp_browse_path, resolve_browse_root
 from .node_registry import node_registry
 from .session import session_manager
+from .self_update import resolve_coco_tool_update_argv as _resolve_coco_tool_update_argv
 from .utils import env_alias
 
 
@@ -890,7 +891,7 @@ class AgentRpcClient:
             if not isinstance(name, str) or not isinstance(data_b64, str):
                 continue
             try:
-                resolved.append((name, base64.b64decode(data_b64)))
+                resolved.append((name, base64.b64decode(data_b64, validate=True)))
             except Exception:
                 continue
         return resolved
@@ -926,7 +927,9 @@ class AgentRpcClient:
                 if not isinstance(name, str) or not isinstance(data_b64, str):
                     continue
                 try:
-                    resolved_documents.append((name, base64.b64decode(data_b64)))
+                    resolved_documents.append(
+                        (name, base64.b64decode(data_b64, validate=True))
+                    )
                 except Exception:
                     continue
 
@@ -941,7 +944,9 @@ class AgentRpcClient:
                 if not isinstance(media_type, str) or not isinstance(data_b64, str):
                     continue
                 try:
-                    resolved_images.append((media_type, base64.b64decode(data_b64)))
+                    resolved_images.append(
+                        (media_type, base64.b64decode(data_b64, validate=True))
+                    )
                 except Exception:
                     continue
 
@@ -956,7 +961,9 @@ class AgentRpcClient:
                 if not isinstance(media_type, str) or not isinstance(data_b64, str):
                     continue
                 try:
-                    resolved_videos.append((media_type, base64.b64decode(data_b64)))
+                    resolved_videos.append(
+                        (media_type, base64.b64decode(data_b64, validate=True))
+                    )
                 except Exception:
                     continue
 
@@ -1164,7 +1171,17 @@ def _run_command_sync(
     except FileNotFoundError as exc:
         return False, "", "", str(exc)
     except subprocess.TimeoutExpired as exc:
-        return False, exc.stdout or "", exc.stderr or "", "timeout"
+        stdout = (
+            exc.stdout.decode("utf-8", errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else exc.stdout or ""
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else exc.stderr or ""
+        )
+        return False, stdout, stderr, "timeout"
     except OSError as exc:
         return False, "", "", str(exc)
     return proc.returncode == 0, proc.stdout, proc.stderr, ""
@@ -1181,6 +1198,15 @@ def _resolve_codex_upgrade_command() -> tuple[str, str]:
     custom = env_alias(_CODEX_UPGRADE_COMMAND_ENV)
     if custom:
         return custom, "custom"
+    codex_binary = shutil.which("codex") or ""
+    codex_realpath = os.path.realpath(codex_binary) if codex_binary else ""
+    normalized_binary = codex_realpath.lower().replace("\\", "/")
+    if "/node_modules/@openai/codex/" in normalized_binary:
+        return "npm install -g @openai/codex@latest", "npm"
+    if "/pipx/venvs/" in normalized_binary:
+        return "pipx upgrade codex", "pipx"
+    if "/uv/tools/" in normalized_binary:
+        return "uv tool upgrade codex", "uv"
     if shutil.which("uv"):
         return "uv tool upgrade codex", "uv"
     if shutil.which("pipx"):
@@ -1206,17 +1232,36 @@ def _run_remote_codex_upgrade_sync() -> tuple[bool, str]:
 
 def _run_remote_coco_update_sync() -> tuple[bool, str]:
     repo_root = _resolve_repo_root()
-    if not (repo_root / ".git").exists():
-        return False, "CoCo update unavailable: runtime is not a git checkout."
-
     custom = env_alias(_COCO_SELF_UPDATE_COMMAND_ENV)
+    if not (repo_root / ".git").exists():
+        update_argv = (
+            ["bash", "-lc", custom]
+            if custom
+            else _resolve_coco_tool_update_argv()
+        )
+        if not update_argv:
+            return False, (
+                "CoCo update unavailable: runtime is not a git checkout and uv "
+                "was not found for package reinstall."
+            )
+        ok, stdout, stderr, err = _run_command_sync(update_argv, cwd=Path.home())
+        if not ok:
+            return False, (
+                "CoCo package update failed: "
+                f"{_tail_text(stderr or stdout or err or 'unknown error')}"
+            )
+        return True, "CoCo package updated."
+
     if custom:
         ok, stdout, stderr, err = _run_command_sync(["bash", "-lc", custom], cwd=repo_root)
         if not ok:
             return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'unknown error')}"
         return True, "CoCo update completed."
 
-    ok, stdout, stderr, err = _run_command_sync(["git", "status", "--porcelain"], cwd=repo_root)
+    ok, stdout, stderr, err = _run_command_sync(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo_root,
+    )
     if not ok:
         return False, f"CoCo update failed: {_tail_text(stderr or stdout or err or 'git status failed')}"
     if stdout.strip():

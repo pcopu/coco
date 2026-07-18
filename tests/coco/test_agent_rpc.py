@@ -1,13 +1,129 @@
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from coco.agent_rpc import AgentRpcClient, AgentRpcServer
+import coco.agent_rpc as agent_rpc
+
+
+def test_run_command_sync_decodes_timeout_output(monkeypatch):
+    def _timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=["demo"],
+            timeout=1,
+            output=b"partial stdout\xff",
+            stderr=b"partial stderr\xfe",
+        )
+
+    monkeypatch.setattr(agent_rpc.subprocess, "run", _timeout)
+
+    ok, stdout, stderr, error = agent_rpc._run_command_sync(["demo"], timeout_seconds=1)
+
+    assert ok is False
+    assert stdout == "partial stdout�"
+    assert stderr == "partial stderr�"
+    assert error == "timeout"
 from coco.node_registry import NodeRegistry
 from coco.node_registry import node_registry
 from coco.session import session_manager
+
+
+def test_agent_rpc_resolve_codex_upgrade_command_prefers_npm_for_nvm_installs(monkeypatch):
+    monkeypatch.setattr(agent_rpc, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        agent_rpc.shutil,
+        "which",
+        lambda name: "/home/pcopu/.nvm/versions/node/v24.13.1/bin/codex"
+        if name == "codex"
+        else (f"/usr/bin/{name}" if name in {"uv", "pipx", "npm"} else None),
+    )
+
+    command, source = agent_rpc._resolve_codex_upgrade_command()
+
+    assert source == "npm"
+    assert command == "npm install -g @openai/codex@latest"
+
+
+def test_agent_rpc_resolve_codex_upgrade_command_recognizes_windows_pipx_install(monkeypatch):
+    monkeypatch.setattr(agent_rpc, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        agent_rpc.shutil,
+        "which",
+        lambda name: r"C:\Users\coco\pipx\venvs\codex\Scripts\codex.exe"
+        if name == "codex"
+        else (f"C:\\tools\\{name}.exe" if name in {"uv", "pipx", "npm"} else None),
+    )
+
+    command, source = agent_rpc._resolve_codex_upgrade_command()
+
+    assert source == "pipx"
+    assert command == "pipx upgrade codex"
+
+
+def test_agent_rpc_coco_update_ignores_untracked_files(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(agent_rpc, "_resolve_repo_root", lambda: repo)
+    monkeypatch.setattr(agent_rpc, "env_alias", lambda _name: "")
+    monkeypatch.setattr(agent_rpc.shutil, "which", lambda _name: None)
+
+    def _run_command(argv, **_kwargs):
+        commands.append(argv)
+        if argv[:3] == ["git", "status", "--porcelain"]:
+            if "--untracked-files=no" in argv:
+                return True, "", "", ""
+            return True, "?? scratch.tmp\n", "", ""
+        if argv[:3] == ["git", "pull", "--ff-only"]:
+            return True, "Already up to date.\n", "", ""
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(agent_rpc, "_run_command_sync", _run_command)
+
+    ok, message = agent_rpc._run_remote_coco_update_sync()
+
+    assert ok is True
+    assert message == "CoCo update completed."
+    assert ["git", "pull", "--ff-only"] in commands
+
+
+def test_agent_rpc_coco_update_reinstalls_uv_tool_without_git_checkout(
+    monkeypatch, tmp_path
+):
+    runtime_root = tmp_path / "site-packages"
+    runtime_root.mkdir()
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(agent_rpc, "_resolve_repo_root", lambda: runtime_root)
+    monkeypatch.setattr(agent_rpc, "env_alias", lambda _name: "")
+    monkeypatch.setattr(
+        agent_rpc,
+        "_resolve_coco_tool_update_argv",
+        lambda: ["/home/coco/.local/bin/uv", "tool", "install", "--force", "git+https://github.com/pcopu/coco.git"],
+        raising=False,
+    )
+
+    def _run_command(argv, **_kwargs):
+        commands.append(argv)
+        return True, "Installed coco", "", ""
+
+    monkeypatch.setattr(agent_rpc, "_run_command_sync", _run_command)
+
+    ok, message = agent_rpc._run_remote_coco_update_sync()
+
+    assert ok is True
+    assert message == "CoCo package updated."
+    assert commands == [[
+        "/home/coco/.local/bin/uv",
+        "tool",
+        "install",
+        "--force",
+        "git+https://github.com/pcopu/coco.git",
+    ]]
 
 
 @pytest.mark.asyncio
@@ -236,6 +352,46 @@ async def test_agent_rpc_ping_includes_runtime_summary(monkeypatch):
         assert payload["runtime"]["tts"]["default_speed"] == 1.4
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_read_documents_rejects_invalid_base64(monkeypatch):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    monkeypatch.setattr(client, "_resolve_endpoint", lambda _machine_id: ("127.0.0.1", 1))
+
+    async def _call(**_kwargs):
+        return {
+            "documents": [
+                {"name": "corrupt.txt", "data_b64": "!!!!"},
+                {"name": "valid.txt", "data_b64": "VkFMSUQ="},
+            ]
+        }
+
+    monkeypatch.setattr(client._client, "call", _call)
+
+    assert await client.read_documents(
+        "remote", workspace_dir="/tmp", paths=["corrupt.txt", "valid.txt"]
+    ) == [("valid.txt", b"VALID")]
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_read_attachments_rejects_invalid_base64(monkeypatch):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    monkeypatch.setattr(client, "_resolve_endpoint", lambda _machine_id: ("127.0.0.1", 1))
+
+    async def _call(**_kwargs):
+        corrupt = {"data_b64": "not base64!"}
+        return {
+            "documents": [{"name": "bad.txt", **corrupt}],
+            "images": [{"media_type": "image/png", **corrupt}],
+            "videos": [{"media_type": "video/mp4", **corrupt}],
+        }
+
+    monkeypatch.setattr(client._client, "call", _call)
+
+    assert await client.read_attachments(
+        "remote", workspace_dir="/tmp", paths=["bad.txt"]
+    ) == {"documents": [], "images": [], "videos": []}
 
 
 @pytest.mark.asyncio

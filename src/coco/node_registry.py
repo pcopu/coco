@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,42 @@ logger = logging.getLogger(__name__)
 NODE_STATUS_ONLINE = "online"
 NODE_STATUS_OFFLINE = "offline"
 NODE_STATUS_DEGRADED = "degraded"
+
+
+def _coerce_int(value: object, *, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_port(value: object) -> int:
+    port = _coerce_int(value)
+    return port if 1 <= port <= 65535 else 0
+
+
+def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _coerce_str(value: object, *, default: str = "") -> str:
+    return value.strip() if isinstance(value, str) else default
+
+
+def _coerce_str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
 @dataclass
@@ -76,42 +113,38 @@ class NodeRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NodeRecord":
-        machine_id = str(data.get("machine_id", "")).strip()
-        display_name = str(data.get("display_name", "")).strip() or machine_id
-        status = str(data.get("status", NODE_STATUS_OFFLINE)).strip() or NODE_STATUS_OFFLINE
-        browse_roots = [
-            str(path).strip()
-            for path in data.get("browse_roots", [])
-            if isinstance(path, str) and str(path).strip()
-        ]
-        capabilities = [
-            str(cap).strip()
-            for cap in data.get("capabilities", [])
-            if isinstance(cap, str) and str(cap).strip()
-        ]
+        machine_id = _coerce_str(data.get("machine_id"))
+        display_name = _coerce_str(data.get("display_name")) or machine_id
+        status = _coerce_str(data.get("status"), default=NODE_STATUS_OFFLINE)
+        if status not in {NODE_STATUS_ONLINE, NODE_STATUS_OFFLINE, NODE_STATUS_DEGRADED}:
+            status = NODE_STATUS_OFFLINE
+        browse_roots = _coerce_str_list(data.get("browse_roots"))
+        capabilities = _coerce_str_list(data.get("capabilities"))
         raw_runtime = data.get("runtime", {})
         runtime = dict(raw_runtime) if isinstance(raw_runtime, dict) else {}
         try:
             last_seen_ts = float(data.get("last_seen_ts", 0.0) or 0.0)
         except (TypeError, ValueError):
             last_seen_ts = 0.0
+        if not math.isfinite(last_seen_ts):
+            last_seen_ts = 0.0
         return cls(
             machine_id=machine_id,
             display_name=display_name,
-            tailnet_name=str(data.get("tailnet_name", "")).strip(),
+            tailnet_name=_coerce_str(data.get("tailnet_name")),
             status=status,
             last_seen_ts=last_seen_ts,
             browse_roots=browse_roots,
             capabilities=capabilities,
             runtime=runtime,
-            agent_version=str(data.get("agent_version", "")).strip(),
-            transport=str(data.get("transport", "local")).strip() or "local",
-            rpc_host=str(data.get("rpc_host", "")).strip(),
-            rpc_port=int(data.get("rpc_port", 0) or 0),
-            is_local=bool(data.get("is_local", False)),
-            controller_capable=bool(data.get("controller_capable", False)),
-            controller_active=bool(data.get("controller_active", False)),
-            preferred_controller=bool(data.get("preferred_controller", False)),
+            agent_version=_coerce_str(data.get("agent_version")),
+            transport=_coerce_str(data.get("transport"), default="local") or "local",
+            rpc_host=_coerce_str(data.get("rpc_host")),
+            rpc_port=_coerce_port(data.get("rpc_port", 0)),
+            is_local=_coerce_bool(data.get("is_local", False)),
+            controller_capable=_coerce_bool(data.get("controller_capable", False)),
+            controller_active=_coerce_bool(data.get("controller_active", False)),
+            preferred_controller=_coerce_bool(data.get("preferred_controller", False)),
         )
 
 
@@ -145,6 +178,9 @@ class NodeRegistry:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Failed to load node registry %s: %s", self.state_file, exc)
+            return
+        if not isinstance(payload, dict):
+            logger.warning("Failed to load node registry %s: root is not an object", self.state_file)
             return
         raw_nodes = payload.get("nodes", {})
         if not isinstance(raw_nodes, dict):
@@ -247,7 +283,7 @@ class NodeRegistry:
             agent_version=agent_version.strip(),
             transport=transport.strip() or "local",
             rpc_host=rpc_host.strip(),
-            rpc_port=max(0, int(rpc_port)),
+            rpc_port=_coerce_port(rpc_port),
             is_local=is_local,
             controller_capable=controller_capable,
             controller_active=controller_active,
