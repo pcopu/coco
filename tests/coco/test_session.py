@@ -40,6 +40,20 @@ def _append_memory_entries(path: Path, entries: list[dict[str, object]]) -> None
             handle.write("\n")
 
 
+def test_window_state_round_trips_remote_transport_identity() -> None:
+    state = session_mod.WindowState(
+        codex_transport_epoch="agent-epoch-2",
+        codex_transport_epoch_started_at=200.5,
+        codex_transport_generation=9,
+    )
+
+    restored = session_mod.WindowState.from_dict(state.to_dict())
+
+    assert restored.codex_transport_epoch == "agent-epoch-2"
+    assert restored.codex_transport_epoch_started_at == 200.5
+    assert restored.codex_transport_generation == 9
+
+
 def test_recent_activity_skips_malformed_numeric_memory_fields(
     mgr: SessionManager,
     telegram_memory_path: Path,
@@ -226,6 +240,35 @@ class TestTopicBindingsV2:
         assert mgr.find_users_for_codex_thread("thread-9") == [
             (100, None, "topic:100:9", 9)
         ]
+
+    def test_set_codex_turn_for_thread_can_scope_to_machine(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="shared-thread",
+            window_id="@machine-a",
+            machine_id="machine-a",
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=200,
+            thread_id=2,
+            codex_thread_id="shared-thread",
+            window_id="@machine-b",
+            machine_id="machine-b",
+        )
+        mgr.set_window_codex_active_turn_id("@machine-a", "old-a")
+        mgr.set_window_codex_active_turn_id("@machine-b", "old-b")
+
+        mgr.set_codex_turn_for_thread(
+            "shared-thread",
+            "new-a",
+            machine_id="machine-a",
+        )
+
+        assert mgr.get_window_codex_active_turn_id("@machine-a") == "new-a"
+        assert mgr.get_window_codex_active_turn_id("@machine-b") == "old-b"
 
     def test_unbind_topic_removes_legacy_mapping(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "@1")
@@ -739,6 +782,12 @@ class TestHostFollowTakeover:
                 "message": "ok",
                 "thread_id": "thread-new",
                 "turn_id": "turn-new",
+                "transport_epoch": "agent-epoch-1",
+                "transport_epoch_started_at": 100.0,
+                "transport_generation": 4,
+                "transport_reset_sequence": 0,
+                "transport_last_reset_generation": 0,
+                "transport_last_reset_reason": "",
             }
 
         monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
@@ -754,6 +803,117 @@ class TestHostFollowTakeover:
         assert ok is True
         assert message == "ok"
         assert sent == [("gpt-5.6-sol", "ultra")]
+
+
+@pytest.mark.asyncio
+async def test_remote_send_rpc_failure_marks_transport_uncertain(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+    mgr.set_window_codex_active_turn_id("@1", "turn-old")
+    uncertainty_calls: list[tuple[set[str], str]] = []
+    mgr.set_transport_uncertainty_handler(
+        lambda window_ids, reason: uncertainty_calls.append((window_ids, reason))
+    )
+
+    async def _send_inputs(_machine_id: str, **_kwargs):
+        raise TimeoutError("RPC acknowledgement timed out")
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+    with pytest.raises(TimeoutError, match="acknowledgement"):
+        await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="continue",
+        )
+
+    assert uncertainty_calls == [({"@1"}, "remote_send_rpc_failed")]
+    assert mgr.get_window_codex_active_turn_id("@1") == ""
+
+
+@pytest.mark.asyncio
+async def test_stale_remote_send_response_cannot_restore_cleared_turn(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+    uncertainty_calls: list[tuple[set[str], str]] = []
+    mgr.set_transport_uncertainty_handler(
+        lambda window_ids, reason: uncertainty_calls.append((window_ids, reason))
+    )
+
+    async def _reject_stale_result(
+        window_id: str,
+        _result: dict[str, object],
+    ) -> bool:
+        mgr._note_transport_uncertainty(
+            window_ids={window_id},
+            reason="stale_remote_send_response",
+        )
+        return False
+
+    mgr.set_remote_transport_result_handler(
+        _reject_stale_result,
+    )
+
+    async def _send_inputs(_machine_id: str, **_kwargs):
+        return {
+            "ok": True,
+            "message": "ok",
+            "thread_id": "thread-new",
+            "turn_id": "turn-stale",
+            "transport_epoch": "agent-epoch-1",
+            "transport_epoch_started_at": 100.0,
+            "transport_generation": 7,
+            "transport_reset_sequence": 1,
+            "transport_last_reset_generation": 7,
+            "transport_last_reset_reason": "request_timeout:turn/start",
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=1,
+        window_id="@1",
+        text="continue",
+    )
+
+    assert ok is False
+    assert "transport changed before acknowledgement" in message.lower()
+    assert mgr.get_window_codex_active_turn_id("@1") == ""
+    assert uncertainty_calls == [({"@1"}, "stale_remote_send_response")]
 
 
 @pytest.mark.asyncio
@@ -2674,7 +2834,7 @@ async def test_send_inputs_to_window_thread_not_found_retry_failure_returns_comb
 
 
 @pytest.mark.asyncio
-async def test_send_inputs_to_window_turn_steer_timeout_retries_with_turn_start(
+async def test_send_inputs_to_window_turn_steer_timeout_is_not_replayed(
     mgr: SessionManager,
     monkeypatch,
 ):
@@ -2707,12 +2867,9 @@ async def test_send_inputs_to_window_turn_steer_timeout_retries_with_turn_start(
                 mgr.get_window_codex_active_turn_id("@900005"),
             )
         )
-        if len(call_states) == 1:
-            raise session_mod.CodexAppServerError(
-                "Timed out waiting for app-server response: turn/steer"
-            )
-        assert mgr.get_window_codex_active_turn_id("@900005") == ""
-        return True, "ok"
+        raise session_mod.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/steer"
+        )
 
     monkeypatch.setattr(mgr, "_send_inputs_via_codex_app_server", _send_inputs_via_codex_app_server)
     monkeypatch.setattr(
@@ -2734,19 +2891,19 @@ async def test_send_inputs_to_window_turn_steer_timeout_retries_with_turn_start(
         steer=False,
     )
 
-    assert ok is True
-    assert msg == "ok"
-    assert call_states == [("thread-live", "turn-stale"), ("thread-live", "")]
+    assert ok is False
+    assert "Timed out waiting for app-server response: turn/steer" in msg
+    assert "not replayed" in msg
+    assert call_states == [("thread-live", "turn-stale")]
     assert mgr.get_window_codex_active_turn_id("@900005") == ""
     assert cleared_thread_ids == ["thread-live"]
     event_names = [event for event, _payload in telemetry_events]
-    assert "transport.app_server.steer_timeout_retry" in event_names
-    assert "transport.app_server.steer_timeout_recovered" in event_names
-    assert "transport.app_server.send_failed" not in event_names
+    assert "transport.app_server.steer_timeout_uncertain" in event_names
+    assert "transport.app_server.send_failed" in event_names
 
 
 @pytest.mark.asyncio
-async def test_send_inputs_to_window_turn_steer_timeout_retry_failure_returns_combined_error(
+async def test_send_inputs_to_window_no_active_turn_retry_failure_returns_combined_error(
     mgr: SessionManager,
     monkeypatch,
 ):
@@ -2767,7 +2924,7 @@ async def test_send_inputs_to_window_turn_steer_timeout_retry_failure_returns_co
         attempts += 1
         if attempts == 1:
             raise session_mod.CodexAppServerError(
-                "Timed out waiting for app-server response: turn/steer"
+                "no active turn to steer"
             )
         raise RuntimeError("steer retry exploded")
 
@@ -2792,13 +2949,45 @@ async def test_send_inputs_to_window_turn_steer_timeout_retry_failure_returns_co
     )
 
     assert ok is False
-    assert "Timed out waiting for app-server response: turn/steer" in msg
+    assert "no active turn to steer" in msg
     assert "retry with turn/start failed: steer retry exploded" in msg
     assert mgr.get_window_codex_active_turn_id("@900006") == ""
     assert telemetry_events
     event, payload = telemetry_events[-1]
     assert event == "transport.app_server.send_failed"
     assert payload["fallback_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_turn_start_timeout_is_not_replayed(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    async def _turn_start(**kwargs):
+        calls.append(str(kwargs["thread_id"]))
+        raise session_mod.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/start"
+        )
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+
+    with pytest.raises(
+        session_mod.CodexAppServerError,
+        match="Timed out waiting for app-server response: turn/start",
+    ):
+        await mgr._turn_start_with_retry(
+            thread_id="thread-once",
+            inputs=[{"type": "text", "text": "run once"}],
+            approval_policy="on-request",
+        )
+
+    assert calls == ["thread-once"]
 
 
 @pytest.mark.asyncio
@@ -2885,8 +3074,15 @@ async def test_validate_codex_topic_bindings_clears_invalid_thread_ids(
     state = mgr.get_window_state("@900000")
     state.codex_active_turn_id = "turn-1"
 
-    async def _thread_read(*, thread_id: str):
+    async def _thread_read(
+        *,
+        thread_id: str,
+        timeout: float,
+        include_turns: bool,
+    ):
         _ = thread_id
+        assert timeout == 10.0
+        assert include_turns is False
         raise session_mod.CodexAppServerError("thread not found")
 
     monkeypatch.setattr(session_mod.codex_app_server_client, "thread_read", _thread_read)
@@ -2916,7 +3112,14 @@ async def test_validate_codex_topic_bindings_keeps_valid_thread_ids(
         window_id="@900000",
     )
 
-    async def _thread_read(*, thread_id: str):
+    async def _thread_read(
+        *,
+        thread_id: str,
+        timeout: float,
+        include_turns: bool,
+    ):
+        assert timeout == 10.0
+        assert include_turns is False
         return {"thread": {"id": thread_id}}
 
     monkeypatch.setattr(session_mod.codex_app_server_client, "thread_read", _thread_read)

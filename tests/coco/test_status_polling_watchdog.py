@@ -44,9 +44,213 @@ async def test_probe_stale_nodes_bounds_unreachable_agent_delay(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_window_health_probe_routes_to_remote_owner(monkeypatch):
+    remote_calls: list[tuple[str, float]] = []
+    accepted_results: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_machine_id",
+        lambda _window_id: "remote-node",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local Node"),
+    )
+    monkeypatch.setattr(
+        status_polling.node_registry,
+        "get_node",
+        lambda _machine_id: SimpleNamespace(
+            runtime={"codex_transport_protocol_version": 1},
+        ),
+    )
+
+    async def _remote_probe(
+        machine_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, object]:
+        remote_calls.append((machine_id, timeout))
+        return {
+            "healthy": True,
+            "transport_epoch": "epoch-1",
+            "transport_epoch_started_at": 10.0,
+            "transport_generation": 4,
+            "transport_reset_sequence": 2,
+            "transport_last_reset_generation": 3,
+            "transport_last_reset_reason": "request_timeout",
+        }
+
+    async def _accept_remote_result(
+        *,
+        window_id: str,
+        result: dict[str, object],
+    ) -> bool:
+        accepted_results.append((window_id, result))
+        return True
+
+    async def _unexpected_local_probe(*, timeout: float) -> bool:
+        _ = timeout
+        raise AssertionError("remote window probed controller-local app-server")
+
+    monkeypatch.setattr(
+        status_polling.agent_rpc_client,
+        "probe_codex_health_state",
+        _remote_probe,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "_accept_remote_transport_result",
+        _accept_remote_result,
+    )
+    monkeypatch.setattr(
+        status_polling.codex_app_server_client,
+        "probe_health",
+        _unexpected_local_probe,
+    )
+
+    healthy = await status_polling._probe_window_codex_transport_health(
+        window_id="@remote",
+        timeout=5.0,
+    )
+
+    assert healthy is True
+    assert remote_calls == [("remote-node", 5.0)]
+    assert accepted_results == [
+        (
+            "@remote",
+            {
+                "healthy": True,
+                "transport_epoch": "epoch-1",
+                "transport_epoch_started_at": 10.0,
+                "transport_generation": 4,
+                "transport_reset_sequence": 2,
+                "transport_last_reset_generation": 3,
+                "transport_last_reset_reason": "request_timeout",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_window_health_probe_skips_unsupported_legacy_agent(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_machine_id",
+        lambda _window_id: "legacy-node",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local Node"),
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_transport_state",
+        lambda _window_id: ("old-modern-epoch", 100.0, 4),
+    )
+    monkeypatch.setattr(
+        status_polling.node_registry,
+        "get_node",
+        lambda _machine_id: SimpleNamespace(
+            runtime={},
+            codex_transport_legacy_confirmed=True,
+        ),
+    )
+
+    async def _unexpected_remote_probe(*_args, **_kwargs):
+        raise AssertionError("legacy agent does not expose health-state RPC")
+
+    monkeypatch.setattr(
+        status_polling.agent_rpc_client,
+        "probe_codex_health_state",
+        _unexpected_remote_probe,
+    )
+
+    healthy = await status_polling._probe_window_codex_transport_health(
+        window_id="@legacy",
+        timeout=5.0,
+    )
+
+    assert healthy is True
+
+
+@pytest.mark.asyncio
+async def test_window_health_probe_rejects_stale_remote_transport_snapshot(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_machine_id",
+        lambda _window_id: "remote-node",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local Node"),
+    )
+    monkeypatch.setattr(
+        status_polling.node_registry,
+        "get_node",
+        lambda _machine_id: SimpleNamespace(
+            runtime={"codex_transport_protocol_version": 1},
+        ),
+    )
+
+    async def _remote_probe(
+        _machine_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, object]:
+        _ = timeout
+        return {
+            "healthy": True,
+            "transport_epoch": "replacement-epoch",
+            "transport_epoch_started_at": 20.0,
+            "transport_generation": 1,
+            "transport_reset_sequence": 0,
+            "transport_last_reset_generation": 0,
+            "transport_last_reset_reason": "",
+        }
+
+    async def _reject_remote_result(
+        *,
+        window_id: str,
+        result: dict[str, object],
+    ) -> bool:
+        assert window_id == "@remote"
+        assert result["transport_epoch"] == "replacement-epoch"
+        return False
+
+    monkeypatch.setattr(
+        status_polling.agent_rpc_client,
+        "probe_codex_health_state",
+        _remote_probe,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "_accept_remote_transport_result",
+        _reject_remote_result,
+    )
+
+    healthy = await status_polling._probe_window_codex_transport_health(
+        window_id="@remote",
+        timeout=5.0,
+    )
+
+    assert healthy is False
+
+
+@pytest.mark.asyncio
 async def test_emit_due_watchdog_skips_resend_when_active_turn(monkeypatch):
     sent_messages: list[str] = []
     telemetry: list[tuple[str, dict[str, object]]] = []
+    health_probe_timeouts: list[float] = []
 
     check = RunWatchCheck(
         user_id=1,
@@ -78,6 +282,17 @@ async def test_emit_due_watchdog_skips_resend_when_active_turn(monkeypatch):
         lambda _w: "turn_1",
     )
     monkeypatch.setattr(status_polling.codex_app_server_client, "is_turn_in_progress", lambda _t: True)
+
+    async def _probe_health(*, timeout: float) -> bool:
+        health_probe_timeouts.append(timeout)
+        return True
+
+    monkeypatch.setattr(
+        status_polling.codex_app_server_client,
+        "probe_health",
+        _probe_health,
+        raising=False,
+    )
 
     def _unexpected_retry_attempt(**_kwargs):
         raise AssertionError("retry attempt should be skipped while turn is active")
@@ -112,12 +327,205 @@ async def test_emit_due_watchdog_skips_resend_when_active_turn(monkeypatch):
         window_id="@1",
     )
 
+    assert len(health_probe_timeouts) == 1
+    assert 0.0 < health_probe_timeouts[0] <= 10.0
     assert sent_messages
     assert sent_messages == ["👀"]
     assert telemetry
     assert telemetry[-1][0] == "watchdog.check_fired"
     assert telemetry[-1][1]["auto_retry_reason"] == "active_turn"
     assert telemetry[-1][1]["retry_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_emit_due_watchdog_reports_recycled_transport_without_resend(monkeypatch):
+    sent_messages: list[str] = []
+    telemetry: list[tuple[str, dict[str, object]]] = []
+    health_probe_timeouts: list[float] = []
+    recovery_uncertainties: list[dict[str, object]] = []
+
+    check = RunWatchCheck(
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+        checkpoint_seconds=30,
+        elapsed_seconds=30.0,
+        resend_text="do not resend me",
+        resend_text_len=16,
+        pending_fingerprint="abc",
+        auto_retry_allowed=True,
+        auto_retry_reason="eligible",
+        retry_count=0,
+        max_auto_retries=2,
+    )
+
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(status_polling, "get_due_run_checks", lambda **_kwargs: [check])
+    monkeypatch.setattr(status_polling.session_manager, "resolve_chat_id", lambda _u, _t: -100)
+    monkeypatch.setattr(status_polling.session_manager, "get_display_name", lambda _w: "demo")
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_thread_id",
+        lambda _w: "thread_1",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _w: "turn_1",
+    )
+    monkeypatch.setattr(status_polling.codex_app_server_client, "is_turn_in_progress", lambda _t: True)
+
+    async def _probe_health(*, timeout: float) -> bool:
+        health_probe_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(
+        status_polling.codex_app_server_client,
+        "probe_health",
+        _probe_health,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "note_transport_reset_uncertainty",
+        lambda **kwargs: recovery_uncertainties.append(kwargs),
+        raising=False,
+    )
+
+    def _unexpected_retry_attempt(**_kwargs):
+        raise AssertionError("transport recovery must not replay the user's prompt")
+
+    async def _unexpected_send_to_window(*_args, **_kwargs):
+        raise AssertionError("transport recovery must not replay the user's prompt")
+
+    monkeypatch.setattr(status_polling, "note_auto_retry_attempt", _unexpected_retry_attempt)
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "send_topic_text_to_window",
+        _unexpected_send_to_window,
+    )
+
+    async def _safe_send(_bot, _chat_id, text: str, **_kwargs):
+        sent_messages.append(text)
+
+    monkeypatch.setattr(status_polling, "safe_send", _safe_send)
+    monkeypatch.setattr(
+        status_polling,
+        "emit_telemetry",
+        lambda event, **fields: telemetry.append((event, fields)),
+    )
+
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+    )
+
+    assert len(health_probe_timeouts) == 1
+    assert 0.0 < health_probe_timeouts[0] <= 10.0
+    assert len(recovery_uncertainties) == 1
+    assert recovery_uncertainties[0]["reason"] == "health_probe_recycled"
+    assert len(sent_messages) == 1
+    report = sent_messages[0].lower()
+    assert "run watchdog check" in report
+    assert "recycled" in report
+    assert "interrupted" in report
+    assert telemetry
+    assert telemetry[-1][0] == "watchdog.check_fired"
+    assert telemetry[-1][1]["auto_retry_reason"] == "transport_recycled"
+    assert telemetry[-1][1]["retry_attempted"] is False
+    assert telemetry[-1][1]["notification_kind"] == "transport_recycled"
+
+
+@pytest.mark.asyncio
+async def test_emit_due_watchdog_does_not_label_protocol_error_as_recycle(
+    monkeypatch,
+):
+    sent_messages: list[str] = []
+    telemetry: list[tuple[str, dict[str, object]]] = []
+    recovery_uncertainties: list[dict[str, object]] = []
+    check = RunWatchCheck(
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+        checkpoint_seconds=30,
+        elapsed_seconds=30.0,
+        resend_text="do not resend me",
+        resend_text_len=16,
+        pending_fingerprint="abc",
+        auto_retry_allowed=True,
+        auto_retry_reason="eligible",
+        retry_count=0,
+        max_auto_retries=2,
+    )
+
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(status_polling, "get_due_run_checks", lambda **_kwargs: [check])
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "resolve_chat_id",
+        lambda _u, _t: -100,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_display_name",
+        lambda _w: "demo",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_thread_id",
+        lambda _w: "thread_1",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _w: "turn_1",
+    )
+
+    async def _probe_health(*, timeout: float) -> bool:
+        _ = timeout
+        raise RuntimeError("authentication required")
+
+    monkeypatch.setattr(
+        status_polling.codex_app_server_client,
+        "probe_health",
+        _probe_health,
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "note_transport_reset_uncertainty",
+        lambda **kwargs: recovery_uncertainties.append(kwargs),
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "note_auto_retry_attempt",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("active uncertain turn must not be resent")
+        ),
+    )
+
+    async def _safe_send(_bot, _chat_id, text: str, **_kwargs):
+        sent_messages.append(text)
+
+    monkeypatch.setattr(status_polling, "safe_send", _safe_send)
+    monkeypatch.setattr(
+        status_polling,
+        "emit_telemetry",
+        lambda event, **fields: telemetry.append((event, fields)),
+    )
+
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=10,
+        window_id="@1",
+    )
+
+    assert recovery_uncertainties == []
+    assert "health probe failed" in sent_messages[0].lower()
+    assert telemetry[-1][1]["auto_retry_reason"] == "health_probe_failed"
+    assert telemetry[-1][1]["notification_kind"] == "watchdog_report"
 
 
 @pytest.mark.asyncio

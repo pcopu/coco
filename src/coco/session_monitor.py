@@ -27,6 +27,8 @@ from .monitor_state import MonitorState, TrackedSession
 from .transcript_parser import TranscriptParser
 logger = logging.getLogger(__name__)
 
+SESSION_MONITOR_MAX_BATCH_BYTES = 16 * 1024 * 1024
+
 _UUID_SUFFIX_RE = re.compile(
     r"(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
 )
@@ -236,7 +238,7 @@ class SessionMonitor:
         """
         new_entries = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(file_path, "rb") as f:
                 # Get file size to detect truncation
                 await f.seek(0, 2)  # Seek to end
                 file_size = await f.tell()
@@ -251,6 +253,58 @@ class SessionMonitor:
                         file_size,
                     )
                     session.last_byte_offset = 0
+                    session.pending_record_start_offset = None
+                    session.pending_record_drain_offset = None
+
+                pending_start = session.pending_record_start_offset
+                pending_drain = session.pending_record_drain_offset
+                if (
+                    pending_start is not None
+                    and (
+                        pending_drain is None
+                        or pending_start < session.last_byte_offset
+                        or pending_drain < pending_start
+                        or pending_drain > file_size
+                    )
+                ):
+                    logger.info(
+                        "Discarding invalid oversized-record drain state for "
+                        "session %s after file change",
+                        session.session_id,
+                    )
+                    session.pending_record_start_offset = None
+                    session.pending_record_drain_offset = None
+                    pending_start = None
+                    pending_drain = None
+
+                if pending_start is not None and pending_drain is not None:
+                    await f.seek(pending_drain)
+                    fragment = await f.read(
+                        SESSION_MONITOR_MAX_BATCH_BYTES
+                    )
+                    newline_index = fragment.find(b"\n")
+                    if newline_index >= 0:
+                        record_end = pending_drain + newline_index + 1
+                        session.last_byte_offset = record_end
+                        session.pending_record_start_offset = None
+                        session.pending_record_drain_offset = None
+                        logger.warning(
+                            "Skipping oversized JSONL record in session %s "
+                            "(%d bytes)",
+                            session.session_id,
+                            record_end - pending_start,
+                        )
+                    else:
+                        session.pending_record_drain_offset = (
+                            pending_drain + len(fragment)
+                        )
+                        if not fragment:
+                            logger.warning(
+                                "Oversized partial JSONL record in session %s, "
+                                "waiting for more data",
+                                session.session_id,
+                            )
+                    return []
 
                 # Seek to last read position for incremental reading
                 await f.seek(session.last_byte_offset)
@@ -260,15 +314,32 @@ class SessionMonitor:
                 # the state file was manually edited or corrupted.
                 if session.last_byte_offset > 0:
                     first_char = await f.read(1)
-                    if first_char and first_char != "{":
+                    if first_char == b"\n":
+                        session.last_byte_offset = await f.tell()
+                        return []
+                    if first_char and first_char != b"{":
                         logger.warning(
                             "Corrupted offset %d in session %s (mid-line), "
                             "scanning to next line",
                             session.last_byte_offset,
                             session.session_id,
                         )
-                        await f.readline()  # Skip rest of partial line
-                        session.last_byte_offset = await f.tell()
+                        remaining_budget = max(
+                            0,
+                            SESSION_MONITOR_MAX_BATCH_BYTES - 1,
+                        )
+                        fragment = (
+                            await f.readline(remaining_budget)
+                            if remaining_budget
+                            else b""
+                        )
+                        if fragment.endswith(b"\n"):
+                            session.last_byte_offset = await f.tell()
+                        else:
+                            session.pending_record_start_offset = (
+                                session.last_byte_offset
+                            )
+                            session.pending_record_drain_offset = await f.tell()
                         return []
                     await f.seek(session.last_byte_offset)  # Reset for normal read
 
@@ -277,11 +348,48 @@ class SessionMonitor:
                 # successfully. A non-empty line that fails JSON parsing is
                 # likely a partial write; stop and retry next cycle.
                 safe_offset = session.last_byte_offset
-                async for line in f:
+                batch_start_offset = safe_offset
+                while True:
+                    bytes_processed = safe_offset - batch_start_offset
+                    bytes_remaining = (
+                        SESSION_MONITOR_MAX_BATCH_BYTES - bytes_processed
+                    )
+                    if bytes_remaining <= 0:
+                        break
+
+                    record_start = await f.tell()
+                    raw_line = await f.readline(bytes_remaining)
+                    if not raw_line:
+                        break
+
+                    record_end = await f.tell()
+                    if (
+                        not raw_line.endswith(b"\n")
+                        and len(raw_line) == bytes_remaining
+                        and record_end < file_size
+                    ):
+                        if bytes_processed:
+                            # Leave the next record for the next bounded batch.
+                            await f.seek(record_start)
+                            break
+
+                        # Persist a drain cursor so each poll does bounded work
+                        # and never re-reads a giant partial record from its
+                        # beginning.
+                        session.pending_record_start_offset = record_start
+                        session.pending_record_drain_offset = record_end
+                        logger.warning(
+                            "Oversized JSONL record in session %s; "
+                            "continuing bounded drain next cycle",
+                            session.session_id,
+                        )
+                        break
+
+                    line = raw_line.decode("utf-8")
                     data = TranscriptParser.parse_line(line)
                     if data is not None:
                         new_entries.append(data)
-                        safe_offset = await f.tell()
+                        safe_offset = record_end
                     elif line.strip():
                         try:
                             json.loads(line)
@@ -295,10 +403,10 @@ class SessionMonitor:
                         # Complete JSON values with an unsupported shape are
                         # invalid records, not partial writes. Skip them so one
                         # scalar/list cannot pin the monitor offset forever.
-                        safe_offset = await f.tell()
+                        safe_offset = record_end
                     else:
                         # Empty line — safe to skip
-                        safe_offset = await f.tell()
+                        safe_offset = record_end
 
                 session.last_byte_offset = safe_offset
 

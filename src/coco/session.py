@@ -29,7 +29,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 
 import aiofiles
@@ -49,9 +49,7 @@ from .utils import atomic_write_json, env_alias
 logger = logging.getLogger(__name__)
 
 APP_SERVER_MAX_TEXT_CHARS_PER_INPUT = 3000
-APP_SERVER_TURN_START_TIMEOUT_SECONDS = 75.0
-APP_SERVER_TURN_START_MAX_ATTEMPTS = 2
-APP_SERVER_TURN_START_RETRY_DELAY_SECONDS = 0.4
+APP_SERVER_TURN_START_TIMEOUT_SECONDS = 20.0
 APP_SERVER_THREAD_NOT_FOUND_RE = re.compile(r"\bthread not found\b", re.IGNORECASE)
 APP_SERVER_TURN_STEER_TIMEOUT_RE = re.compile(
     r"Timed out waiting for app-server response:\s*turn/steer",
@@ -77,7 +75,9 @@ TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL = "host_follow_final"
 EXPECTED_TRANSCRIPT_USER_ECHO_MAX_AGE_SECONDS = 120.0
 CODEX_SERVICE_TIERS = frozenset({"fast", "flex"})
 TRANSCRIPTION_PROFILES = frozenset({"compatible", "auto"})
-SESSION_START_REASONS = frozenset({"fresh_start", "resume", "after_clear"})
+SESSION_START_REASONS = frozenset(
+    {"fresh_start", "resume", "after_clear", "oversized_rollover"}
+)
 
 
 @dataclass
@@ -111,6 +111,9 @@ class WindowState:
         mention_only: Whether this window should only accept @mentions as input
         codex_thread_id: Codex app-server thread ID (Codex app-server transport)
         codex_active_turn_id: In-progress turn ID for codex_thread_id
+        codex_transport_epoch: Process incarnation for the bound app-server state
+        codex_transport_epoch_started_at: Wall-clock start of that incarnation
+        codex_transport_generation: App-server generation within that incarnation
     """
 
     session_id: str = ""
@@ -121,6 +124,9 @@ class WindowState:
     mention_only: bool = False
     codex_thread_id: str = ""
     codex_active_turn_id: str = ""
+    codex_transport_epoch: str = ""
+    codex_transport_epoch_started_at: float = 0.0
+    codex_transport_generation: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -139,6 +145,14 @@ class WindowState:
             d["codex_thread_id"] = self.codex_thread_id
         if self.codex_active_turn_id:
             d["codex_active_turn_id"] = self.codex_active_turn_id
+        if self.codex_transport_epoch:
+            d["codex_transport_epoch"] = self.codex_transport_epoch
+        if self.codex_transport_epoch_started_at > 0:
+            d["codex_transport_epoch_started_at"] = (
+                self.codex_transport_epoch_started_at
+            )
+        if self.codex_transport_generation > 0:
+            d["codex_transport_generation"] = self.codex_transport_generation
         return d
 
     @classmethod
@@ -169,6 +183,21 @@ class WindowState:
             value = data.get(key, "")
             return value if isinstance(value, str) else ""
 
+        try:
+            codex_transport_epoch_started_at = max(
+                0.0,
+                float(data.get("codex_transport_epoch_started_at", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            codex_transport_epoch_started_at = 0.0
+        try:
+            codex_transport_generation = max(
+                0,
+                int(data.get("codex_transport_generation", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            codex_transport_generation = 0
+
         return cls(
             session_id=_text("session_id"),
             cwd=_text("cwd"),
@@ -178,6 +207,9 @@ class WindowState:
             mention_only=mention_only,
             codex_thread_id=_text("codex_thread_id"),
             codex_active_turn_id=_text("codex_active_turn_id"),
+            codex_transport_epoch=_text("codex_transport_epoch"),
+            codex_transport_epoch_started_at=codex_transport_epoch_started_at,
+            codex_transport_generation=codex_transport_generation,
         )
 
 
@@ -421,6 +453,20 @@ class SessionManager:
         init=False,
         repr=False,
     )
+    _transport_uncertainty_handler: (
+        Callable[[set[str], str], None] | None
+    ) = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _remote_transport_result_handler: (
+        Callable[[str, dict[str, Any]], Awaitable[bool]] | None
+    ) = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -432,6 +478,65 @@ class SessionManager:
             lock = asyncio.Lock()
             self._window_send_locks[window_id] = lock
         return lock
+
+    def set_transport_uncertainty_handler(
+        self,
+        handler: Callable[[set[str], str], None] | None,
+    ) -> None:
+        """Register the controller callback for uncertain remote mutations."""
+        self._transport_uncertainty_handler = handler
+
+    def _note_transport_uncertainty(
+        self,
+        *,
+        window_ids: set[str],
+        reason: str,
+    ) -> None:
+        handler = self._transport_uncertainty_handler
+        if handler is not None:
+            handler(window_ids, reason)
+
+    def set_remote_transport_result_handler(
+        self,
+        handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None,
+    ) -> None:
+        """Register the controller validator for remote transport snapshots."""
+        self._remote_transport_result_handler = handler
+
+    async def _accept_remote_transport_result(
+        self,
+        *,
+        window_id: str,
+        result: dict[str, Any],
+    ) -> bool:
+        handler = self._remote_transport_result_handler
+        if handler is not None and not await handler(window_id, result):
+            self.clear_window_codex_turn(window_id)
+            return False
+
+        epoch = str(result.get("transport_epoch", "")).strip()
+        try:
+            epoch_started_at = max(
+                0.0,
+                float(result.get("transport_epoch_started_at", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            epoch_started_at = 0.0
+        try:
+            generation = max(
+                0,
+                int(result.get("transport_generation", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            generation = 0
+        if epoch and epoch_started_at > 0 and generation > 0:
+            self.set_window_codex_transport_state(
+                window_id,
+                epoch=epoch,
+                epoch_started_at=epoch_started_at,
+                generation=generation,
+            )
+        return True
 
     def _save_state(self) -> None:
         topic_bindings = self._collect_topic_bindings()
@@ -1071,7 +1176,7 @@ class SessionManager:
             config.sessions_path.glob("**/*.jsonl"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
-        )[:limit]
+        )
         for file_path in candidates:
             extracted = self._extract_codex_session_summary(file_path)
             if not extracted:
@@ -1684,28 +1789,122 @@ class SessionManager:
         """Clear active Codex turn id for a window."""
         self.set_window_codex_active_turn_id(window_id, "")
 
-    def clear_window_codex_turns_for_machine(self, machine_id: str) -> int:
-        """Clear active Codex turn ids for windows bound to one machine."""
-        target_machine_id = machine_id.strip()
-        local_machine_id, _local_machine_name = self._local_machine_identity()
-        if not target_machine_id:
-            target_machine_id = local_machine_id
+    def get_window_codex_transport_generation(self, window_id: str) -> int:
+        """Return the app-server generation associated with current remote state."""
+        return max(
+            0,
+            int(self.get_window_state(window_id).codex_transport_generation),
+        )
 
+    def get_window_codex_transport_state(
+        self,
+        window_id: str,
+    ) -> tuple[str, float, int]:
+        """Return the app-server epoch, epoch start time, and generation."""
+        state = self.get_window_state(window_id)
+        return (
+            state.codex_transport_epoch.strip(),
+            max(0.0, float(state.codex_transport_epoch_started_at)),
+            max(0, int(state.codex_transport_generation)),
+        )
+
+    @staticmethod
+    def _normalize_codex_transport_snapshot(
+        snapshot: dict[str, Any],
+    ) -> tuple[str, float, int]:
+        """Return a validated app-server process identity from a snapshot."""
+        raw_epoch = snapshot.get("epoch")
+        epoch = raw_epoch.strip() if isinstance(raw_epoch, str) else ""
+        try:
+            epoch_started_at = max(
+                0.0,
+                float(snapshot.get("epoch_started_at", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            epoch_started_at = 0.0
+        try:
+            generation = max(
+                0,
+                int(snapshot.get("generation", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            generation = 0
+        if not epoch or epoch_started_at <= 0 or generation <= 0:
+            return "", 0.0, 0
+        return epoch, epoch_started_at, generation
+
+    def set_window_codex_transport_state(
+        self,
+        window_id: str,
+        *,
+        epoch: str,
+        epoch_started_at: float,
+        generation: int,
+    ) -> None:
+        """Persist the complete remote app-server transport identity."""
+        state = self.get_window_state(window_id)
+        normalized_epoch = epoch.strip()
+        normalized_started_at = max(0.0, float(epoch_started_at))
+        normalized_generation = max(0, int(generation))
+        if (
+            state.codex_transport_epoch == normalized_epoch
+            and state.codex_transport_epoch_started_at == normalized_started_at
+            and state.codex_transport_generation == normalized_generation
+        ):
+            return
+        state.codex_transport_epoch = normalized_epoch
+        state.codex_transport_epoch_started_at = normalized_started_at
+        state.codex_transport_generation = normalized_generation
+        self._save_state()
+
+    def set_window_codex_transport_generation(
+        self,
+        window_id: str,
+        generation: int,
+    ) -> None:
+        """Persist the app-server generation associated with a remote window."""
+        state = self.get_window_state(window_id)
+        normalized = max(0, int(generation))
+        if state.codex_transport_generation == normalized:
+            return
+        state.codex_transport_generation = normalized
+        self._save_state()
+
+    def clear_window_codex_turns(self, window_ids: set[str]) -> int:
+        """Clear active Codex turn ids for an explicit set of windows."""
         cleared = 0
-        for window_id, state in self.window_states.items():
-            if not state.codex_active_turn_id:
-                continue
-            bound_machine_id = self.get_window_machine_id(window_id)
-            if bound_machine_id:
-                if bound_machine_id != target_machine_id:
-                    continue
-            elif target_machine_id != local_machine_id:
+        for window_id in window_ids:
+            state = self.window_states.get(window_id)
+            if state is None or not state.codex_active_turn_id:
                 continue
             state.codex_active_turn_id = ""
             cleared += 1
         if cleared:
             self._save_state()
         return cleared
+
+    def clear_window_codex_turns_for_machine(self, machine_id: str) -> int:
+        """Clear active Codex turn ids for windows bound to one machine."""
+        window_ids = self.get_window_ids_for_machine(machine_id)
+        return self.clear_window_codex_turns(window_ids)
+
+    def get_window_ids_for_machine(self, machine_id: str) -> set[str]:
+        """Return window ids bound to one machine, including local defaults."""
+        target_machine_id = machine_id.strip()
+        local_machine_id, _local_machine_name = self._local_machine_identity()
+        if not target_machine_id:
+            target_machine_id = local_machine_id
+
+        window_ids: set[str] = set()
+        for window_id in self.window_states:
+            bound_machine_id = self.get_window_machine_id(window_id)
+            if bound_machine_id:
+                if bound_machine_id != target_machine_id:
+                    continue
+            elif target_machine_id != local_machine_id:
+                continue
+            window_ids.add(window_id)
+        return window_ids
 
     def _build_session_file_path(self, session_id: str, cwd: str) -> Path | None:
         """Return direct transcript path when it can be derived cheaply.
@@ -2476,20 +2675,38 @@ class SessionManager:
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
-                remote_result = await agent_rpc_client.send_inputs(
-                    machine_id,
+                try:
+                    remote_result = await agent_rpc_client.send_inputs(
+                        machine_id,
+                        window_id=window_id,
+                        cwd=cwd,
+                        window_name=state.window_name
+                        or self.get_display_name(window_id),
+                        inputs=[{"type": "text", "text": text}],
+                        steer=steer,
+                        force_new_turn=force_new_turn,
+                        thread_id=state.codex_thread_id.strip(),
+                        approval_mode=state.approval_mode.strip(),
+                        model_slug=model_slug,
+                        reasoning_effort=reasoning_effort,
+                        service_tier=service_tier,
+                    )
+                except Exception:
+                    self._note_transport_uncertainty(
+                        window_ids={window_id},
+                        reason="remote_send_rpc_failed",
+                    )
+                    self.clear_window_codex_turn(window_id)
+                    raise
+                if not await self._accept_remote_transport_result(
                     window_id=window_id,
-                    cwd=cwd,
-                    window_name=state.window_name or self.get_display_name(window_id),
-                    inputs=[{"type": "text", "text": text}],
-                    steer=steer,
-                    force_new_turn=force_new_turn,
-                    thread_id=state.codex_thread_id.strip(),
-                    approval_mode=state.approval_mode.strip(),
-                    model_slug=model_slug,
-                    reasoning_effort=reasoning_effort,
-                    service_tier=service_tier,
-                )
+                    result=remote_result,
+                ):
+                    return (
+                        False,
+                        "Remote Codex transport changed before acknowledgement; "
+                        "the request will not be replayed automatically.",
+                    )
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
                 if resolved_thread_id:
@@ -2555,20 +2772,38 @@ class SessionManager:
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
-                remote_result = await agent_rpc_client.send_inputs(
-                    machine_id,
+                try:
+                    remote_result = await agent_rpc_client.send_inputs(
+                        machine_id,
+                        window_id=window_id,
+                        cwd=cwd,
+                        window_name=state.window_name
+                        or self.get_display_name(window_id),
+                        inputs=inputs,
+                        steer=steer,
+                        force_new_turn=force_new_turn,
+                        thread_id=state.codex_thread_id.strip(),
+                        approval_mode=state.approval_mode.strip(),
+                        model_slug=model_slug,
+                        reasoning_effort=reasoning_effort,
+                        service_tier=service_tier,
+                    )
+                except Exception:
+                    self._note_transport_uncertainty(
+                        window_ids={window_id},
+                        reason="remote_send_rpc_failed",
+                    )
+                    self.clear_window_codex_turn(window_id)
+                    raise
+                if not await self._accept_remote_transport_result(
                     window_id=window_id,
-                    cwd=cwd,
-                    window_name=state.window_name or self.get_display_name(window_id),
-                    inputs=inputs,
-                    steer=steer,
-                    force_new_turn=force_new_turn,
-                    thread_id=state.codex_thread_id.strip(),
-                    approval_mode=state.approval_mode.strip(),
-                    model_slug=model_slug,
-                    reasoning_effort=reasoning_effort,
-                    service_tier=service_tier,
-                )
+                    result=remote_result,
+                ):
+                    return (
+                        False,
+                        "Remote Codex transport changed before acknowledgement; "
+                        "the request will not be replayed automatically.",
+                    )
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
                 if resolved_thread_id:
@@ -3698,14 +3933,27 @@ class SessionManager:
             result.append((user_id, chat_id, window_id, thread_id))
         return result
 
-    def set_codex_turn_for_thread(self, codex_thread_id: str, turn_id: str) -> None:
-        """Update active Codex turn id across all windows bound to a thread id."""
+    def set_codex_turn_for_thread(
+        self,
+        codex_thread_id: str,
+        turn_id: str,
+        *,
+        machine_id: str = "",
+    ) -> None:
+        """Update active turn ids for one thread, optionally on one machine."""
         if not codex_thread_id:
             return
         changed = False
         normalized = turn_id.strip()
-        for state in self.window_states.values():
+        normalized_machine_id = machine_id.strip()
+        for window_id, state in self.window_states.items():
             if state.codex_thread_id != codex_thread_id:
+                continue
+            if (
+                normalized_machine_id
+                and self.get_window_machine_id(window_id).strip()
+                != normalized_machine_id
+            ):
                 continue
             if state.codex_active_turn_id == normalized:
                 continue
@@ -3728,11 +3976,53 @@ class SessionManager:
 
         checked = 0
         invalid_thread_ids: set[str] = set()
+        oversized_thread_ids: set[str] = set()
         for codex_thread_id in sorted(thread_ids):
             checked += 1
             try:
+                rollout_path = self._find_codex_session_file_for_thread(
+                    codex_thread_id
+                )
+                rollout_size = (
+                    rollout_path.stat().st_size
+                    if rollout_path is not None
+                    else 0
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Stored Codex thread transcript check failed "
+                    "(thread=%s): %s",
+                    codex_thread_id,
+                    exc,
+                )
+                invalid_thread_ids.add(codex_thread_id)
+                continue
+            resume_limit = int(config.codex_max_resume_bytes)
+            if rollout_size > resume_limit:
+                invalid_thread_ids.add(codex_thread_id)
+                oversized_thread_ids.add(codex_thread_id)
+                emit_telemetry(
+                    "transport.app_server.oversized_binding_rollover",
+                    runtime_mode=config.runtime_mode,
+                    codex_transport=config.codex_transport,
+                    thread_id=codex_thread_id,
+                    rollout_path=str(rollout_path),
+                    rollout_size_bytes=rollout_size,
+                    resume_limit_bytes=resume_limit,
+                )
+                logger.warning(
+                    "Skipping app-server validation for oversized Codex "
+                    "thread %s (size=%d limit=%d)",
+                    codex_thread_id,
+                    rollout_size,
+                    resume_limit,
+                )
+                continue
+            try:
                 payload = await codex_app_server_client.thread_read(
-                    thread_id=codex_thread_id
+                    thread_id=codex_thread_id,
+                    timeout=10.0,
+                    include_turns=False,
                 )
             except Exception as e:
                 logger.warning(
@@ -3786,12 +4076,22 @@ class SessionManager:
                 if state.codex_thread_id == codex_thread_id:
                     state.codex_thread_id = ""
                     state.codex_active_turn_id = ""
+                    if codex_thread_id in oversized_thread_ids:
+                        self.mark_window_pending_session_start_reason(
+                            window_id,
+                            "oversized_rollover",
+                        )
 
-        for state in self.window_states.values():
+        for window_id, state in self.window_states.items():
             codex_thread_id = state.codex_thread_id.strip()
             if codex_thread_id and codex_thread_id in invalid_thread_ids:
                 state.codex_thread_id = ""
                 state.codex_active_turn_id = ""
+                if codex_thread_id in oversized_thread_ids:
+                    self.mark_window_pending_session_start_reason(
+                        window_id,
+                        "oversized_rollover",
+                    )
                 changed = True
 
         if changed:
@@ -4031,48 +4331,38 @@ class SessionManager:
         reasoning_effort: str = "",
         service_tier: str = "",
     ) -> dict[str, Any]:
-        """Start a turn with one guarded retry for transient timeout cases."""
-        attempts = APP_SERVER_TURN_START_MAX_ATTEMPTS
-        last_err: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                turn_kwargs: dict[str, Any] = {}
-                if model_slug:
-                    turn_kwargs["model"] = model_slug
-                if reasoning_effort:
-                    turn_kwargs["effort"] = reasoning_effort
-                return await codex_app_server_client.turn_start(
-                    thread_id=thread_id,
-                    inputs=inputs,
-                    approval_policy=approval_policy,
-                    service_tier=service_tier.strip() or None,
-                    timeout=APP_SERVER_TURN_START_TIMEOUT_SECONDS,
-                    **turn_kwargs,
+        """Start a turn once; timeout outcomes are uncertain and never replayed."""
+        turn_kwargs: dict[str, Any] = {}
+        if model_slug:
+            turn_kwargs["model"] = model_slug
+        if reasoning_effort:
+            turn_kwargs["effort"] = reasoning_effort
+        try:
+            return await codex_app_server_client.turn_start(
+                thread_id=thread_id,
+                inputs=inputs,
+                approval_policy=approval_policy,
+                service_tier=service_tier.strip() or None,
+                timeout=APP_SERVER_TURN_START_TIMEOUT_SECONDS,
+                **turn_kwargs,
+            )
+        except Exception as error:
+            if self._is_turn_start_timeout(error):
+                # A notification can prove that the server accepted the turn
+                # even when its response frame was lost. Otherwise the outcome
+                # remains uncertain and must be surfaced without replay.
+                existing_turn = codex_app_server_client.get_active_turn_id(
+                    thread_id
                 )
-            except Exception as e:
-                last_err = e
-                if not self._is_turn_start_timeout(e) or attempt >= attempts:
-                    raise
-                # If the server started a turn but the response frame was delayed/lost,
-                # use tracked active turn and avoid duplicate turn/start submission.
-                existing_turn = codex_app_server_client.get_active_turn_id(thread_id)
                 if existing_turn:
                     logger.warning(
-                        "turn/start timed out but active turn already exists (thread=%s turn=%s); treating as success",
+                        "turn/start timed out but active turn already exists "
+                        "(thread=%s turn=%s); treating as success",
                         thread_id,
                         existing_turn,
                     )
                     return {"turn": {"id": existing_turn}}
-                logger.warning(
-                    "turn/start timeout (thread=%s attempt=%d/%d), retrying once",
-                    thread_id,
-                    attempt,
-                    attempts,
-                )
-                await asyncio.sleep(APP_SERVER_TURN_START_RETRY_DELAY_SECONDS)
-        if last_err:
-            raise last_err
-        raise CodexAppServerError("turn/start failed without an explicit error")
+            raise
 
     async def _ensure_codex_thread_for_window(
         self,
@@ -4182,22 +4472,143 @@ class SessionManager:
         cwd: str,
     ) -> str:
         """Resume latest Codex session for cwd and bind it to a window."""
-        latest_thread_id = self.get_latest_codex_session_id_for_cwd(cwd)
-        if not latest_thread_id:
+        discovered = self._find_latest_session_for_cwd(cwd)
+        if not discovered:
+            return ""
+        latest_thread_id, rollout_path = discovered
+
+        try:
+            rollout_size = rollout_path.stat().st_size
+        except OSError as exc:
+            raise CodexAppServerError(
+                f"Cannot safely resume Codex thread {latest_thread_id}: "
+                f"failed to stat transcript {rollout_path}"
+            ) from exc
+        resume_limit = int(config.codex_max_resume_bytes)
+        if rollout_size > resume_limit:
+            self.set_window_codex_thread_id(window_id, "")
+            self.mark_window_pending_session_start_reason(
+                window_id,
+                "oversized_rollover",
+            )
+            emit_telemetry(
+                "transport.app_server.oversized_resume_rollover",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                window_id=window_id,
+                cwd=cwd,
+                thread_id=latest_thread_id,
+                rollout_path=str(rollout_path),
+                rollout_size_bytes=rollout_size,
+                resume_limit_bytes=resume_limit,
+            )
+            logger.warning(
+                "Skipping oversized Codex resume for %s "
+                "(thread=%s size=%d limit=%d); starting a fresh thread",
+                window_id,
+                latest_thread_id,
+                rollout_size,
+                resume_limit,
+            )
             return ""
 
-        result = await codex_app_server_client.thread_resume(thread_id=latest_thread_id)
+        return await self.resume_codex_session_for_window(
+            window_id=window_id,
+            cwd=cwd,
+            thread_id=latest_thread_id,
+        )
+
+    async def resume_codex_session_for_window(
+        self,
+        *,
+        window_id: str,
+        cwd: str,
+        thread_id: str,
+    ) -> str:
+        """Safely resume one Codex rollout and bind it to a window."""
+        normalized_thread_id = thread_id.strip()
+        if not normalized_thread_id:
+            raise CodexAppServerError("Codex thread id is required for resume")
+
+        rollout_path = self._find_codex_session_file_for_thread(
+            normalized_thread_id,
+            cwd=cwd,
+        )
+        if rollout_path is None:
+            raise CodexAppServerError(
+                f"Cannot safely resume Codex thread {normalized_thread_id}: "
+                "local transcript was not found"
+            )
+        try:
+            rollout_size = rollout_path.stat().st_size
+        except OSError as exc:
+            raise CodexAppServerError(
+                f"Cannot safely resume Codex thread {normalized_thread_id}: "
+                f"failed to stat transcript {rollout_path}"
+            ) from exc
+        resume_limit = int(config.codex_max_resume_bytes)
+        if rollout_size > resume_limit:
+            raise CodexAppServerError(
+                f"Codex transcript exceeds resume limit "
+                f"({rollout_size} > {resume_limit} bytes): {normalized_thread_id}"
+            )
+
+        state = self.get_window_state(window_id)
+        known_turn_id = (
+            state.codex_active_turn_id.strip()
+            if state.codex_thread_id.strip() == normalized_thread_id
+            else ""
+        )
+        known_transport_state = self.get_window_codex_transport_state(window_id)
+        result = await codex_app_server_client.thread_resume(
+            thread_id=normalized_thread_id
+        )
         resumed_thread_id = self._extract_lifecycle_thread_id(
             result,
-            fallback=latest_thread_id,
+            fallback=normalized_thread_id,
         )
         if not resumed_thread_id:
             return ""
-        resumed_turn_id = self._extract_lifecycle_turn_id(result)
+        current_transport_state = self._normalize_codex_transport_snapshot(
+            codex_app_server_client.transport_state_snapshot()
+        )
+        known_turn_is_current = bool(
+            known_turn_id
+            and state.codex_thread_id.strip() == resumed_thread_id
+            and state.codex_active_turn_id.strip() == known_turn_id
+            and current_transport_state[0]
+            and known_transport_state == current_transport_state
+        )
+        resumed_turn_id = (
+            self._extract_lifecycle_turn_id(result)
+            or (
+                codex_app_server_client.get_active_turn_id(resumed_thread_id)
+                or ""
+            ).strip()
+            or (known_turn_id if known_turn_is_current else "")
+        )
+        if known_turn_id and not resumed_turn_id:
+            emit_telemetry(
+                "transport.app_server.resume_stale_turn_dropped",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                window_id=window_id,
+                thread_id=resumed_thread_id,
+                known_transport_epoch=known_transport_state[0],
+                known_transport_generation=known_transport_state[2],
+                current_transport_epoch=current_transport_state[0],
+                current_transport_generation=current_transport_state[2],
+            )
         self.set_window_codex_thread_id(window_id, resumed_thread_id)
         self.set_window_codex_active_turn_id(window_id, resumed_turn_id)
+        if current_transport_state[0]:
+            self.set_window_codex_transport_state(
+                window_id,
+                epoch=current_transport_state[0],
+                epoch_started_at=current_transport_state[1],
+                generation=current_transport_state[2],
+            )
         self.mark_window_pending_session_start_reason(window_id, "resume")
-        state = self.get_window_state(window_id)
         if cwd and state.cwd != cwd:
             state.cwd = cwd
             self._save_state()
@@ -4207,7 +4618,7 @@ class SessionManager:
             cwd=cwd,
         )
         logger.info(
-            "Resumed latest Codex thread for window %s (cwd=%s): %s",
+            "Resumed Codex thread for window %s (cwd=%s): %s",
             window_id,
             cwd,
             resumed_thread_id,
@@ -4333,7 +4744,7 @@ class SessionManager:
             )
         return ok, msg
 
-    async def _retry_send_after_steer_timeout(
+    async def _retry_send_after_no_active_turn(
         self,
         *,
         window_id: str,
@@ -4347,18 +4758,19 @@ class SessionManager:
         reasoning_effort: str = "",
         service_tier: str = "",
     ) -> tuple[bool, str]:
-        """Clear stale active turn and retry once via turn/start."""
+        """Clear a definitively stale active turn and retry once via turn/start."""
         if thread_id:
             codex_app_server_client.clear_active_turn(thread_id)
         self.clear_window_codex_turn(window_id)
 
         logger.warning(
-            "App-server turn/steer timed out for %s (%s), retrying with turn/start",
+            "App-server rejected stale active turn for %s (%s); "
+            "retrying with turn/start",
             window_id,
             self.get_display_name(window_id),
         )
         emit_telemetry(
-            "transport.app_server.steer_timeout_retry",
+            "transport.app_server.no_active_turn_retry",
             runtime_mode=config.runtime_mode,
             codex_transport=config.codex_transport,
             window_id=window_id,
@@ -4385,7 +4797,7 @@ class SessionManager:
         )
         if ok:
             emit_telemetry(
-                "transport.app_server.steer_timeout_recovered",
+                "transport.app_server.no_active_turn_recovered",
                 runtime_mode=config.runtime_mode,
                 codex_transport=config.codex_transport,
                 window_id=window_id,
@@ -4396,7 +4808,7 @@ class SessionManager:
             )
         else:
             emit_telemetry(
-                "transport.app_server.steer_timeout_recovery_failed",
+                "transport.app_server.no_active_turn_recovery_failed",
                 runtime_mode=config.runtime_mode,
                 codex_transport=config.codex_transport,
                 window_id=window_id,
@@ -4612,9 +5024,29 @@ class SessionManager:
                             error_text = (
                                 f"{error_text}; retry with new thread failed: {retry_error}"
                             )
-                    elif self._is_turn_steer_timeout_error(e) or self._is_no_active_turn_error(e):
+                    elif self._is_turn_steer_timeout_error(e):
+                        if stale_thread_id:
+                            codex_app_server_client.clear_active_turn(
+                                stale_thread_id
+                            )
+                        self.clear_window_codex_turn(window_id)
+                        emit_telemetry(
+                            "transport.app_server.steer_timeout_uncertain",
+                            runtime_mode=config.runtime_mode,
+                            codex_transport=config.codex_transport,
+                            window_id=window_id,
+                            display=display,
+                            steer=steer,
+                            stale_turn_id=stale_turn_id,
+                            thread_id=stale_thread_id,
+                        )
+                        error_text = (
+                            f"{error_text}; transport recycled and the "
+                            "uncertain request was not replayed"
+                        )
+                    elif self._is_no_active_turn_error(e):
                         try:
-                            return await self._retry_send_after_steer_timeout(
+                            return await self._retry_send_after_no_active_turn(
                                 window_id=window_id,
                                 inputs=inputs,
                                 window_name=window_name,
@@ -4626,7 +5058,7 @@ class SessionManager:
                             )
                         except Exception as retry_error:
                             emit_telemetry(
-                                "transport.app_server.steer_timeout_recovery_failed",
+                                "transport.app_server.no_active_turn_recovery_failed",
                                 runtime_mode=config.runtime_mode,
                                 codex_transport=config.codex_transport,
                                 window_id=window_id,

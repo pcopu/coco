@@ -1,7 +1,10 @@
 """Tests for no-response watchdog checkpoint tracking."""
 
+from types import SimpleNamespace
+
 import pytest
 
+import coco.bot as bot
 import coco.handlers.run_watchdog as watchdog
 
 
@@ -307,7 +310,7 @@ def test_legacy_monotonic_retry_state_is_discarded_after_restart():
     assert due_30[0].retry_count == 0
 
 
-def test_activity_clears_pending_state_and_retry_counter():
+def test_activity_resets_silence_clock_without_clearing_state():
     _clear()
     watchdog.note_run_started(
         user_id=3,
@@ -317,55 +320,223 @@ def test_activity_clears_pending_state_and_retry_counter():
         expect_response=True,
         pending_text="check",
         now=0.0,
-    )
-    watchdog.get_due_run_checks(
-        user_id=3,
-        thread_id=30,
-        window_id="@3",
-        now=30.0,
-    )
-    watchdog.note_auto_retry_attempt(
-        user_id=3,
-        thread_id=30,
-        window_id="@3",
-        now=30.1,
     )
     watchdog.note_run_activity(
         user_id=3,
         thread_id=30,
         window_id="@3",
-        source="assistant_text",
-        now=35.0,
+        source="assistant_progress",
+        now=20.0,
     )
+
     assert watchdog.get_due_run_checks(
         user_id=3,
         thread_id=30,
         window_id="@3",
-        now=300.0,
+        now=49.0,
     ) == []
 
-    watchdog.reset_run_watchdog_for_tests(clear_persisted=False)
-    watchdog.note_run_started(
-        user_id=3,
-        thread_id=30,
-        window_id="@3",
-        source="user_input",
-        expect_response=True,
-        pending_text="check",
-        now=500.0,
-    )
     due_30 = watchdog.get_due_run_checks(
         user_id=3,
         thread_id=30,
         window_id="@3",
-        now=530.0,
+        now=50.0,
+    )
+
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+    assert due_30[0].elapsed_seconds == 30.0
+
+
+def test_post_activity_check_never_auto_resends():
+    _clear()
+    watchdog.note_run_started(
+        user_id=3,
+        thread_id=31,
+        window_id="@3",
+        source="user_input",
+        expect_response=True,
+        pending_text="check",
+        now=0.0,
+    )
+    watchdog.note_run_activity(
+        user_id=3,
+        thread_id=31,
+        window_id="@3",
+        source="assistant_progress",
+        now=5.0,
+    )
+
+    due_30 = watchdog.get_due_run_checks(
+        user_id=3,
+        thread_id=31,
+        window_id="@3",
+        now=35.0,
+    )
+
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+    assert due_30[0].auto_retry_allowed is False
+
+
+def test_non_response_start_does_not_clear_existing_watch():
+    _clear()
+    watchdog.note_run_started(
+        user_id=3,
+        thread_id=32,
+        window_id="@3",
+        source="user_input",
+        expect_response=True,
+        pending_text="check",
+        now=0.0,
+    )
+    watchdog.note_run_started(
+        user_id=3,
+        thread_id=32,
+        window_id="@3",
+        source="slash:status",
+        expect_response=False,
+        pending_text="/status",
+        now=10.0,
+    )
+
+    due_30 = watchdog.get_due_run_checks(
+        user_id=3,
+        thread_id=32,
+        window_id="@3",
+        now=30.0,
+    )
+
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+
+
+@pytest.mark.asyncio
+async def test_successful_forwarded_clear_disarms_existing_watch(monkeypatch):
+    user_id = 3
+    thread_id = 33
+    window_id = "@3"
+    watchdog.note_run_started(
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        source="user_input",
+        expect_response=True,
+        pending_text="do not replay after clear",
+        now=0.0,
+    )
+
+    async def _send_action(_action):
+        return None
+
+    chat = SimpleNamespace(
+        id=-1003,
+        type="supergroup",
+        send_action=_send_action,
+    )
+    message = SimpleNamespace(
+        text="/clear",
+        message_thread_id=thread_id,
+        chat=chat,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_message=message,
+        message=message,
+    )
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _user_id: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda *_args, **_kwargs: window_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-3",
+            cwd="/tmp/project",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_display_name",
+        lambda _window_id: "topic",
+    )
+
+    async def _send_to_window(_window_id, _text):
+        return True, "ok"
+
+    monkeypatch.setattr(bot.session_manager, "send_to_window", _send_to_window)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "clear_window_session",
+        lambda _window_id: None,
+    )
+
+    async def _safe_reply(_message, _text, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.forward_command_handler(update, SimpleNamespace())
+
+    assert watchdog.get_due_run_checks(
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        now=30.0,
+    ) == []
+
+
+def test_clear_run_watch_state_honors_window_ownership():
+    watchdog.note_run_started(
+        user_id=3,
+        thread_id=34,
+        window_id="@new",
+        source="user_input",
+        expect_response=True,
+        pending_text="still owned by the new window",
+        now=0.0,
+    )
+
+    assert (
+        watchdog.clear_run_watch_state(
+            3,
+            34,
+            window_id="@old",
+        )
+        is False
+    )
+    due_30 = watchdog.get_due_run_checks(
+        user_id=3,
+        thread_id=34,
+        window_id="@new",
+        now=30.0,
     )
     assert [item.checkpoint_seconds for item in due_30] == [30]
-    assert due_30[0].auto_retry_allowed is True
-    assert due_30[0].retry_count == 0
+
+    assert (
+        watchdog.clear_run_watch_state(
+            3,
+            34,
+            window_id="@new",
+        )
+        is True
+    )
+    assert watchdog.get_due_run_checks(
+        user_id=3,
+        thread_id=34,
+        window_id="@new",
+        now=60.0,
+    ) == []
 
 
-def test_completion_clears_pending_state():
+def test_completion_after_activity_remains_terminal():
     _clear()
     watchdog.note_run_started(
         user_id=4,
@@ -376,11 +547,26 @@ def test_completion_clears_pending_state():
         pending_text="check",
         now=0.0,
     )
+    watchdog.note_run_activity(
+        user_id=4,
+        thread_id=40,
+        window_id="@4",
+        source="assistant_progress",
+        now=10.0,
+    )
+    due_30 = watchdog.get_due_run_checks(
+        user_id=4,
+        thread_id=40,
+        window_id="@4",
+        now=40.0,
+    )
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+
     watchdog.note_run_completed(
         user_id=4,
         thread_id=40,
         reason="done",
-        now=10.0,
+        now=41.0,
     )
     assert watchdog.get_due_run_checks(
         user_id=4,
@@ -388,6 +574,35 @@ def test_completion_clears_pending_state():
         window_id="@4",
         now=300.0,
     ) == []
+
+
+def test_transport_uncertainty_suppresses_replay_without_known_turn_id():
+    _clear()
+    watchdog.note_run_started(
+        user_id=5,
+        thread_id=50,
+        window_id="@5",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+
+    watchdog.note_transport_reset_uncertainty(
+        window_ids={"@5"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    due_30 = watchdog.get_due_run_checks(
+        user_id=5,
+        thread_id=50,
+        window_id="@5",
+        now=35.0,
+    )
+    assert [item.checkpoint_seconds for item in due_30] == [30]
+    assert due_30[0].auto_retry_allowed is False
+    assert due_30[0].auto_retry_reason == "transport_uncertain"
     _clear()
 
 

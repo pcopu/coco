@@ -13,6 +13,12 @@ HeartbeatHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 NotificationHandler = Callable[[dict[str, Any]], Awaitable[None]]
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 
+CODEX_TRANSPORT_PROTOCOL_VERSION = 1
+CODEX_TRANSPORT_PROTOCOL_VERSION_KEY = (
+    "codex_transport_protocol_version"
+)
+REMOTE_CODEX_MACHINE_CONTEXT_KEY = "_coco_remote_machine_id"
+
 
 class ControllerRpcServer:
     """Controller listener used by remote agents for heartbeats and app-server events."""
@@ -67,23 +73,43 @@ class ControllerRpcClient:
         )
         return result if isinstance(result, dict) else None
 
-    async def notification(self, *, method: str, params: dict[str, Any]) -> None:
+    async def notification(
+        self,
+        *,
+        method: str,
+        params: dict[str, Any],
+        transport: dict[str, Any] | None = None,
+    ) -> None:
         if not config.controller_rpc_host:
             raise ClusterRpcError("controller RPC host is not configured")
         await self._client.call(
             host=config.controller_rpc_host,
             port=config.controller_rpc_port,
             method="controller/notification",
-            params={"method": method, "params": params},
+            params={
+                "method": method,
+                "params": params,
+                **({"transport": transport} if transport is not None else {}),
+            },
         )
 
-    async def request(self, *, method: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    async def request(
+        self,
+        *,
+        method: str,
+        params: dict[str, Any],
+        transport: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not config.controller_rpc_host:
             raise ClusterRpcError("controller RPC host is not configured")
         result = await self._client.call(
             host=config.controller_rpc_host,
             port=config.controller_rpc_port,
             method="controller/request",
-            params={"method": method, "params": params},
+            params={
+                "method": method,
+                "params": params,
+                **({"transport": transport} if transport is not None else {}),
+            },
         )
         return result if isinstance(result, dict) else None

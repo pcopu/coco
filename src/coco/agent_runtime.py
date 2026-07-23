@@ -7,21 +7,67 @@ import contextlib
 import logging
 
 from .agent_rpc import AgentRpcServer
-from .codex_app_server import codex_app_server_client
+from .codex_app_server import (
+    INTERNAL_TRANSPORT_CONTEXT_KEY,
+    codex_app_server_client,
+)
 from .config import config
-from .controller_rpc import ControllerRpcClient
+from .controller_rpc import (
+    CODEX_TRANSPORT_PROTOCOL_VERSION,
+    CODEX_TRANSPORT_PROTOCOL_VERSION_KEY,
+    ControllerRpcClient,
+)
 from .node_registry import node_registry
+from .session import session_manager
 from .tts_runtime import stop_tts_server
 
 
 logger = logging.getLogger(__name__)
 
 
+def _forwarded_transport_context(
+    params: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    forwarded_params = dict(params)
+    raw_context = forwarded_params.pop(INTERNAL_TRANSPORT_CONTEXT_KEY, None)
+    context = (
+        dict(raw_context)
+        if isinstance(raw_context, dict)
+        else codex_app_server_client.transport_state_snapshot()
+    )
+    context["machine_id"] = config.machine_id
+    return forwarded_params, context
+
+
 async def _heartbeat_loop(controller_client: ControllerRpcClient) -> None:
     while True:
         try:
             node = node_registry.ensure_local_node(transport="agent_rpc")
-            await controller_client.heartbeat(node.to_dict())
+            payload = node.to_dict()
+            transport_state = codex_app_server_client.transport_state_snapshot()
+            payload.update(
+                {
+                    CODEX_TRANSPORT_PROTOCOL_VERSION_KEY: (
+                        CODEX_TRANSPORT_PROTOCOL_VERSION
+                    ),
+                    "codex_transport_epoch": transport_state["epoch"],
+                    "codex_transport_epoch_started_at": transport_state[
+                        "epoch_started_at"
+                    ],
+                    "codex_transport_generation": transport_state["generation"],
+                    "codex_transport_reset_sequence": transport_state[
+                        "reset_sequence"
+                    ],
+                    "codex_last_reset_generation": transport_state[
+                        "last_reset_generation"
+                    ],
+                    "codex_last_reset_reason": transport_state[
+                        "last_reset_reason"
+                    ],
+                    "codex_last_reset_at": transport_state["last_reset_at"],
+                }
+            )
+            await controller_client.heartbeat(payload)
         except Exception as exc:
             logger.warning("Agent heartbeat failed: %s", exc)
         await asyncio.sleep(max(5.0, float(config.node_heartbeat_interval)))
@@ -43,31 +89,118 @@ async def run_agent_async() -> None:
 
     controller_client: ControllerRpcClient | None = None
     heartbeat_task: asyncio.Task[None] | None = None
+    reset_report_tasks: set[asyncio.Task[None]] = set()
+
+    async def _report_transport_reset(
+        *,
+        machine_id: str,
+        reason: str,
+        generation: int,
+        reset_sequence: int,
+        transport_epoch: str,
+        transport_epoch_started_at: float,
+    ) -> None:
+        if controller_client is None:
+            return
+        try:
+            await controller_client.notification(
+                method="coco/transportReset",
+                params={
+                    "machineId": machine_id,
+                    "reason": reason,
+                    "generation": generation,
+                    "resetSequence": reset_sequence,
+                    "transportEpoch": transport_epoch,
+                    "transportEpochStartedAt": transport_epoch_started_at,
+                },
+                transport={
+                    "machine_id": machine_id,
+                    **codex_app_server_client.transport_state_snapshot(),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed reporting app-server transport reset to controller; "
+                "the next heartbeat will reconcile it: %s",
+                exc,
+            )
+
+    async def _transport_reset_handler(reason: str, generation: int) -> None:
+        local_machine_id, _local_machine_name = (
+            session_manager._local_machine_identity()
+        )
+        cleared_turns = session_manager.clear_window_codex_turns_for_machine(
+            local_machine_id
+        )
+        logger.warning(
+            "Codex app-server transport reset "
+            "(reason=%s generation=%d cleared_turns=%d)",
+            reason,
+            generation,
+            cleared_turns,
+        )
+        if controller_client is not None:
+            transport_state = codex_app_server_client.transport_state_snapshot()
+            reset_sequence = int(transport_state["reset_sequence"])
+            task = asyncio.create_task(
+                _report_transport_reset(
+                    machine_id=local_machine_id,
+                    reason=reason,
+                    generation=generation,
+                    reset_sequence=reset_sequence,
+                    transport_epoch=str(transport_state["epoch"]),
+                    transport_epoch_started_at=float(
+                        transport_state["epoch_started_at"]
+                    ),
+                )
+            )
+            reset_report_tasks.add(task)
+            task.add_done_callback(reset_report_tasks.discard)
+
     if config.controller_rpc_host:
         controller_client = ControllerRpcClient(shared_secret=config.cluster_shared_secret)
 
         async def _notification_forwarder(method: str, params: dict[str, object]) -> None:
             assert controller_client is not None
-            await controller_client.notification(method=method, params=params)
+            forwarded_params, transport = _forwarded_transport_context(params)
+            await controller_client.notification(
+                method=method,
+                params=forwarded_params,
+                transport=transport,
+            )
 
         async def _request_forwarder(
             method: str,
             params: dict[str, object],
         ) -> dict[str, object] | None:
             assert controller_client is not None
-            return await controller_client.request(method=method, params=params)
+            forwarded_params, transport = _forwarded_transport_context(params)
+            return await controller_client.request(
+                method=method,
+                params=forwarded_params,
+                transport=transport,
+            )
 
         await codex_app_server_client.set_handlers(
             notification_handler=_notification_forwarder,
             server_request_handler=_request_forwarder,
+            transport_reset_handler=_transport_reset_handler,
         )
         heartbeat_task = asyncio.create_task(_heartbeat_loop(controller_client))
     else:
+        set_handlers = getattr(codex_app_server_client, "set_handlers", None)
+        if set_handlers is not None:
+            await set_handlers(transport_reset_handler=_transport_reset_handler)
         logger.warning("COCO_CONTROLLER_RPC_HOST is unset; agent will not report upstream")
 
     try:
         await asyncio.Event().wait()
     finally:
+        pending_reset_reports = list(reset_report_tasks)
+        for task in pending_reset_reports:
+            task.cancel()
+        if pending_reset_reports:
+            await asyncio.gather(*pending_reset_reports, return_exceptions=True)
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

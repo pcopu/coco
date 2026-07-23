@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 NODE_STATUS_ONLINE = "online"
 NODE_STATUS_OFFLINE = "offline"
 NODE_STATUS_DEGRADED = "degraded"
+_CODEX_TRANSPORT_PROTOCOL_VERSION_KEY = (
+    "codex_transport_protocol_version"
+)
+_CODEX_TRANSPORT_LEGACY_CONFIRMATION_HEARTBEATS = 2
 
 
 def _coerce_int(value: object, *, default: int = 0) -> int:
@@ -84,6 +88,8 @@ class NodeRecord:
     controller_capable: bool = False
     controller_active: bool = False
     preferred_controller: bool = False
+    codex_transport_protocol_missing_heartbeats: int = 0
+    codex_transport_legacy_confirmed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -109,6 +115,12 @@ class NodeRecord:
             payload["runtime"] = dict(self.runtime)
         if self.agent_version:
             payload["agent_version"] = self.agent_version
+        if self.codex_transport_protocol_missing_heartbeats > 0:
+            payload["codex_transport_protocol_missing_heartbeats"] = (
+                self.codex_transport_protocol_missing_heartbeats
+            )
+        if self.codex_transport_legacy_confirmed:
+            payload["codex_transport_legacy_confirmed"] = True
         return payload
 
     @classmethod
@@ -145,6 +157,18 @@ class NodeRecord:
             controller_capable=_coerce_bool(data.get("controller_capable", False)),
             controller_active=_coerce_bool(data.get("controller_active", False)),
             preferred_controller=_coerce_bool(data.get("preferred_controller", False)),
+            codex_transport_protocol_missing_heartbeats=max(
+                0,
+                _coerce_int(
+                    data.get(
+                        "codex_transport_protocol_missing_heartbeats",
+                        0,
+                    )
+                ),
+            ),
+            codex_transport_legacy_confirmed=_coerce_bool(
+                data.get("codex_transport_legacy_confirmed", False)
+            ),
         )
 
 
@@ -262,6 +286,7 @@ class NodeRegistry:
         controller_capable: bool = False,
         controller_active: bool = False,
         preferred_controller: bool = False,
+        codex_transport_protocol_advertised: bool | None = None,
         now: float | None = None,
     ) -> NodeRecord:
         normalized_id = machine_id.strip()
@@ -271,6 +296,75 @@ class NodeRegistry:
         timestamp = time.time() if now is None else float(now)
         existing = self._nodes.get(normalized_id)
         old_status = existing.status if existing is not None else NODE_STATUS_ONLINE
+        normalized_runtime = dict(runtime or {})
+        incoming_has_protocol = (
+            _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY in normalized_runtime
+        )
+        protocol_observation = codex_transport_protocol_advertised
+        if protocol_observation is None and incoming_has_protocol:
+            protocol_observation = True
+        missing_heartbeats = (
+            existing.codex_transport_protocol_missing_heartbeats
+            if existing is not None
+            else 0
+        )
+        legacy_confirmed = (
+            existing.codex_transport_legacy_confirmed
+            if existing is not None
+            else False
+        )
+        existing_protocol_version = (
+            max(
+                1,
+                _coerce_int(
+                    existing.runtime.get(
+                        _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+                    )
+                ),
+            )
+            if existing is not None
+            and _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+            in existing.runtime
+            else 0
+        )
+
+        if protocol_observation is True:
+            normalized_runtime[_CODEX_TRANSPORT_PROTOCOL_VERSION_KEY] = max(
+                1,
+                existing_protocol_version,
+                _coerce_int(
+                    normalized_runtime.get(
+                        _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+                    )
+                ),
+            )
+            missing_heartbeats = 0
+            legacy_confirmed = False
+        elif protocol_observation is False:
+            normalized_runtime.pop(
+                _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY,
+                None,
+            )
+            if existing_protocol_version > 0:
+                missing_heartbeats += 1
+                if (
+                    missing_heartbeats
+                    < _CODEX_TRANSPORT_LEGACY_CONFIRMATION_HEARTBEATS
+                ):
+                    normalized_runtime[
+                        _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+                    ] = existing_protocol_version
+                else:
+                    missing_heartbeats = 0
+                    legacy_confirmed = True
+            elif not legacy_confirmed:
+                missing_heartbeats = 0
+        elif existing_protocol_version > 0:
+            # Non-heartbeat refreshes (for example stale-node probes) cannot
+            # downgrade a protocol capability by omission.
+            normalized_runtime[
+                _CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+            ] = existing_protocol_version
         record = NodeRecord(
             machine_id=normalized_id,
             display_name=normalized_display,
@@ -279,7 +373,7 @@ class NodeRegistry:
             last_seen_ts=timestamp,
             browse_roots=list(browse_roots or []),
             capabilities=list(capabilities or []),
-            runtime=dict(runtime or {}),
+            runtime=normalized_runtime,
             agent_version=agent_version.strip(),
             transport=transport.strip() or "local",
             rpc_host=rpc_host.strip(),
@@ -288,6 +382,8 @@ class NodeRegistry:
             controller_capable=controller_capable,
             controller_active=controller_active,
             preferred_controller=preferred_controller,
+            codex_transport_protocol_missing_heartbeats=missing_heartbeats,
+            codex_transport_legacy_confirmed=legacy_confirmed,
         )
         self._nodes[normalized_id] = record
         self._save()

@@ -161,6 +161,108 @@ def test_ensure_local_node_includes_runtime_capabilities(tmp_path, monkeypatch):
     }
 
 
+def test_transport_protocol_runtime_version_is_sticky_and_monotonic(tmp_path):
+    registry = NodeRegistry(state_file=tmp_path / "nodes.json")
+    common = {
+        "machine_id": "remote-node",
+        "display_name": "Remote Node",
+        "transport": "agent_rpc",
+        "is_local": False,
+    }
+
+    registry.note_heartbeat(
+        **common,
+        runtime={"codex_transport_protocol_version": 2},
+        now=1.0,
+    )
+    registry.note_heartbeat(
+        **common,
+        runtime={
+            "codex_transport_protocol_version": 1,
+            "tts": {"available": True},
+        },
+        now=2.0,
+    )
+    registry.note_heartbeat(
+        **common,
+        runtime={"tts": {"available": False}},
+        codex_transport_protocol_advertised=False,
+        now=3.0,
+    )
+
+    node = registry.get_node("remote-node")
+    assert node is not None
+    assert node.runtime == {
+        "codex_transport_protocol_version": 2,
+        "tts": {"available": False},
+    }
+    assert node.codex_transport_protocol_missing_heartbeats == 1
+    assert node.codex_transport_legacy_confirmed is False
+
+    restored = NodeRegistry(state_file=tmp_path / "nodes.json")
+    restored_node = restored.get_node("remote-node")
+    assert restored_node is not None
+    assert restored_node.runtime["codex_transport_protocol_version"] == 2
+    assert restored_node.codex_transport_protocol_missing_heartbeats == 1
+
+    downgraded = restored.note_heartbeat(
+        **common,
+        runtime={"tts": {"available": False}},
+        codex_transport_protocol_advertised=False,
+        now=4.0,
+    )
+
+    assert "codex_transport_protocol_version" not in downgraded.runtime
+    assert downgraded.codex_transport_protocol_missing_heartbeats == 0
+    assert downgraded.codex_transport_legacy_confirmed is True
+
+    restored_downgrade = NodeRegistry(state_file=tmp_path / "nodes.json")
+    restored_downgraded_node = restored_downgrade.get_node("remote-node")
+    assert restored_downgraded_node is not None
+    assert restored_downgraded_node.codex_transport_legacy_confirmed is True
+    assert (
+        "codex_transport_protocol_version"
+        not in restored_downgraded_node.runtime
+    )
+
+    reupgraded = restored_downgrade.note_heartbeat(
+        **common,
+        runtime={"codex_transport_protocol_version": 1},
+        codex_transport_protocol_advertised=True,
+        now=5.0,
+    )
+    assert reupgraded.runtime["codex_transport_protocol_version"] == 1
+    assert reupgraded.codex_transport_legacy_confirmed is False
+
+
+def test_unqualified_registry_update_cannot_downgrade_transport_protocol(
+    tmp_path,
+):
+    registry = NodeRegistry(state_file=tmp_path / "nodes.json")
+    common = {
+        "machine_id": "remote-node",
+        "display_name": "Remote Node",
+        "transport": "agent_rpc",
+        "is_local": False,
+    }
+    registry.note_heartbeat(
+        **common,
+        runtime={"codex_transport_protocol_version": 1},
+        codex_transport_protocol_advertised=True,
+        now=1.0,
+    )
+
+    node = registry.note_heartbeat(
+        **common,
+        runtime={"tts": {"available": True}},
+        now=2.0,
+    )
+
+    assert node.runtime["codex_transport_protocol_version"] == 1
+    assert node.codex_transport_protocol_missing_heartbeats == 0
+    assert node.codex_transport_legacy_confirmed is False
+
+
 def test_registry_load_tolerates_malformed_persisted_endpoint_and_flags(tmp_path):
     state_file = tmp_path / "nodes.json"
     state_file.write_text(

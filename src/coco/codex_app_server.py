@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]]
+TransportResetHandler = Callable[[str, int], Awaitable[None]]
 
 # Default asyncio StreamReader limit (64 KiB) is too small for app-server
 # JSONL payloads that can inline generated images. Keep this above the largest
@@ -40,8 +42,10 @@ APP_SERVER_NOTIFICATION_DROP_WHEN_FULL = frozenset(
         "thread/tokenUsage/updated",
     }
 )
-TIMEOUT_RECYCLE_METHODS = frozenset({"thread/start", "turn/start", "turn/steer"})
+SAFE_TIMEOUT_RETRY_METHODS = frozenset({"account/rateLimits/read"})
+APP_SERVER_MUTATION_TIMEOUT_SECONDS = 20.0
 APP_SERVER_ENABLED_FEATURES = ("goals",)
+INTERNAL_TRANSPORT_CONTEXT_KEY = "__coco_transport"
 _APP_SERVER_START_FAILURE_FILE = coco_dir() / "app_server_start_failures.json"
 _APP_SERVER_OWNED_PIDS_DIR = coco_dir() / "app_server_owned_pids"
 _APP_SERVER_START_FAILURE_WINDOW_SECONDS = 15 * 60
@@ -67,6 +71,7 @@ class CodexAppServerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
         self._notification_delivery_tasks: set[asyncio.Task[None]] = set()
+        self._server_request_tasks: set[asyncio.Task[None]] = set()
         self._notification_locks: dict[str, asyncio.Lock] = {}
         self._notification_active_partitions: set[str] = set()
         self._notification_partition_backlog: dict[
@@ -85,11 +90,13 @@ class CodexAppServerClient:
         )
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
+        self._recycle_lock = asyncio.Lock()
         self._request_id = 1
         self._pending: dict[str, asyncio.Future[Any]] = {}
 
         self._notification_handler: NotificationHandler | None = None
         self._server_request_handler: ServerRequestHandler | None = None
+        self._transport_reset_handler: TransportResetHandler | None = None
 
         self._active_turns: dict[str, str] = {}
         self._thread_token_usage: dict[str, dict[str, Any]] = {}
@@ -97,6 +104,14 @@ class CodexAppServerClient:
         self._initialized = False
         self._server_user_agent = ""
         self._transport_needs_restart = False
+        self._transport_epoch = uuid.uuid4().hex
+        self._transport_epoch_started_at = time.time()
+        self._transport_generation = 0
+        self._stop_sequence = 0
+        self._transport_reset_sequence = 0
+        self._last_transport_reset_generation = 0
+        self._last_transport_reset_reason = ""
+        self._last_transport_reset_at = 0.0
         self._systemd_unit_name = ""
 
     @staticmethod
@@ -191,98 +206,172 @@ class CodexAppServerClient:
         *,
         notification_handler: NotificationHandler | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        transport_reset_handler: TransportResetHandler | None = None,
     ) -> None:
         self._notification_handler = notification_handler
         self._server_request_handler = server_request_handler
+        self._transport_reset_handler = transport_reset_handler
 
     async def ensure_started(self) -> None:
         if self._is_transport_ready():
             return
 
         async with self._start_lock:
-            recovery_attempted = False
-            while True:
-                if self._is_transport_ready():
-                    return
+            await self._ensure_started_locked()
 
-                if self._proc and self._proc.returncode is None and (
-                    self._transport_needs_restart or not self._initialized
-                ):
-                    logger.warning(
-                        "Recycling unhealthy Codex app-server transport "
-                        "(initialized=%s, needs_restart=%s)",
-                        self._initialized,
-                        self._transport_needs_restart,
-                    )
-                    await self.stop()
+    async def _ensure_started_locked(self) -> None:
+        """Start and initialize a transport while holding ``_start_lock``."""
+        recovery_attempted = False
+        while True:
+            if self._is_transport_ready():
+                return
 
-                if not self._proc or self._proc.returncode is not None:
-                    argv = self._app_server_argv()
-                    logger.info("Starting Codex app-server: %s", argv)
-                    try:
-                        spawn_kwargs: dict[str, Any] = {
-                            "stdin": asyncio.subprocess.PIPE,
-                            "stdout": asyncio.subprocess.PIPE,
-                            "stderr": asyncio.subprocess.PIPE,
-                            "limit": APP_SERVER_STREAM_LIMIT,
-                        }
-                        app_server_env = self._app_server_env()
-                        if app_server_env is not None:
-                            spawn_kwargs["env"] = app_server_env
-                        self._proc = await asyncio.create_subprocess_exec(
-                            *argv,
-                            **spawn_kwargs,
-                        )
-                    except OSError as e:
-                        raise CodexAppServerError(
-                            f"Failed to start codex app-server: {e}"
-                        ) from e
+            if self._proc and self._proc.returncode is not None:
+                stale_generation = self._transport_generation
+                logger.warning(
+                    "Replacing exited Codex app-server transport "
+                    "(generation=%d returncode=%s)",
+                    stale_generation,
+                    self._proc.returncode,
+                )
+                await self._stop_locked()
+                await self._notify_transport_reset(
+                    "process_exited",
+                    stale_generation,
+                )
 
-                    self._remember_owned_pid(self._proc.pid)
-                    self._initialized = False
-                    self._server_user_agent = ""
-                    self._transport_needs_restart = False
-                    self._reader_task = asyncio.create_task(self._reader_loop())
-                    self._stderr_task = asyncio.create_task(self._stderr_loop())
-                    self._ensure_notification_worker()
+            if self._proc and self._proc.returncode is None and (
+                self._transport_needs_restart or not self._initialized
+            ):
+                stale_generation = self._transport_generation
+                logger.warning(
+                    "Recycling unhealthy Codex app-server transport "
+                    "(initialized=%s, needs_restart=%s)",
+                    self._initialized,
+                    self._transport_needs_restart,
+                )
+                await self._stop_locked()
+                await self._notify_transport_reset(
+                    "unhealthy_transport",
+                    stale_generation,
+                )
 
+            if not self._proc or self._proc.returncode is not None:
+                argv = self._app_server_argv()
+                logger.info("Starting Codex app-server: %s", argv)
                 try:
-                    await self._run_initialize_handshake()
-                    self._clear_start_failure_state()
-                    return
-                except Exception as exc:
-                    await self.stop()
-                    if recovery_attempted:
-                        raise
-                    if not await self._attempt_recovery_after_start_failure(exc):
-                        raise
-                    recovery_attempted = True
+                    spawn_kwargs: dict[str, Any] = {
+                        "stdin": asyncio.subprocess.PIPE,
+                        "stdout": asyncio.subprocess.PIPE,
+                        "stderr": asyncio.subprocess.PIPE,
+                        "limit": APP_SERVER_STREAM_LIMIT,
+                    }
+                    app_server_env = self._app_server_env()
+                    if app_server_env is not None:
+                        spawn_kwargs["env"] = app_server_env
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        **spawn_kwargs,
+                    )
+                except OSError as e:
+                    raise CodexAppServerError(
+                        f"Failed to start codex app-server: {e}"
+                    ) from e
+
+                self._remember_owned_pid(self._proc.pid)
+                self._transport_generation += 1
+                self._initialized = False
+                self._server_user_agent = ""
+                self._transport_needs_restart = False
+                self._reader_task = asyncio.create_task(self._reader_loop())
+                self._stderr_task = asyncio.create_task(self._stderr_loop())
+                self._ensure_notification_worker()
+
+            try:
+                await self._run_initialize_handshake()
+                self._clear_start_failure_state()
+                return
+            except Exception as exc:
+                await self._stop_locked()
+                if recovery_attempted:
+                    raise
+                if not await self._attempt_recovery_after_start_failure(exc):
+                    raise
+                recovery_attempted = True
 
     def is_running(self) -> bool:
         """Return whether the app-server process is currently running."""
         return bool(self._proc and self._proc.returncode is None)
 
     async def stop(self) -> None:
+        # Signal shutdown intent before waiting for the lifecycle lock. Timeout
+        # recyclers already queued on another lock must not restart afterward.
+        # This increment happens before the first await. Request dispatch checks
+        # it immediately before the synchronous stdin write, so an older queued
+        # request cannot cross the shutdown boundary.
+        self._stop_sequence += 1
+        async with self._start_lock:
+            stopped_generation = self._transport_generation
+            had_transport_state = bool(
+                self._proc is not None
+                or self._initialized
+                or self._active_turns
+            )
+            await self._stop_locked()
+            if had_transport_state:
+                await self._notify_transport_reset(
+                    "explicit_stop",
+                    stopped_generation,
+                )
+
+    async def _stop_locked(self) -> None:
+        """Stop one transport lifecycle while holding ``_start_lock``."""
         proc = self._proc
         self._proc = None
         systemd_unit_name = self._systemd_unit_name
         self._systemd_unit_name = ""
 
-        for task in (self._reader_task, self._stderr_task, self._notification_task):
-            if task:
-                task.cancel()
+        current_task = asyncio.current_task()
+        lifecycle_tasks = [
+            task
+            for task in (
+                self._reader_task,
+                self._stderr_task,
+                self._notification_task,
+            )
+            if task is not None and task is not current_task
+        ]
+        for task in lifecycle_tasks:
+            task.cancel()
         self._reader_task = None
         self._stderr_task = None
         self._notification_task = None
-        delivery_tasks = list(self._notification_delivery_tasks)
+        delivery_tasks = [
+            task
+            for task in self._notification_delivery_tasks
+            if task is not current_task
+        ]
+        server_request_tasks = [
+            task
+            for task in self._server_request_tasks
+            if task is not current_task
+        ]
         self._notification_partition_backlog.clear()
         self._notification_partition_backlog_size = 0
         self._notification_backlog_available.set()
         for task in delivery_tasks:
             task.cancel()
-        if delivery_tasks:
-            await asyncio.gather(*delivery_tasks, return_exceptions=True)
+        for task in server_request_tasks:
+            task.cancel()
+        tasks_to_wait = [
+            *lifecycle_tasks,
+            *delivery_tasks,
+            *server_request_tasks,
+        ]
+        if tasks_to_wait:
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
         self._notification_delivery_tasks.clear()
+        self._server_request_tasks.clear()
         self._notification_locks.clear()
         self._notification_active_partitions.clear()
         # Drop any queued notifications from the previous process lifecycle.
@@ -312,6 +401,36 @@ class CodexAppServerClient:
         self._initialized = False
         self._server_user_agent = ""
         self._transport_needs_restart = False
+
+    async def _notify_transport_reset(self, reason: str, generation: int) -> None:
+        self._transport_reset_sequence += 1
+        self._last_transport_reset_generation = generation
+        self._last_transport_reset_reason = reason
+        self._last_transport_reset_at = time.time()
+        handler = self._transport_reset_handler
+        if handler is None:
+            return
+        try:
+            await handler(reason, generation)
+        except Exception:
+            logger.exception(
+                "Codex app-server transport reset handler failed "
+                "(reason=%s generation=%d)",
+                reason,
+                generation,
+            )
+
+    def transport_state_snapshot(self) -> dict[str, Any]:
+        """Return monotonic lifecycle state for remote reset reconciliation."""
+        return {
+            "epoch": self._transport_epoch,
+            "epoch_started_at": self._transport_epoch_started_at,
+            "generation": self._transport_generation,
+            "reset_sequence": self._transport_reset_sequence,
+            "last_reset_generation": self._last_transport_reset_generation,
+            "last_reset_reason": self._last_transport_reset_reason,
+            "last_reset_at": self._last_transport_reset_at,
+        }
 
     async def _stop_systemd_unit(self, unit_name: str) -> None:
         try:
@@ -975,6 +1094,7 @@ class CodexAppServerClient:
         return {}
 
     async def _reader_loop(self) -> None:
+        generation = self._transport_generation
         try:
             while True:
                 msg = await self._read_one_message()
@@ -988,6 +1108,8 @@ class CodexAppServerClient:
         except Exception as e:
             logger.exception("codex app-server reader loop failed: %s", e)
         finally:
+            if generation != self._transport_generation:
+                return
             if self._proc and self._proc.returncode is None:
                 self._transport_needs_restart = True
             for key, fut in list(self._pending.items()):
@@ -1142,6 +1264,27 @@ class CodexAppServerClient:
         method: str,
         params: dict[str, Any],
     ) -> None:
+        transport_context = params.get(INTERNAL_TRANSPORT_CONTEXT_KEY)
+        if isinstance(transport_context, dict):
+            context_epoch = str(transport_context.get("epoch", "")).strip()
+            try:
+                context_generation = int(
+                    transport_context.get("generation", 0) or 0
+                )
+            except (TypeError, ValueError):
+                context_generation = 0
+            if (
+                context_epoch != self._transport_epoch
+                or context_generation != self._transport_generation
+            ):
+                logger.debug(
+                    "Dropping stale app-server notification "
+                    "(method=%s generation=%d current=%d)",
+                    method,
+                    context_generation,
+                    self._transport_generation,
+                )
+                return
         partition = self._notification_partition(params)
         lock = self._notification_locks.setdefault(partition, asyncio.Lock())
         async with lock:
@@ -1231,15 +1374,21 @@ class CodexAppServerClient:
             req_id = msg.get("id")
             params = msg.get("params")
             params_dict = params if isinstance(params, dict) else {}
-            result: dict[str, Any] | None = None
-            if self._server_request_handler:
-                try:
-                    result = await self._server_request_handler(method, params_dict)
-                except Exception as e:
-                    logger.exception("app-server request handler failed (%s): %s", method, e)
-            if result is None:
-                result = self._default_server_request_result(method, params_dict)
-            await self._write_response(req_id, result=result)
+            generation = self._transport_generation
+            request_params = dict(params_dict)
+            request_params[INTERNAL_TRANSPORT_CONTEXT_KEY] = (
+                self.transport_state_snapshot()
+            )
+            task = asyncio.create_task(
+                self._handle_server_request(
+                    req_id=req_id,
+                    method=method,
+                    params=request_params,
+                    generation=generation,
+                )
+            )
+            self._server_request_tasks.add(task)
+            task.add_done_callback(self._server_request_tasks.discard)
             return
 
         # Notification (method, no id)
@@ -1252,7 +1401,11 @@ class CodexAppServerClient:
                 # work (progress edits, etc.) can be slow and would otherwise
                 # starve request/response processing, leading to turn/start timeouts.
                 self._ensure_notification_worker()
-                self._enqueue_notification(method, params_dict)
+                notification_params = dict(params_dict)
+                notification_params[INTERNAL_TRANSPORT_CONTEXT_KEY] = (
+                    self.transport_state_snapshot()
+                )
+                self._enqueue_notification(method, notification_params)
             return
 
         # Response (id, maybe result/error)
@@ -1270,6 +1423,46 @@ class CodexAppServerClient:
                 fut.set_exception(CodexAppServerError(message))
                 return
             fut.set_result(msg.get("result"))
+
+    async def _handle_server_request(
+        self,
+        *,
+        req_id: Any,
+        method: str,
+        params: dict[str, Any],
+        generation: int,
+    ) -> None:
+        """Handle one server-initiated request without blocking stdout reads."""
+        try:
+            result: dict[str, Any] | None = None
+            if self._server_request_handler:
+                try:
+                    result = await self._server_request_handler(method, params)
+                except Exception as exc:
+                    logger.exception(
+                        "app-server request handler failed (%s): %s",
+                        method,
+                        exc,
+                    )
+            if result is None:
+                result = self._default_server_request_result(method, params)
+            if generation != self._transport_generation:
+                logger.debug(
+                    "Dropping late app-server request response "
+                    "(method=%s generation=%d current=%d)",
+                    method,
+                    generation,
+                    self._transport_generation,
+                )
+                return
+            await self._write_response(req_id, result=result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Failed writing app-server request response (%s)",
+                method,
+            )
 
     @staticmethod
     def _default_server_request_result(
@@ -1342,17 +1535,28 @@ class CodexAppServerClient:
             if isinstance(thread_id, str) and isinstance(token_usage, dict):
                 self._thread_token_usage[thread_id] = token_usage
 
-    async def _write_jsonrpc(self, payload: dict[str, Any]) -> None:
-        proc = self._proc
-        if not proc or not proc.stdin:
-            raise CodexAppServerError("codex app-server is not running")
-
+    async def _write_jsonrpc(
+        self,
+        payload: dict[str, Any],
+        *,
+        expected_stop_sequence: int | None = None,
+    ) -> None:
         # Codex CLI app-server currently expects JSONL over stdio.
         # Reader remains dual-format to tolerate framed responses.
         raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         frame = raw + b"\n"
 
         async with self._write_lock:
+            if (
+                expected_stop_sequence is not None
+                and self._stop_sequence != expected_stop_sequence
+            ):
+                raise CodexAppServerError(
+                    "App-server transport changed before request dispatch"
+                )
+            proc = self._proc
+            if not proc or not proc.stdin:
+                raise CodexAppServerError("codex app-server is not running")
             proc.stdin.write(frame)
             await proc.stdin.drain()
 
@@ -1375,6 +1579,7 @@ class CodexAppServerClient:
         params: dict[str, Any] | None = None,
         *,
         timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
     ) -> Any:
         if not self._proc or self._proc.returncode is not None:
             raise CodexAppServerError("codex app-server is not running")
@@ -1393,7 +1598,10 @@ class CodexAppServerClient:
         }
 
         try:
-            await self._write_jsonrpc(payload)
+            await self._write_jsonrpc(
+                payload,
+                expected_stop_sequence=expected_stop_sequence,
+            )
         except Exception:
             self._pending.pop(req_id, None)
             raise
@@ -1443,28 +1651,132 @@ class CodexAppServerClient:
         params: dict[str, Any] | None = None,
         *,
         timeout: float = 60.0,
+        retry_safe_timeout: bool = True,
     ) -> Any:
+        stop_sequence = self._stop_sequence
         await self.ensure_started()
+        generation = self._transport_generation
+        reset_sequence = self._transport_reset_sequence
         try:
-            return await self._request_started(method, params, timeout=timeout)
+            result = await self._request_started(
+                method,
+                params,
+                timeout=timeout,
+                expected_stop_sequence=stop_sequence,
+            )
+            self._validate_response_transport_state(
+                method=method,
+                expected_generation=generation,
+                expected_stop_sequence=stop_sequence,
+                expected_reset_sequence=reset_sequence,
+            )
+            return result
         except CodexAppServerError as e:
-            if not self._is_timeout_recycle_candidate(method, e):
+            if not self._is_request_timeout(method, e):
+                raise
+            if not retry_safe_timeout:
+                # A short health/read probe can time out while the app-server
+                # is busy servicing a healthy backend request. Treat that as
+                # inconclusive and leave the transport (and active turns)
+                # untouched.
+                logger.warning(
+                    "App-server request timed out (%s); leaving transport "
+                    "running because timeout recovery is disabled",
+                    method,
+                )
                 raise
             logger.warning(
-                "App-server request timed out (%s); recycling transport and retrying once",
+                "App-server request timed out (%s); recycling transport",
                 method,
             )
-            await self.stop()
-            await self.ensure_started()
-            return await self._request_started(method, params, timeout=timeout)
+            await self._recycle_timed_out_transport(
+                expected_generation=generation,
+                expected_stop_sequence=stop_sequence,
+                method=method,
+            )
+            if self._stop_sequence != stop_sequence:
+                raise
+            if method not in SAFE_TIMEOUT_RETRY_METHODS:
+                # A timed-out mutation has an unknown outcome. Never replay it
+                # at the transport layer, where doing so can duplicate work.
+                raise
+            retry_generation = self._transport_generation
+            retry_reset_sequence = self._transport_reset_sequence
+            try:
+                result = await self._request_started(
+                    method,
+                    params,
+                    timeout=timeout,
+                    expected_stop_sequence=stop_sequence,
+                )
+                self._validate_response_transport_state(
+                    method=method,
+                    expected_generation=retry_generation,
+                    expected_stop_sequence=stop_sequence,
+                    expected_reset_sequence=retry_reset_sequence,
+                )
+                return result
+            except CodexAppServerError as retry_error:
+                if self._is_request_timeout(method, retry_error):
+                    await self._recycle_timed_out_transport(
+                        expected_generation=retry_generation,
+                        expected_stop_sequence=stop_sequence,
+                        method=method,
+                    )
+                raise
+
+    def _validate_response_transport_state(
+        self,
+        *,
+        method: str,
+        expected_generation: int,
+        expected_stop_sequence: int,
+        expected_reset_sequence: int,
+    ) -> None:
+        """Reject responses that became stale before their waiter resumed."""
+        if (
+            self._transport_generation == expected_generation
+            and self._stop_sequence == expected_stop_sequence
+            and self._transport_reset_sequence == expected_reset_sequence
+            and self._is_transport_ready()
+        ):
+            return
+        raise CodexAppServerError(
+            f"App-server transport changed while awaiting response: {method}"
+        )
 
     @staticmethod
-    def _is_timeout_recycle_candidate(method: str, err: Exception) -> bool:
-        if method not in TIMEOUT_RECYCLE_METHODS:
-            return False
+    def _is_request_timeout(method: str, err: Exception) -> bool:
         if not isinstance(err, CodexAppServerError):
             return False
         return f"Timed out waiting for app-server response: {method}" in str(err)
+
+    async def _recycle_timed_out_transport(
+        self,
+        *,
+        expected_generation: int,
+        expected_stop_sequence: int | None = None,
+        method: str,
+    ) -> bool:
+        """Recycle one failed generation exactly once across concurrent callers."""
+        if expected_stop_sequence is None:
+            expected_stop_sequence = self._stop_sequence
+        async with self._recycle_lock:
+            async with self._start_lock:
+                if self._stop_sequence != expected_stop_sequence:
+                    return False
+                if self._transport_generation != expected_generation:
+                    await self._ensure_started_locked()
+                    return False
+                await self._stop_locked()
+                await self._notify_transport_reset(
+                    f"request_timeout:{method}",
+                    expected_generation,
+                )
+                if self._stop_sequence != expected_stop_sequence:
+                    return False
+                await self._ensure_started_locked()
+                return True
 
     async def thread_start(
         self,
@@ -1486,7 +1798,7 @@ class CodexAppServerClient:
             params["reasoningEffort"] = effort
         if service_tier:
             params["serviceTier"] = service_tier
-        result = await self.request("thread/start", params, timeout=120.0)
+        result = await self.request("thread/start", params, timeout=30.0)
         return result if isinstance(result, dict) else {}
 
     async def thread_fork(
@@ -1510,10 +1822,15 @@ class CodexAppServerClient:
         thread_id: str,
         service_tier: str | None = None,
     ) -> dict[str, Any]:
-        params = {"threadId": thread_id}
+        params = {
+            "threadId": thread_id,
+            # CoCo only needs lifecycle metadata and current live state. Avoid
+            # materializing historical turns into one large JSON response.
+            "excludeTurns": True,
+        }
         if service_tier:
             params["serviceTier"] = service_tier
-        result = await self.request("thread/resume", params, timeout=120.0)
+        result = await self.request("thread/resume", params, timeout=30.0)
         return result if isinstance(result, dict) else {}
 
     async def thread_list(
@@ -1533,8 +1850,12 @@ class CodexAppServerClient:
         *,
         thread_id: str,
         timeout: float = 60.0,
+        include_turns: bool = True,
     ) -> dict[str, Any]:
-        params = {"threadId": thread_id}
+        params = {
+            "threadId": thread_id,
+            "includeTurns": include_turns,
+        }
         result = await self.request("thread/read", params, timeout=timeout)
         return result if isinstance(result, dict) else {}
 
@@ -1593,7 +1914,7 @@ class CodexAppServerClient:
         model: str | None = None,
         effort: str | None = None,
         service_tier: str | None = None,
-        timeout: float = 90.0,
+        timeout: float = APP_SERVER_MUTATION_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
@@ -1623,7 +1944,7 @@ class CodexAppServerClient:
         thread_id: str,
         expected_turn_id: str,
         inputs: list[dict[str, Any]],
-        timeout: float = 90.0,
+        timeout: float = APP_SERVER_MUTATION_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
@@ -1653,6 +1974,55 @@ class CodexAppServerClient:
                 self._rate_limits = snapshot
             return result
         return {}
+
+    async def probe_health(self, *, timeout: float = 5.0) -> bool:
+        """Probe request/response health, returning false when recovery occurred."""
+        bounded_timeout = max(0.1, min(float(timeout), 10.0))
+        reset_sequence_before_start = self._transport_reset_sequence
+        generation = self._transport_generation
+        reset_sequence = reset_sequence_before_start
+        try:
+            await self.ensure_started()
+            generation = self._transport_generation
+            reset_sequence = self._transport_reset_sequence
+            if reset_sequence != reset_sequence_before_start:
+                return False
+            await self.request(
+                "account/rateLimits/read",
+                {},
+                timeout=bounded_timeout,
+                retry_safe_timeout=False,
+            )
+            return (
+                self._transport_generation == generation
+                and self._transport_reset_sequence == reset_sequence
+            )
+        except Exception as exc:
+            recovered = (
+                self._transport_generation != generation
+                or self._transport_reset_sequence != reset_sequence
+            )
+            if not recovered and (
+                self._transport_needs_restart or not self.is_running()
+            ):
+                try:
+                    await self.ensure_started()
+                except Exception:
+                    logger.warning(
+                        "Codex app-server health recovery failed",
+                        exc_info=True,
+                    )
+                recovered = (
+                    self._transport_generation != generation
+                    or self._transport_reset_sequence != reset_sequence
+                )
+            if recovered:
+                logger.warning(
+                    "Codex app-server health probe triggered recovery: %s",
+                    exc,
+                )
+                return False
+            raise
 
     def get_active_turn_id(self, thread_id: str) -> str | None:
         turn = self._active_turns.get(thread_id)

@@ -6,6 +6,8 @@ import coco.bot as bot
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from .run_watchdog import clear_run_watch_state
+
 _COMMAND_HANDLER_NAMES = {
     "start_command",
     "folder_command",
@@ -485,8 +487,12 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # child/sub-agent output already queued behind the command is muted.
             import coco.bot as bot_mod
 
-            bot_mod._interrupted_codex_threads.add(codex_thread_id)
-            bot_mod._interrupted_codex_turns[codex_thread_id] = ""
+            codex_thread_state_key = bot_mod._codex_thread_state_key(
+                codex_thread_id,
+                session_manager.get_window_machine_id(wid),
+            )
+            bot_mod._interrupted_codex_threads.add(codex_thread_state_key)
+            bot_mod._interrupted_codex_turns[codex_thread_state_key] = ""
             clear_queued_topic_inputs(user.id, thread_id, chat_id)
             purged = await cancel_topic_delivery(
                 user.id, thread_id, chat_id=chat_id
@@ -511,7 +517,9 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     e,
                 )
         if codex_thread_id and active_turn_id:
-            bot_mod._interrupted_codex_turns[codex_thread_id] = active_turn_id
+            bot_mod._interrupted_codex_turns[
+                codex_thread_state_key
+            ] = active_turn_id
             try:
                 await codex_app_server_client.turn_interrupt(
                     thread_id=codex_thread_id,
@@ -521,8 +529,13 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 # The turn is still live when the interrupt transport fails.
                 # Roll back the output fence so its remaining updates are not
                 # muted indefinitely while the cached active turn continues.
-                bot_mod._interrupted_codex_threads.discard(codex_thread_id)
-                bot_mod._interrupted_codex_turns.pop(codex_thread_id, None)
+                bot_mod._interrupted_codex_threads.discard(
+                    codex_thread_state_key
+                )
+                bot_mod._interrupted_codex_turns.pop(
+                    codex_thread_state_key,
+                    None,
+                )
                 logger.warning(
                     "App-server interrupt failed (thread=%s turn=%s): %s",
                     codex_thread_id,
@@ -534,6 +547,7 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return
             session_manager.clear_window_codex_turn(wid)
             codex_app_server_client.clear_active_turn(codex_thread_id)
+            clear_run_watch_state(user.id, thread_id, window_id=wid)
             suffix = f"; discarded {purged} queued update(s)" if purged else ""
             await _cleanup_esc_ui()
             await _notify_esc_status(f"⎋ Interrupted active turn{suffix}")
@@ -541,10 +555,16 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if codex_thread_id:
             # No interrupt was sent because no active turn could be confirmed.
             # Do not leave a potentially live turn permanently output-fenced.
-            bot_mod._interrupted_codex_threads.discard(codex_thread_id)
-            bot_mod._interrupted_codex_turns.pop(codex_thread_id, None)
+            bot_mod._interrupted_codex_threads.discard(
+                codex_thread_state_key
+            )
+            bot_mod._interrupted_codex_turns.pop(
+                codex_thread_state_key,
+                None,
+            )
             session_manager.clear_window_codex_turn(wid)
             codex_app_server_client.clear_active_turn(codex_thread_id)
+            clear_run_watch_state(user.id, thread_id, window_id=wid)
             await _cleanup_esc_ui()
             await _notify_esc_status(
                 "⎋ No foreground turn was visible; queued updates were cleared, but no running turn could be interrupted.",

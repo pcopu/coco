@@ -238,6 +238,20 @@ class Config:
             self.sessions_path = Path(sessions_path_raw).expanduser()
         else:
             self.sessions_path = Path.home() / ".codex" / "sessions"
+        max_resume_bytes_raw = env_alias(
+            "COCO_CODEX_MAX_RESUME_BYTES",
+            default=str(128 * 1024 * 1024),
+        )
+        try:
+            self.codex_max_resume_bytes = int(max_resume_bytes_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "COCO_CODEX_MAX_RESUME_BYTES must be a positive integer"
+            ) from exc
+        if self.codex_max_resume_bytes <= 0:
+            raise ValueError(
+                "COCO_CODEX_MAX_RESUME_BYTES must be a positive integer"
+            )
         self.monitor_poll_interval = _parse_positive_finite(
             env.MONITOR_POLL_INTERVAL,
             name="MONITOR_POLL_INTERVAL",

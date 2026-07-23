@@ -55,6 +55,8 @@ class RunWatchState:
     pending_fingerprint: str
     retry_count: int = 0
     auto_retry_succeeded: bool = False
+    activity_seen: bool = False
+    replay_suppressed_reason: str = ""
     fired_checkpoints: set[int] = field(default_factory=set)
 
 
@@ -257,7 +259,8 @@ def note_run_started(
 
     text = pending_text.strip()
     if not expect_response or not text:
-        _clear_topic_state(skey)
+        # Commands and other non-response events must not silently disarm an
+        # existing user-turn watch.
         return
 
     pending_fingerprint = _fingerprint_text(text)
@@ -306,8 +309,8 @@ def note_run_activity(
     source: str = "",
     now: float | None = None,
 ) -> None:
-    """Record assistant activity by clearing pending-response tracking."""
-    _ = now if now is not None else time.monotonic()
+    """Record assistant activity as a heartbeat for pending-run tracking."""
+    ts = now if now is not None else time.monotonic()
     skey = _topic_key(user_id, thread_id)
     state = _run_watch_state.get(skey)
     if not state:
@@ -315,16 +318,21 @@ def note_run_activity(
     if state.window_id != window_id:
         return
 
-    _clear_topic_state(skey)
+    state.started_at = ts
+    state.activity_seen = True
+    state.fired_checkpoints.clear()
+    state.retry_count = 0
+    state.auto_retry_succeeded = False
+    _clear_persisted_retry_count(skey, state.pending_fingerprint)
     logger.info(
-        "Run watchdog pending-cleared by activity (user=%d thread=%s window=%s source=%s)",
+        "Run watchdog heartbeat (user=%d thread=%s window=%s source=%s)",
         user_id,
         thread_id,
         window_id,
         source or "unknown",
     )
     emit_telemetry(
-        "watchdog.pending_cleared_activity",
+        "watchdog.activity_heartbeat",
         user_id=user_id,
         thread_id=thread_id,
         window_id=window_id,
@@ -365,9 +373,66 @@ def note_run_completed(
     )
 
 
-def clear_run_watch_state(user_id: int, thread_id: int | None = None) -> None:
-    """Clear watchdog state for one topic."""
-    _clear_topic_state(_topic_key(user_id, thread_id))
+def note_transport_reset_uncertainty(
+    *,
+    window_ids: set[str],
+    reason: str,
+    now: float | None = None,
+) -> int:
+    """Suppress replay for watched runs affected by an uncertain transport reset."""
+    normalized_window_ids = {
+        window_id.strip()
+        for window_id in window_ids
+        if window_id.strip()
+    }
+    if not normalized_window_ids:
+        return 0
+
+    ts = now if now is not None else time.monotonic()
+    affected = 0
+    for topic_key, state in _run_watch_state.items():
+        if state.window_id not in normalized_window_ids:
+            continue
+        state.started_at = ts
+        state.replay_suppressed_reason = "transport_uncertain"
+        state.fired_checkpoints.clear()
+        state.retry_count = 0
+        state.auto_retry_succeeded = False
+        _clear_persisted_retry_count(topic_key, state.pending_fingerprint)
+        affected += 1
+        emit_telemetry(
+            "watchdog.transport_uncertain",
+            user_id=topic_key[0],
+            thread_id=topic_key[1] or None,
+            window_id=state.window_id,
+            reason=reason or "unknown",
+            pending_fingerprint=state.pending_fingerprint,
+        )
+    if affected:
+        logger.warning(
+            "Run watchdog suppressed replay for %d transport-uncertain run(s) "
+            "(reason=%s)",
+            affected,
+            reason or "unknown",
+        )
+    return affected
+
+
+def clear_run_watch_state(
+    user_id: int,
+    thread_id: int | None = None,
+    *,
+    window_id: str | None = None,
+) -> bool:
+    """Clear one topic's watchdog state when it still belongs to the window."""
+    skey = _topic_key(user_id, thread_id)
+    state = _run_watch_state.get(skey)
+    if state is None:
+        return False
+    if window_id is not None and state.window_id != window_id:
+        return False
+    _clear_topic_state(skey)
+    return True
 
 
 def prune_run_watch_topics(active_topic_keys: set[tuple[int, int]]) -> None:
@@ -493,7 +558,11 @@ def get_immediate_auto_retry_candidate(
     auto_retry_reason = "checkpoint"
     resend_text = state.pending_text
     resend_text_len = len(resend_text)
-    if state.auto_retry_succeeded:
+    if state.replay_suppressed_reason:
+        auto_retry_reason = state.replay_suppressed_reason
+    elif state.activity_seen:
+        auto_retry_reason = "activity_seen"
+    elif state.auto_retry_succeeded:
         auto_retry_reason = "already_sent"
     elif state.retry_count >= RUN_MAX_AUTO_RETRIES:
         auto_retry_reason = "retry_cap"
@@ -558,7 +627,11 @@ def get_due_run_checks(
             auto_retry_allowed = False
             auto_retry_reason = "checkpoint"
             if checkpoint in RUN_AUTO_RESEND_CHECKPOINTS_SECONDS:
-                if state.auto_retry_succeeded:
+                if state.replay_suppressed_reason:
+                    auto_retry_reason = state.replay_suppressed_reason
+                elif state.activity_seen:
+                    auto_retry_reason = "activity_seen"
+                elif state.auto_retry_succeeded:
                     auto_retry_reason = "already_sent"
                 elif state.retry_count >= RUN_MAX_AUTO_RETRIES:
                     auto_retry_reason = "retry_cap"

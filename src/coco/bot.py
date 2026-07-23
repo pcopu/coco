@@ -43,7 +43,12 @@ from telegram.ext import (
 
 from .codex_app_server import CodexAppServerError, codex_app_server_client
 from .config import config
-from .controller_rpc import ControllerRpcServer
+from .controller_rpc import (
+    CODEX_TRANSPORT_PROTOCOL_VERSION,
+    CODEX_TRANSPORT_PROTOCOL_VERSION_KEY,
+    ControllerRpcServer,
+    REMOTE_CODEX_MACHINE_CONTEXT_KEY,
+)
 from .agent_rpc import agent_rpc_client
 from .node_registry import NODE_STATUS_ONLINE, node_registry
 from .handlers.callback_data import (
@@ -191,6 +196,7 @@ from .handlers.run_watchdog import (
     note_run_activity,
     note_run_completed,
     note_run_started,
+    note_transport_reset_uncertainty,
 )
 from .handlers.status_polling import emit_looper_tick, status_poll_loop
 from .session import (
@@ -238,23 +244,51 @@ _status_poll_task: asyncio.Task | None = None
 _controller_rpc_server: ControllerRpcServer | None = None
 _update_check_task: asyncio.Task | None = None
 
+
+@dataclass
+class _RemoteCodexTransportState:
+    epoch: str
+    epoch_started_at: float
+    current_generation: int = 0
+    reset_sequence: int = 0
+    last_reset_generation: int = 0
+    candidate_epoch: str = ""
+    candidate_heartbeat_count: int = 0
+
+
+_remote_transport_state_by_machine: dict[str, _RemoteCodexTransportState] = {}
+_remote_transport_event_locks: dict[str, asyncio.Lock] = {}
+
+
+def _remote_transport_event_lock(machine_id: str) -> asyncio.Lock:
+    normalized_machine_id = machine_id.strip()
+    lock = _remote_transport_event_locks.get(normalized_machine_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _remote_transport_event_locks[normalized_machine_id] = lock
+    return lock
+
+
 # Track whether this turn already produced user-visible terminal output.
 # This is usually a final assistant text item, but image/document-only tool
 # output should also suppress the misleading "no final assistant response"
 # fallback on turn completion.
-_turn_has_final_text: dict[str, bool] = {}
+_CodexThreadStateKey = str | tuple[str, str]
+_turn_has_final_text: dict[_CodexThreadStateKey, bool] = {}
 # Threads that appear to be in image-generation flow and may deliver their
 # terminal artifact slightly after `turn/completed`.
-_pending_image_generation_threads: set[str] = set()
+_pending_image_generation_threads: set[_CodexThreadStateKey] = set()
 _IMAGE_GENERATION_COMPLETION_GRACE_SECONDS = 1.5
 # Track transient app-server turn failures that should trigger one guarded retry
 # after the failing turn fully completes.
-_pending_transient_app_server_errors: dict[str, tuple[str, str]] = {}
+_pending_transient_app_server_errors: dict[
+    _CodexThreadStateKey, tuple[str, str]
+] = {}
 # Threads explicitly interrupted via `/esc`; late assistant completions for these
 # threads should be ignored until the next started/completed notification clears
 # the marker.
-_interrupted_codex_threads: set[str] = set()
-_interrupted_codex_turns: dict[str, str] = {}
+_interrupted_codex_threads: set[_CodexThreadStateKey] = set()
+_interrupted_codex_turns: dict[_CodexThreadStateKey, str] = {}
 
 # Prevent duplicate /restart handling races.
 _restart_requested = False
@@ -6588,14 +6622,16 @@ async def _bind_selected_folder_to_topic(
                 resumed_effort = ""
         else:
             if resume_thread_id:
-                result = await codex_app_server_client.thread_resume(
-                    thread_id=resume_thread_id,
+                codex_thread_id = (
+                    await session_manager.resume_codex_session_for_window(
+                        window_id=created_wid,
+                        cwd=selected_path,
+                        thread_id=resume_thread_id,
+                    )
                 )
-                codex_thread_id = _extract_lifecycle_thread_id(
-                    result,
-                    fallback=resume_thread_id,
+                resumed_turn_id = (
+                    session_manager.get_window_codex_active_turn_id(created_wid)
                 )
-                resumed_turn_id = _extract_lifecycle_turn_id(result)
                 if not codex_thread_id:
                     raise CodexAppServerError("thread/resume returned no thread id")
                 message = f"Resumed app-server session `{window_name}`"
@@ -7990,6 +8026,10 @@ async def forward_command_handler(
     await update.message.chat.send_action(ChatAction.TYPING)
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
+        if cc_slash.strip().lower() == "/clear":
+            from .handlers.run_watchdog import clear_run_watch_state
+
+            clear_run_watch_state(user.id, thread_id, window_id=wid)
         note_run_started(
             user_id=user.id,
             thread_id=thread_id,
@@ -11366,9 +11406,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     approval_mode=session_manager.get_window_state(wid).approval_mode.strip(),
                 )
             else:
-                result = await codex_app_server_client.thread_resume(
-                    thread_id=target_thread_id,
+                resumed_local_thread_id = (
+                    await session_manager.resume_codex_session_for_window(
+                        window_id=wid,
+                        cwd=session_manager.get_window_state(wid).cwd.strip(),
+                        thread_id=target_thread_id,
+                    )
                 )
+                result = {
+                    "thread_id": resumed_local_thread_id,
+                    "turn_id": session_manager.get_window_codex_active_turn_id(
+                        wid
+                    ),
+                }
         except Exception as e:
             await query.answer(f"Resume failed: {e}", show_alert=True)
             return
@@ -12969,12 +13019,81 @@ def _parse_direct_goal_request(text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _find_codex_thread_bindings_for_source(
+    codex_thread_id: str,
+    *,
+    source_machine_id: str = "",
+) -> list[tuple[int, int | None, str, int]]:
+    """Return thread bindings restricted to the callback's remote machine."""
+    bindings = session_manager.find_users_for_codex_thread(codex_thread_id)
+    normalized_machine_id = source_machine_id.strip()
+    if not normalized_machine_id:
+        return bindings
+    return [
+        binding
+        for binding in bindings
+        if session_manager.get_window_machine_id(binding[2]).strip()
+        == normalized_machine_id
+    ]
+
+
+def _codex_thread_state_key(
+    codex_thread_id: str,
+    source_machine_id: str = "",
+) -> _CodexThreadStateKey:
+    """Keep callback bookkeeping isolated per remote machine."""
+    normalized_machine_id = source_machine_id.strip()
+    local_machine_id = str(
+        getattr(node_registry, "local_machine_id", "")
+    ).strip()
+    if not normalized_machine_id or normalized_machine_id == local_machine_id:
+        return codex_thread_id
+    return normalized_machine_id, codex_thread_id
+
+
+def _set_codex_turn_for_callback(
+    codex_thread_id: str,
+    turn_id: str,
+    *,
+    source_machine_id: str = "",
+) -> None:
+    """Update turn state without crossing a remote machine boundary."""
+    normalized_machine_id = source_machine_id.strip()
+    if normalized_machine_id:
+        session_manager.set_codex_turn_for_thread(
+            codex_thread_id,
+            turn_id,
+            machine_id=normalized_machine_id,
+        )
+        return
+    session_manager.set_codex_turn_for_thread(codex_thread_id, turn_id)
+
+
+async def _route_app_server_message(
+    msg: NewMessage,
+    bot: Bot,
+    *,
+    source_machine_id: str = "",
+) -> None:
+    """Route one app-server message with its remote machine identity intact."""
+    normalized_machine_id = source_machine_id.strip()
+    if normalized_machine_id:
+        await handle_new_message(
+            msg,
+            bot,
+            source_machine_id=normalized_machine_id,
+        )
+        return
+    await handle_new_message(msg, bot)
+
+
 async def _retry_failed_turn_after_transient_app_server_error(
     *,
     bot: Bot,
     codex_thread_id: str,
     status: str,
     error_message: str,
+    source_machine_id: str = "",
 ) -> set[tuple[int, int | None]]:
     """Retry one failed turn from watchdog state after a transient app-server error."""
     suppressed_topics: set[tuple[int, int | None]] = set()
@@ -12985,7 +13104,10 @@ async def _retry_failed_turn_after_transient_app_server_error(
         bound_chat_id,
         wid,
         bound_thread_id,
-    ) in session_manager.find_users_for_codex_thread(codex_thread_id):
+    ) in _find_codex_thread_bindings_for_source(
+        codex_thread_id,
+        source_machine_id=source_machine_id,
+    ):
         candidate = get_immediate_auto_retry_candidate(
             user_id=user_id,
             thread_id=bound_thread_id,
@@ -13113,11 +13235,15 @@ async def _handle_codex_app_server_request(
     params: dict[str, object],
     *,
     bot: Bot,
+    source_machine_id: str = "",
 ) -> dict[str, object] | None:
     """Handle app-server request callbacks (approvals, request_user_input)."""
     thread_id = params.get("threadId")
     bindings = (
-        session_manager.find_users_for_codex_thread(thread_id)
+        _find_codex_thread_bindings_for_source(
+            thread_id,
+            source_machine_id=source_machine_id,
+        )
         if isinstance(thread_id, str)
         else []
     )
@@ -13318,13 +13444,628 @@ async def _handle_codex_app_server_request(
     return None
 
 
+def _remote_transport_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _remote_transport_float(value: object) -> float:
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _merge_remote_transport_protocol_runtime(
+    *,
+    machine_id: str,
+    heartbeat_params: dict[str, object],
+    runtime: dict[str, object],
+) -> dict[str, object]:
+    """Normalize explicit protocol evidence before registry reconciliation."""
+    _ = machine_id
+    merged = dict(runtime)
+    advertised_versions: list[int] = []
+
+    if CODEX_TRANSPORT_PROTOCOL_VERSION_KEY in merged:
+        advertised_versions.append(
+            max(
+                CODEX_TRANSPORT_PROTOCOL_VERSION,
+                _remote_transport_int(
+                    merged.get(CODEX_TRANSPORT_PROTOCOL_VERSION_KEY)
+                ),
+            )
+        )
+    if (
+        CODEX_TRANSPORT_PROTOCOL_VERSION_KEY in heartbeat_params
+        or "codex_transport_epoch" in heartbeat_params
+    ):
+        advertised_versions.append(
+            max(
+                CODEX_TRANSPORT_PROTOCOL_VERSION,
+                _remote_transport_int(
+                    heartbeat_params.get(
+                        CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+                    )
+                ),
+            )
+        )
+
+    if advertised_versions:
+        merged[CODEX_TRANSPORT_PROTOCOL_VERSION_KEY] = max(
+            advertised_versions
+        )
+    return merged
+
+
+def _remote_machine_allows_legacy_transport(
+    *,
+    machine_id: str,
+    window_ids: set[str],
+) -> bool:
+    """Allow metadata-free RPC only for a known, never-modern remote agent."""
+    normalized_machine_id = machine_id.strip()
+    if not normalized_machine_id:
+        return False
+    node = node_registry.get_node(normalized_machine_id)
+    if (
+        node is None
+        or bool(getattr(node, "is_local", False))
+        or str(getattr(node, "transport", "")).strip() != "agent_rpc"
+    ):
+        return False
+
+    runtime = getattr(node, "runtime", {})
+    if (
+        isinstance(runtime, dict)
+        and CODEX_TRANSPORT_PROTOCOL_VERSION_KEY in runtime
+    ):
+        return False
+    if bool(
+        getattr(node, "codex_transport_legacy_confirmed", False)
+    ):
+        return True
+    if normalized_machine_id in _remote_transport_state_by_machine:
+        return False
+
+    known_window_ids = (
+        set(window_ids)
+        | session_manager.get_window_ids_for_machine(
+            normalized_machine_id
+        )
+    )
+    for window_id in known_window_ids:
+        epoch, epoch_started_at, generation = (
+            session_manager.get_window_codex_transport_state(window_id)
+        )
+        if (
+            epoch.strip()
+            or float(epoch_started_at) > 0
+            or int(generation) > 0
+        ):
+            return False
+    return True
+
+
+def _legacy_forwarded_transport_binding(
+    params: dict[str, object],
+) -> tuple[str, set[str]] | None:
+    """Resolve a metadata-free callback to one unambiguously legacy agent."""
+    thread_id = str(params.get("threadId", "")).strip()
+    if not thread_id:
+        return None
+    bindings = session_manager.find_users_for_codex_thread(thread_id)
+    window_ids = {
+        window_id.strip()
+        for _user_id, _chat_id, window_id, _thread_id in bindings
+        if window_id.strip()
+    }
+    if not window_ids:
+        return None
+    machine_ids = {
+        session_manager.get_window_machine_id(window_id).strip()
+        for window_id in window_ids
+    }
+    if len(machine_ids) != 1 or "" in machine_ids:
+        return None
+    machine_id = next(iter(machine_ids))
+    if not _remote_machine_allows_legacy_transport(
+        machine_id=machine_id,
+        window_ids=window_ids,
+    ):
+        return None
+    return machine_id, window_ids
+
+
+def _mark_remote_transport_uncertain(
+    *,
+    machine_id: str,
+    window_ids: set[str],
+    reason: str,
+    source: str,
+    generation: int,
+) -> tuple[int, int]:
+    if not window_ids:
+        return 0, 0
+    uncertain_watches = note_transport_reset_uncertainty(
+        window_ids=window_ids,
+        reason=reason,
+    )
+    cleared_turns = session_manager.clear_window_codex_turns(window_ids)
+    emit_telemetry(
+        "transport.app_server.remote_reset",
+        runtime_mode=config.runtime_mode,
+        codex_transport=config.codex_transport,
+        reason=reason,
+        generation=generation,
+        cleared_turns=cleared_turns,
+        uncertain_watches=uncertain_watches,
+        machine_id=machine_id,
+        source=source,
+        affected_windows=len(window_ids),
+    )
+    logger.warning(
+        "Remote Codex transport state invalidated "
+        "(machine=%s reason=%s generation=%d source=%s windows=%d "
+        "cleared_turns=%d uncertain_watches=%d)",
+        machine_id,
+        reason,
+        generation,
+        source,
+        len(window_ids),
+        cleared_turns,
+        uncertain_watches,
+    )
+    return cleared_turns, uncertain_watches
+
+
+def _handle_confirmed_remote_legacy_downgrade(machine_id: str) -> None:
+    """Idempotently invalidate modern state after a confirmed agent rollback."""
+    normalized_machine_id = machine_id.strip()
+    if not normalized_machine_id:
+        return
+    machine_window_ids = session_manager.get_window_ids_for_machine(
+        normalized_machine_id
+    )
+    modern_window_ids: set[str] = set()
+    for window_id in machine_window_ids:
+        epoch, epoch_started_at, generation = (
+            session_manager.get_window_codex_transport_state(window_id)
+        )
+        if (
+            epoch.strip()
+            or _remote_transport_float(epoch_started_at) > 0
+            or _remote_transport_int(generation) > 0
+        ):
+            modern_window_ids.add(window_id)
+
+    had_runtime_state = (
+        normalized_machine_id in _remote_transport_state_by_machine
+    )
+    if not modern_window_ids and not had_runtime_state:
+        return
+
+    # An in-memory modern transport snapshot can have affected a window before
+    # that window's identity was persisted. In that case fence every window
+    # owned by the machine; otherwise only touch explicitly modern windows.
+    affected_window_ids = (
+        machine_window_ids if had_runtime_state else modern_window_ids
+    )
+    _mark_remote_transport_uncertain(
+        machine_id=normalized_machine_id,
+        window_ids=affected_window_ids,
+        reason="remote_agent_legacy_transport_confirmed",
+        source="heartbeat",
+        generation=0,
+    )
+    for window_id in affected_window_ids:
+        session_manager.set_window_codex_transport_state(
+            window_id,
+            epoch="",
+            epoch_started_at=0.0,
+            generation=0,
+        )
+    _remote_transport_state_by_machine.pop(
+        normalized_machine_id,
+        None,
+    )
+
+
+def _reconcile_remote_codex_transport_state(
+    *,
+    machine_id: str,
+    transport_epoch: str,
+    transport_epoch_started_at: float,
+    current_generation: int,
+    reset_sequence: int,
+    last_reset_generation: int,
+    last_reset_reason: str,
+    source: str,
+) -> bool:
+    """Merge one agent transport snapshot and invalidate only stale windows."""
+    normalized_machine_id = machine_id.strip()
+    normalized_epoch = transport_epoch.strip()
+    epoch_started_at = max(0.0, float(transport_epoch_started_at))
+    current_generation = max(0, int(current_generation))
+    reset_sequence = max(0, int(reset_sequence))
+    last_reset_generation = max(0, int(last_reset_generation))
+    last_reset_reason = (
+        last_reset_reason.strip() or "remote_transport_reset"
+    )
+    if not normalized_machine_id:
+        return False
+
+    machine_window_ids = session_manager.get_window_ids_for_machine(
+        normalized_machine_id
+    )
+    window_transport_states = {
+        window_id: session_manager.get_window_codex_transport_state(window_id)
+        for window_id in machine_window_ids
+    }
+    if not normalized_epoch or epoch_started_at <= 0:
+        _mark_remote_transport_uncertain(
+            machine_id=normalized_machine_id,
+            window_ids=machine_window_ids,
+            reason="remote_transport_metadata_missing",
+            source=source,
+            generation=current_generation,
+        )
+        return False
+
+    persisted_by_epoch: dict[str, tuple[int, float, int]] = {}
+    for window_epoch, window_started_at, window_generation in (
+        window_transport_states.values()
+    ):
+        if not window_epoch:
+            continue
+        count, newest_started_at, newest_generation = persisted_by_epoch.get(
+            window_epoch,
+            (0, 0.0, 0),
+        )
+        persisted_by_epoch[window_epoch] = (
+            count + 1,
+            max(newest_started_at, window_started_at),
+            max(newest_generation, window_generation),
+        )
+
+    state = _remote_transport_state_by_machine.get(normalized_machine_id)
+    already_affected: set[str] = set()
+    if state is None:
+        if persisted_by_epoch:
+            persisted_epoch, (
+                _persisted_count,
+                persisted_started_at,
+                persisted_generation,
+            ) = max(
+                persisted_by_epoch.items(),
+                key=lambda item: (item[1][0], item[1][2], item[0]),
+            )
+            state = _RemoteCodexTransportState(
+                epoch=persisted_epoch,
+                epoch_started_at=persisted_started_at,
+                current_generation=persisted_generation,
+            )
+            _remote_transport_state_by_machine[normalized_machine_id] = state
+        elif source == "heartbeat":
+            state = _RemoteCodexTransportState(
+                epoch=normalized_epoch,
+                epoch_started_at=epoch_started_at,
+                current_generation=current_generation,
+            )
+            _remote_transport_state_by_machine[normalized_machine_id] = state
+        else:
+            emit_telemetry(
+                "transport.app_server.remote_state_ignored",
+                machine_id=normalized_machine_id,
+                source=source,
+                reason="awaiting_authoritative_heartbeat",
+                generation=current_generation,
+            )
+            return False
+
+    if state.epoch != normalized_epoch:
+        if source != "heartbeat":
+            emit_telemetry(
+                "transport.app_server.remote_state_ignored",
+                machine_id=normalized_machine_id,
+                source=source,
+                reason="different_unconfirmed_agent_epoch",
+                generation=current_generation,
+            )
+            return False
+        # One agent heartbeat loop sends sequentially and waits for each
+        # response, so a terminated process can leave at most one old
+        # heartbeat in flight. Two consecutive observations establish causal
+        # succession without trusting remote wall-clock time.
+        if state.candidate_epoch == normalized_epoch:
+            state.candidate_heartbeat_count += 1
+        else:
+            state.candidate_epoch = normalized_epoch
+            state.candidate_heartbeat_count = 1
+        if state.candidate_heartbeat_count < 2:
+            return False
+        already_affected = {
+            window_id
+            for window_id, (window_epoch, _window_started_at, _window_generation)
+            in window_transport_states.items()
+            if not window_epoch or window_epoch != normalized_epoch
+        }
+        state = _RemoteCodexTransportState(
+            epoch=normalized_epoch,
+            epoch_started_at=epoch_started_at,
+            current_generation=current_generation,
+        )
+        _remote_transport_state_by_machine[normalized_machine_id] = state
+    else:
+        state.candidate_epoch = ""
+        state.candidate_heartbeat_count = 0
+        state.epoch_started_at = epoch_started_at
+        persisted_generation = persisted_by_epoch.get(
+            normalized_epoch,
+            (0, 0.0, 0),
+        )[2]
+        state.current_generation = max(
+            state.current_generation,
+            persisted_generation,
+            current_generation,
+        )
+
+    if already_affected:
+        _mark_remote_transport_uncertain(
+            machine_id=normalized_machine_id,
+            window_ids=already_affected,
+            reason="remote_agent_transport_epoch_changed",
+            source=source,
+            generation=current_generation,
+        )
+
+    has_unseen_reset = reset_sequence > state.reset_sequence
+    if source == "notification" and reset_sequence == 0:
+        # Legacy or malformed one-shot reset reports still fail closed.
+        has_unseen_reset = True
+    if not has_unseen_reset:
+        return True
+
+    reset_affected = {
+        window_id
+        for window_id, (window_epoch, _window_started_at, window_generation)
+        in window_transport_states.items()
+        if window_id not in already_affected
+        and (not window_epoch or window_epoch == normalized_epoch)
+        and (
+            last_reset_generation <= 0
+            or window_generation <= last_reset_generation
+        )
+    }
+    _mark_remote_transport_uncertain(
+        machine_id=normalized_machine_id,
+        window_ids=reset_affected,
+        reason=last_reset_reason,
+        source=source,
+        generation=last_reset_generation,
+    )
+    state.reset_sequence = max(state.reset_sequence, reset_sequence)
+    state.last_reset_generation = max(
+        state.last_reset_generation,
+        last_reset_generation,
+    )
+    return True
+
+
+def _accept_remote_codex_transport_result_locked(
+    window_id: str,
+    result: dict[str, object],
+) -> bool:
+    """Reject a send acknowledgement superseded by a known transport reset."""
+    bound_machine_id = session_manager.get_window_machine_id(
+        window_id
+    ).strip()
+    context_machine_id = str(
+        result.get(REMOTE_CODEX_MACHINE_CONTEXT_KEY, "")
+    ).strip()
+    machine_id = bound_machine_id or context_machine_id
+    if (
+        bound_machine_id
+        and context_machine_id
+        and bound_machine_id != context_machine_id
+    ):
+        _mark_remote_transport_uncertain(
+            machine_id=bound_machine_id,
+            window_ids={window_id},
+            reason="remote_response_machine_mismatch",
+            source="send_response",
+            generation=0,
+        )
+        return False
+    transport_epoch = str(result.get("transport_epoch", "")).strip()
+    epoch_started_at = _remote_transport_float(
+        result.get("transport_epoch_started_at")
+    )
+    generation = _remote_transport_int(result.get("transport_generation"))
+    reset_sequence = _remote_transport_int(
+        result.get("transport_reset_sequence")
+    )
+    last_reset_generation = _remote_transport_int(
+        result.get("transport_last_reset_generation")
+    )
+    last_reset_reason = str(
+        result.get("transport_last_reset_reason", "")
+    ).strip()
+    if (
+        not machine_id
+        or not transport_epoch
+        or epoch_started_at <= 0
+        or generation <= 0
+    ):
+        has_transport_metadata = any(
+            str(key).startswith("transport_") for key in result
+        )
+        if (
+            machine_id
+            and not has_transport_metadata
+            and _remote_machine_allows_legacy_transport(
+                machine_id=machine_id,
+                window_ids={window_id},
+            )
+        ):
+            emit_telemetry(
+                "transport.app_server.remote_legacy_response_accepted",
+                machine_id=machine_id,
+                window_id=window_id,
+            )
+            logger.info(
+                "Accepted metadata-free Codex response from legacy agent "
+                "(machine=%s window=%s)",
+                machine_id,
+                window_id,
+            )
+            return True
+        _mark_remote_transport_uncertain(
+            machine_id=machine_id or "unknown",
+            window_ids={window_id},
+            reason="remote_send_transport_metadata_missing",
+            source="send_response",
+            generation=generation,
+        )
+        return False
+
+    accepted = _reconcile_remote_codex_transport_state(
+        machine_id=machine_id,
+        transport_epoch=transport_epoch,
+        transport_epoch_started_at=epoch_started_at,
+        current_generation=generation,
+        reset_sequence=reset_sequence,
+        last_reset_generation=last_reset_generation,
+        last_reset_reason=last_reset_reason,
+        source="send_response",
+    )
+    state = _remote_transport_state_by_machine.get(machine_id)
+    if (
+        not accepted
+        or state is None
+        or state.epoch != transport_epoch
+        or state.epoch_started_at != epoch_started_at
+        or generation < state.current_generation
+        or generation <= state.last_reset_generation
+        or reset_sequence < state.reset_sequence
+    ):
+        _mark_remote_transport_uncertain(
+            machine_id=machine_id,
+            window_ids={window_id},
+            reason="stale_remote_send_response",
+            source="send_response",
+            generation=generation,
+        )
+        return False
+    return True
+
+
+async def _accept_remote_codex_transport_result(
+    window_id: str,
+    result: dict[str, object],
+) -> bool:
+    machine_id = (
+        session_manager.get_window_machine_id(window_id).strip()
+        or str(result.get(REMOTE_CODEX_MACHINE_CONTEXT_KEY, "")).strip()
+    )
+    if not machine_id:
+        return _accept_remote_codex_transport_result_locked(window_id, result)
+    async with _remote_transport_event_lock(machine_id):
+        return _accept_remote_codex_transport_result_locked(window_id, result)
+
+
+def _remote_forwarded_transport_is_current(
+    transport: dict[str, object],
+    *,
+    source: str,
+) -> bool:
+    machine_id = str(transport.get("machine_id", "")).strip()
+    transport_epoch = str(transport.get("epoch", "")).strip()
+    epoch_started_at = _remote_transport_float(
+        transport.get("epoch_started_at")
+    )
+    generation = _remote_transport_int(transport.get("generation"))
+    reset_sequence = _remote_transport_int(transport.get("reset_sequence"))
+    last_reset_generation = _remote_transport_int(
+        transport.get("last_reset_generation")
+    )
+    last_reset_reason = str(
+        transport.get("last_reset_reason", "")
+    ).strip()
+    if (
+        not machine_id
+        or not transport_epoch
+        or epoch_started_at <= 0
+        or generation <= 0
+    ):
+        return False
+    accepted = _reconcile_remote_codex_transport_state(
+        machine_id=machine_id,
+        transport_epoch=transport_epoch,
+        transport_epoch_started_at=epoch_started_at,
+        current_generation=generation,
+        reset_sequence=reset_sequence,
+        last_reset_generation=last_reset_generation,
+        last_reset_reason=last_reset_reason,
+        source=source,
+    )
+    state = _remote_transport_state_by_machine.get(machine_id)
+    return bool(
+        accepted
+        and state is not None
+        and state.epoch == transport_epoch
+        and generation == state.current_generation
+        and generation > state.last_reset_generation
+        and reset_sequence >= state.reset_sequence
+    )
+
+
 async def _handle_codex_app_server_notification(
     method: str,
     params: dict[str, object],
     *,
     bot: Bot,
+    source_machine_id: str = "",
 ) -> None:
     """Translate app-server notifications into existing Telegram message flow."""
+    normalized_source_machine_id = source_machine_id.strip()
+    if method == "coco/transportReset":
+        machine_id = str(params.get("machineId", "")).strip()
+        reason = str(params.get("reason", "")).strip() or "remote_transport_reset"
+        generation = _remote_transport_int(params.get("generation"))
+        reset_sequence = _remote_transport_int(params.get("resetSequence"))
+        transport_epoch = str(params.get("transportEpoch", "")).strip()
+        transport_epoch_started_at = _remote_transport_float(
+            params.get("transportEpochStartedAt")
+        )
+        if not machine_id:
+            logger.warning("Ignoring remote transport reset without machine id")
+            return
+        if (
+            normalized_source_machine_id
+            and machine_id != normalized_source_machine_id
+        ):
+            logger.warning(
+                "Ignoring remote transport reset with mismatched source "
+                "(source=%s claimed=%s)",
+                normalized_source_machine_id,
+                machine_id,
+            )
+            return
+        _reconcile_remote_codex_transport_state(
+            machine_id=machine_id,
+            transport_epoch=transport_epoch,
+            transport_epoch_started_at=transport_epoch_started_at,
+            current_generation=generation,
+            reset_sequence=reset_sequence,
+            last_reset_generation=generation,
+            last_reset_reason=reason,
+            source="notification",
+        )
+        return
+
     def _notification_targets(
         *,
         codex_thread_id: str | None = None,
@@ -13333,7 +14074,10 @@ async def _handle_codex_app_server_notification(
         targets: list[tuple[int, int | None]] = []
 
         if codex_thread_id:
-            bindings = session_manager.find_users_for_codex_thread(codex_thread_id)
+            bindings = _find_codex_thread_bindings_for_source(
+                codex_thread_id,
+                source_machine_id=normalized_source_machine_id,
+            )
             for user_id, bound_chat_id, _wid, bound_thread_id in bindings:
                 chat_id = session_manager.resolve_chat_id(
                     user_id,
@@ -13351,8 +14095,14 @@ async def _handle_codex_app_server_notification(
             user_id,
             bound_chat_id,
             bound_thread_id,
-            _wid,
+            wid,
         ) in session_manager.iter_topic_window_bindings():
+            if (
+                normalized_source_machine_id
+                and session_manager.get_window_machine_id(wid).strip()
+                != normalized_source_machine_id
+            ):
+                continue
             chat_id = session_manager.resolve_chat_id(
                 user_id,
                 bound_thread_id,
@@ -13403,11 +14153,15 @@ async def _handle_codex_app_server_notification(
                 message_thread_id=thread_id,
             )
         if isinstance(codex_thread_id, str) and codex_thread_id:
+            state_key = _codex_thread_state_key(
+                codex_thread_id,
+                normalized_source_machine_id,
+            )
             if (
                 will_retry is False
                 and _is_transient_app_server_turn_error(msg, details)
             ):
-                _pending_transient_app_server_errors[codex_thread_id] = (msg, details)
+                _pending_transient_app_server_errors[state_key] = (msg, details)
                 emit_telemetry(
                     "transport.app_server.turn_failed_transient_error",
                     codex_thread_id=codex_thread_id,
@@ -13417,7 +14171,7 @@ async def _handle_codex_app_server_notification(
                     details=details,
                 )
             else:
-                _pending_transient_app_server_errors.pop(codex_thread_id, None)
+                _pending_transient_app_server_errors.pop(state_key, None)
         return
 
     if method == "configWarning":
@@ -13468,17 +14222,25 @@ async def _handle_codex_app_server_notification(
         turn = params.get("turn")
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if isinstance(thread_id, str) and isinstance(turn_id, str):
-            fenced_turn_id = _interrupted_codex_turns.get(thread_id)
+            state_key = _codex_thread_state_key(
+                thread_id,
+                normalized_source_machine_id,
+            )
+            fenced_turn_id = _interrupted_codex_turns.get(state_key)
             if (
-                thread_id not in _interrupted_codex_threads
+                state_key not in _interrupted_codex_threads
                 or fenced_turn_id not in {"", turn_id}
             ):
-                _interrupted_codex_threads.discard(thread_id)
-                _interrupted_codex_turns.pop(thread_id, None)
-            _pending_transient_app_server_errors.pop(thread_id, None)
-            _pending_image_generation_threads.discard(thread_id)
-            session_manager.set_codex_turn_for_thread(thread_id, turn_id)
-            _turn_has_final_text[thread_id] = False
+                _interrupted_codex_threads.discard(state_key)
+                _interrupted_codex_turns.pop(state_key, None)
+            _pending_transient_app_server_errors.pop(state_key, None)
+            _pending_image_generation_threads.discard(state_key)
+            _set_codex_turn_for_callback(
+                thread_id,
+                turn_id,
+                source_machine_id=normalized_source_machine_id,
+            )
+            _turn_has_final_text[state_key] = False
         return
 
     if method == "turn/completed":
@@ -13486,15 +14248,23 @@ async def _handle_codex_app_server_notification(
         turn = params.get("turn")
         if not isinstance(thread_id, str):
             return
+        state_key = _codex_thread_state_key(
+            thread_id,
+            normalized_source_machine_id,
+        )
         status = turn.get("status") if isinstance(turn, dict) else ""
         if isinstance(status, str) and status == "inProgress":
             turn_id = turn.get("id") if isinstance(turn, dict) else ""
             if isinstance(turn_id, str):
-                session_manager.set_codex_turn_for_thread(thread_id, turn_id)
+                _set_codex_turn_for_callback(
+                    thread_id,
+                    turn_id,
+                    source_machine_id=normalized_source_machine_id,
+                )
             return
 
-        pending_image_generation = thread_id in _pending_image_generation_threads
-        had_final_text = _turn_has_final_text.get(thread_id, False)
+        pending_image_generation = state_key in _pending_image_generation_threads
+        had_final_text = _turn_has_final_text.get(state_key, False)
         if (
             not had_final_text
             and pending_image_generation
@@ -13502,14 +14272,18 @@ async def _handle_codex_app_server_notification(
             and status == "completed"
         ):
             await asyncio.sleep(_IMAGE_GENERATION_COMPLETION_GRACE_SECONDS)
-            had_final_text = _turn_has_final_text.get(thread_id, False)
-        _turn_has_final_text.pop(thread_id, None)
+            had_final_text = _turn_has_final_text.get(state_key, False)
+        _turn_has_final_text.pop(state_key, None)
         # Keep the fence through terminal handling so late child output stays
         # muted; the next FIFO `turn/started` notification clears it.
-        was_interrupted = thread_id in _interrupted_codex_threads
-        _pending_image_generation_threads.discard(thread_id)
-        session_manager.set_codex_turn_for_thread(thread_id, "")
-        transient_error = _pending_transient_app_server_errors.pop(thread_id, None)
+        was_interrupted = state_key in _interrupted_codex_threads
+        _pending_image_generation_threads.discard(state_key)
+        _set_codex_turn_for_callback(
+            thread_id,
+            "",
+            source_machine_id=normalized_source_machine_id,
+        )
+        transient_error = _pending_transient_app_server_errors.pop(state_key, None)
         suppressed_topics: set[tuple[int, int | None]] = set()
         if (
             isinstance(status, str)
@@ -13525,6 +14299,7 @@ async def _handle_codex_app_server_notification(
                 codex_thread_id=thread_id,
                 status=status,
                 error_message=combined_error,
+                source_machine_id=normalized_source_machine_id,
             )
         # Any terminal turn completion should allow queued `/q` input to advance.
         # Restricting this to failed/interrupted leaves successful turns parked.
@@ -13540,8 +14315,9 @@ async def _handle_codex_app_server_notification(
             bound_chat_id,
             wid,
             bound_thread_id,
-        ) in session_manager.find_users_for_codex_thread(
-            thread_id
+        ) in _find_codex_thread_bindings_for_source(
+            thread_id,
+            source_machine_id=normalized_source_machine_id,
         ):
             if (user_id, bound_thread_id) in suppressed_topics:
                 continue
@@ -13639,7 +14415,11 @@ async def _handle_codex_app_server_notification(
         item = params.get("item")
         if not isinstance(thread_id, str) or not isinstance(item, dict):
             return
-        if thread_id in _interrupted_codex_threads:
+        state_key = _codex_thread_state_key(
+            thread_id,
+            normalized_source_machine_id,
+        )
+        if state_key in _interrupted_codex_threads:
             return
         item_type = item.get("type")
         if item_type != "agentMessage":
@@ -13647,8 +14427,8 @@ async def _handle_codex_app_server_notification(
         text = _extract_app_server_response_item_text(item)
         if not text:
             return
-        _turn_has_final_text[thread_id] = True
-        await handle_new_message(
+        _turn_has_final_text[state_key] = True
+        await _route_app_server_message(
             NewMessage(
                 session_id=thread_id,
                 text=text,
@@ -13658,6 +14438,7 @@ async def _handle_codex_app_server_notification(
                 source="app_server",
             ),
             bot,
+            source_machine_id=normalized_source_machine_id,
         )
         return
 
@@ -13666,7 +14447,11 @@ async def _handle_codex_app_server_notification(
         item = params.get("item")
         if not isinstance(thread_id, str) or not isinstance(item, dict):
             return
-        if thread_id in _interrupted_codex_threads:
+        state_key = _codex_thread_state_key(
+            thread_id,
+            normalized_source_machine_id,
+        )
+        if state_key in _interrupted_codex_threads:
             return
         item_type = item.get("type")
         role = item.get("role")
@@ -13678,11 +14463,11 @@ async def _handle_codex_app_server_notification(
                 item.get("phase")
             )
             if content_type == "progress" and _looks_like_image_generation_progress(text):
-                _pending_image_generation_threads.add(thread_id)
+                _pending_image_generation_threads.add(state_key)
             if content_type == "text":
-                _turn_has_final_text[thread_id] = True
-                _pending_image_generation_threads.discard(thread_id)
-            await handle_new_message(
+                _turn_has_final_text[state_key] = True
+                _pending_image_generation_threads.discard(state_key)
+            await _route_app_server_message(
                 NewMessage(
                     session_id=thread_id,
                     text=text,
@@ -13692,15 +14477,16 @@ async def _handle_codex_app_server_notification(
                     source="app_server",
                 ),
                 bot,
+                source_machine_id=normalized_source_machine_id,
             )
             return
 
         image_data = _extract_app_server_response_item_images(item)
         if not image_data:
             return
-        _turn_has_final_text[thread_id] = True
-        _pending_image_generation_threads.discard(thread_id)
-        await handle_new_message(
+        _turn_has_final_text[state_key] = True
+        _pending_image_generation_threads.discard(state_key)
+        await _route_app_server_message(
             NewMessage(
                 session_id=thread_id,
                 text="",
@@ -13711,11 +14497,17 @@ async def _handle_codex_app_server_notification(
                 image_data=image_data,
             ),
             bot,
+            source_machine_id=normalized_source_machine_id,
         )
         return
 
 
-async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
+async def handle_new_message(
+    msg: NewMessage,
+    bot: Bot,
+    *,
+    source_machine_id: str = "",
+) -> None:
     """Handle a new assistant message — enqueue for sequential processing.
 
     Messages are queued per-user to ensure status messages always appear last.
@@ -13729,9 +14521,13 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
     # Find users whose thread-bound window matches this session/thread.
     active_users: list[tuple[int, int | None, str, int]] = []
-    if _codex_app_server_enabled():
-        active_users = session_manager.find_users_for_codex_thread(msg.session_id)
-    if not active_users:
+    normalized_source_machine_id = source_machine_id.strip()
+    if normalized_source_machine_id or _codex_app_server_enabled():
+        active_users = _find_codex_thread_bindings_for_source(
+            msg.session_id,
+            source_machine_id=normalized_source_machine_id,
+        )
+    if not active_users and not normalized_source_machine_id:
         active_users = await session_manager.find_users_for_session(msg.session_id)
 
     if not active_users:
@@ -13805,7 +14601,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # user-visible tool output but no final assistant text item.
             # Mark the turn as satisfied so `turn/completed` does not inject the
             # misleading "without a final assistant response" fallback.
-            _turn_has_final_text[msg.session_id] = True
+            _turn_has_final_text[
+                _codex_thread_state_key(
+                    msg.session_id,
+                    normalized_source_machine_id,
+                )
+            ] = True
 
         parts = (
             build_response_parts(
@@ -13852,11 +14653,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                         compact=True,
                         chat_id=chat_id,
                     )
-                    note_run_completed(
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        reason="final_assistant_text",
-                    )
+                    if msg.source != "app_server":
+                        note_run_completed(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            reason="final_assistant_text",
+                        )
                     if thread_id is not None:
                         looper_completed_state = consume_looper_completion_keyword(
                             user_id=user_id,
@@ -13914,11 +14716,306 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 )
 
 
+async def _handle_remote_codex_app_server_notification(
+    *,
+    method: str,
+    params: dict[str, object],
+    transport: dict[str, object],
+    bot: Bot,
+) -> None:
+    machine_id = str(transport.get("machine_id", "")).strip()
+    if not machine_id:
+        logger.warning("Dropping forwarded app-server notification without machine id")
+        return
+    async with _remote_transport_event_lock(machine_id):
+        accepted = _remote_forwarded_transport_is_current(
+            transport,
+            source="forwarded_notification",
+        )
+    if not accepted:
+        logger.warning(
+            "Dropping stale forwarded app-server notification "
+            "(machine=%s method=%s epoch=%s generation=%d)",
+            machine_id,
+            method,
+            str(transport.get("epoch", "")).strip() or "<unknown>",
+            _remote_transport_int(transport.get("generation")),
+        )
+        return
+
+    await _handle_codex_app_server_notification(
+        method,
+        params,
+        bot=bot,
+        source_machine_id=machine_id,
+    )
+
+    async with _remote_transport_event_lock(machine_id):
+        still_current = _remote_forwarded_transport_is_current(
+            transport,
+            source="forwarded_notification_completion",
+        )
+    if not still_current:
+        event_epoch = str(transport.get("epoch", "")).strip()
+        event_generation = _remote_transport_int(
+            transport.get("generation")
+        )
+        affected_window_ids: set[str] = set()
+        for window_id in session_manager.get_window_ids_for_machine(machine_id):
+            window_epoch, _window_started_at, window_generation = (
+                session_manager.get_window_codex_transport_state(window_id)
+            )
+            if (
+                not window_epoch or window_epoch == event_epoch
+            ) and window_generation <= event_generation:
+                affected_window_ids.add(window_id)
+        _mark_remote_transport_uncertain(
+            machine_id=machine_id,
+            window_ids=affected_window_ids,
+            reason="forwarded_notification_became_stale",
+            source="forwarded_notification_completion",
+            generation=event_generation,
+        )
+
+
+async def _handle_remote_codex_app_server_request(
+    *,
+    method: str,
+    params: dict[str, object],
+    transport: dict[str, object],
+    bot: Bot,
+) -> dict[str, object] | None:
+    machine_id = str(transport.get("machine_id", "")).strip()
+    if not machine_id:
+        logger.warning("Dropping forwarded app-server request without machine id")
+        return None
+    async with _remote_transport_event_lock(machine_id):
+        accepted = _remote_forwarded_transport_is_current(
+            transport,
+            source="forwarded_request",
+        )
+    if not accepted:
+        logger.warning(
+            "Dropping stale forwarded app-server request "
+            "(machine=%s method=%s epoch=%s generation=%d)",
+            machine_id,
+            method,
+            str(transport.get("epoch", "")).strip() or "<unknown>",
+            _remote_transport_int(transport.get("generation")),
+        )
+        return None
+
+    result = await _handle_codex_app_server_request(
+        method,
+        params,
+        bot=bot,
+        source_machine_id=machine_id,
+    )
+
+    async with _remote_transport_event_lock(machine_id):
+        still_current = _remote_forwarded_transport_is_current(
+            transport,
+            source="forwarded_request_completion",
+        )
+    if not still_current:
+        logger.warning(
+            "Discarding app-server request response after transport changed "
+            "(machine=%s method=%s epoch=%s generation=%d)",
+            machine_id,
+            method,
+            str(transport.get("epoch", "")).strip() or "<unknown>",
+            _remote_transport_int(transport.get("generation")),
+        )
+        return None
+    return result
+
+
+async def _handle_controller_rpc_notification(
+    rpc_params: dict[str, object],
+    *,
+    bot: Bot,
+) -> None:
+    """Dispatch modern fenced callbacks or a narrowly scoped legacy callback."""
+    method = rpc_params.get("method")
+    inner_params = rpc_params.get("params")
+    if not isinstance(method, str) or not isinstance(inner_params, dict):
+        return
+
+    if "transport" in rpc_params:
+        transport = rpc_params.get("transport")
+        if not isinstance(transport, dict):
+            logger.warning(
+                "Dropping forwarded app-server notification with malformed "
+                "transport metadata (method=%s)",
+                method,
+            )
+            return
+        await _handle_remote_codex_app_server_notification(
+            method=method,
+            params=inner_params,
+            transport=transport,
+            bot=bot,
+        )
+        return
+
+    legacy_binding = _legacy_forwarded_transport_binding(inner_params)
+    if legacy_binding is None:
+        logger.warning(
+            "Dropping metadata-free forwarded app-server notification "
+            "(method=%s thread=%s)",
+            method,
+            str(inner_params.get("threadId", "")).strip() or "<unknown>",
+        )
+        emit_telemetry(
+            "transport.app_server.remote_legacy_callback_dropped",
+            callback_type="notification",
+            method=method,
+        )
+        return
+
+    machine_id, window_ids = legacy_binding
+    emit_telemetry(
+        "transport.app_server.remote_legacy_callback_accepted",
+        callback_type="notification",
+        method=method,
+        machine_id=machine_id,
+        affected_windows=len(window_ids),
+    )
+    await _handle_codex_app_server_notification(
+        method,
+        inner_params,
+        bot=bot,
+        source_machine_id=machine_id,
+    )
+    if _legacy_forwarded_transport_binding(inner_params) != legacy_binding:
+        logger.warning(
+            "Legacy forwarded notification crossed a transport upgrade "
+            "(machine=%s method=%s)",
+            machine_id,
+            method,
+        )
+        stale_window_ids: set[str] = set()
+        for window_id in window_ids:
+            if (
+                session_manager.get_window_machine_id(window_id).strip()
+                != machine_id
+            ):
+                continue
+            window_epoch, window_started_at, window_generation = (
+                session_manager.get_window_codex_transport_state(window_id)
+            )
+            if (
+                window_epoch.strip()
+                or _remote_transport_float(window_started_at) > 0
+                or _remote_transport_int(window_generation) > 0
+            ):
+                continue
+            stale_window_ids.add(window_id)
+        _mark_remote_transport_uncertain(
+            machine_id=machine_id,
+            window_ids=stale_window_ids,
+            reason="legacy_forwarded_notification_became_stale",
+            source="legacy_forwarded_notification_completion",
+            generation=0,
+        )
+        emit_telemetry(
+            "transport.app_server.remote_legacy_callback_became_stale",
+            callback_type="notification",
+            method=method,
+            machine_id=machine_id,
+        )
+
+
+async def _handle_controller_rpc_request(
+    rpc_params: dict[str, object],
+    *,
+    bot: Bot,
+) -> dict[str, object] | None:
+    """Dispatch one fenced request, retaining a fail-closed legacy bridge."""
+    method = rpc_params.get("method")
+    inner_params = rpc_params.get("params")
+    if not isinstance(method, str) or not isinstance(inner_params, dict):
+        return None
+
+    if "transport" in rpc_params:
+        transport = rpc_params.get("transport")
+        if not isinstance(transport, dict):
+            logger.warning(
+                "Dropping forwarded app-server request with malformed "
+                "transport metadata (method=%s)",
+                method,
+            )
+            return None
+        return await _handle_remote_codex_app_server_request(
+            method=method,
+            params=inner_params,
+            transport=transport,
+            bot=bot,
+        )
+
+    legacy_binding = _legacy_forwarded_transport_binding(inner_params)
+    if legacy_binding is None:
+        logger.warning(
+            "Dropping metadata-free forwarded app-server request "
+            "(method=%s thread=%s)",
+            method,
+            str(inner_params.get("threadId", "")).strip() or "<unknown>",
+        )
+        emit_telemetry(
+            "transport.app_server.remote_legacy_callback_dropped",
+            callback_type="request",
+            method=method,
+        )
+        return None
+
+    machine_id, window_ids = legacy_binding
+    emit_telemetry(
+        "transport.app_server.remote_legacy_callback_accepted",
+        callback_type="request",
+        method=method,
+        machine_id=machine_id,
+        affected_windows=len(window_ids),
+    )
+    result = await _handle_codex_app_server_request(
+        method,
+        inner_params,
+        bot=bot,
+        source_machine_id=machine_id,
+    )
+    if _legacy_forwarded_transport_binding(inner_params) != legacy_binding:
+        logger.warning(
+            "Discarding legacy app-server request response after transport "
+            "upgrade (machine=%s method=%s)",
+            machine_id,
+            method,
+        )
+        emit_telemetry(
+            "transport.app_server.remote_legacy_callback_became_stale",
+            callback_type="request",
+            method=method,
+            machine_id=machine_id,
+        )
+        return None
+    return result
+
+
 # --- App lifecycle ---
 
 
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _controller_rpc_server
+
+    _remote_transport_state_by_machine.clear()
+    _remote_transport_event_locks.clear()
+    session_manager.set_transport_uncertainty_handler(
+        lambda window_ids, reason: note_transport_reset_uncertainty(
+            window_ids=window_ids,
+            reason=reason,
+        )
+    )
+    session_manager.set_remote_transport_result_handler(
+        _accept_remote_codex_transport_result
+    )
 
     emit_telemetry(
         "runtime.mode",
@@ -14020,9 +15117,47 @@ async def post_init(application: Application) -> None:
                 bot=application.bot,
             )
 
+        async def app_server_transport_reset_handler(
+            reason: str,
+            generation: int,
+        ) -> None:
+            local_machine_id, _local_machine_name = (
+                session_manager._local_machine_identity()
+            )
+            affected_window_ids = session_manager.get_window_ids_for_machine(
+                local_machine_id
+            )
+            uncertain_watches = note_transport_reset_uncertainty(
+                window_ids=affected_window_ids,
+                reason=reason,
+            )
+            cleared_turns = session_manager.clear_window_codex_turns_for_machine(
+                local_machine_id
+            )
+            emit_telemetry(
+                "transport.app_server.reset",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                reason=reason,
+                generation=generation,
+                cleared_turns=cleared_turns,
+                uncertain_watches=uncertain_watches,
+                machine_id=local_machine_id,
+            )
+            logger.warning(
+                "Codex app-server transport reset "
+                "(reason=%s generation=%d cleared_turns=%d "
+                "uncertain_watches=%d)",
+                reason,
+                generation,
+                cleared_turns,
+                uncertain_watches,
+            )
+
         await codex_app_server_client.set_handlers(
             notification_handler=app_server_notification_handler,
             server_request_handler=app_server_request_handler,
+            transport_reset_handler=app_server_transport_reset_handler,
         )
         try:
             await codex_app_server_client.ensure_started()
@@ -14133,7 +15268,24 @@ async def post_init(application: Application) -> None:
             if isinstance(item, str) and item.strip()
         ]
         raw_runtime = params.get("runtime", {})
-        runtime = dict(raw_runtime) if isinstance(raw_runtime, dict) else {}
+        protocol_advertised = (
+            CODEX_TRANSPORT_PROTOCOL_VERSION_KEY in params
+            or "codex_transport_epoch" in params
+            or (
+                isinstance(raw_runtime, dict)
+                and CODEX_TRANSPORT_PROTOCOL_VERSION_KEY
+                in raw_runtime
+            )
+        )
+        runtime = _merge_remote_transport_protocol_runtime(
+            machine_id=machine_id,
+            heartbeat_params=params,
+            runtime=(
+                dict(raw_runtime)
+                if isinstance(raw_runtime, dict)
+                else {}
+            ),
+        )
         agent_version = str(params.get("agent_version", "")).strip()
         rpc_host = str(params.get("rpc_host", "")).strip()
         rpc_port_raw = params.get("rpc_port", 0)
@@ -14141,7 +15293,7 @@ async def post_init(application: Application) -> None:
             rpc_port = int(rpc_port_raw or 0)
         except (TypeError, ValueError):
             rpc_port = 0
-        node_registry.note_heartbeat(
+        node = node_registry.note_heartbeat(
             machine_id=machine_id,
             display_name=display_name,
             tailnet_name=tailnet_name,
@@ -14156,28 +15308,51 @@ async def post_init(application: Application) -> None:
             controller_capable=bool(params.get("controller_capable", False)),
             controller_active=bool(params.get("controller_active", False)),
             preferred_controller=bool(params.get("preferred_controller", False)),
+            codex_transport_protocol_advertised=protocol_advertised,
         )
+        if bool(
+            getattr(
+                node,
+                "codex_transport_legacy_confirmed",
+                False,
+            )
+        ):
+            _handle_confirmed_remote_legacy_downgrade(machine_id)
+        if "codex_transport_epoch" in params:
+            async with _remote_transport_event_lock(machine_id):
+                _reconcile_remote_codex_transport_state(
+                    machine_id=machine_id,
+                    transport_epoch=str(
+                        params.get("codex_transport_epoch", "")
+                    ).strip(),
+                    transport_epoch_started_at=_remote_transport_float(
+                        params.get("codex_transport_epoch_started_at")
+                    ),
+                    current_generation=_remote_transport_int(
+                        params.get("codex_transport_generation")
+                    ),
+                    reset_sequence=_remote_transport_int(
+                        params.get("codex_transport_reset_sequence")
+                    ),
+                    last_reset_generation=_remote_transport_int(
+                        params.get("codex_last_reset_generation")
+                    ),
+                    last_reset_reason=str(
+                        params.get("codex_last_reset_reason", "")
+                    ).strip(),
+                    source="heartbeat",
+                )
         return {"ok": True}
 
     async def _rpc_notification_handler(params: dict[str, object]) -> None:
-        method = params.get("method")
-        inner_params = params.get("params")
-        if not isinstance(method, str) or not isinstance(inner_params, dict):
-            return
-        await _handle_codex_app_server_notification(
-            method,
-            inner_params,
+        await _handle_controller_rpc_notification(
+            params,
             bot=application.bot,
         )
 
     async def _rpc_request_handler(params: dict[str, object]) -> dict[str, object] | None:
-        method = params.get("method")
-        inner_params = params.get("params")
-        if not isinstance(method, str) or not isinstance(inner_params, dict):
-            return None
-        return await _handle_codex_app_server_request(
-            method,
-            inner_params,
+        return await _handle_controller_rpc_request(
+            params,
             bot=application.bot,
         )
 
@@ -14197,6 +15372,8 @@ async def post_init(application: Application) -> None:
 
 async def post_shutdown(application: Application) -> None:
     global _status_poll_task, _controller_rpc_server, _update_check_task
+    session_manager.set_transport_uncertainty_handler(None)
+    session_manager.set_remote_transport_result_handler(None)
 
     if _update_check_task:
         _update_check_task.cancel()

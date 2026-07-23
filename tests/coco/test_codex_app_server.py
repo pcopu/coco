@@ -235,6 +235,58 @@ async def test_stop_stops_systemd_run_unit_before_wrapper(monkeypatch):
     assert client._systemd_unit_name == ""
 
 
+@pytest.mark.asyncio
+async def test_explicit_stop_publishes_one_transport_reset():
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 5
+    client._active_turns["thread-live"] = "turn-live"
+    reset_calls: list[tuple[str, int]] = []
+
+    async def _transport_reset_handler(
+        reason: str,
+        generation: int,
+    ) -> None:
+        reset_calls.append((reason, generation))
+
+    await client.set_handlers(
+        transport_reset_handler=_transport_reset_handler,
+    )
+
+    await client.stop()
+    snapshot_after_first_stop = client.transport_state_snapshot()
+    await client.stop()
+
+    assert reset_calls == [("explicit_stop", 5)]
+    assert snapshot_after_first_stop["reset_sequence"] == 1
+    assert snapshot_after_first_stop["last_reset_generation"] == 5
+    assert snapshot_after_first_stop["last_reset_reason"] == "explicit_stop"
+    assert client.transport_state_snapshot()["reset_sequence"] == 1
+    assert client.get_active_turn_id("thread-live") is None
+
+
+@pytest.mark.asyncio
+async def test_stopping_never_started_transport_does_not_publish_reset():
+    client = cas.CodexAppServerClient()
+    reset_calls: list[tuple[str, int]] = []
+
+    async def _transport_reset_handler(
+        reason: str,
+        generation: int,
+    ) -> None:
+        reset_calls.append((reason, generation))
+
+    await client.set_handlers(
+        transport_reset_handler=_transport_reset_handler,
+    )
+
+    await client.stop()
+
+    assert reset_calls == []
+    assert client.transport_state_snapshot()["reset_sequence"] == 0
+
+
 def test_reap_stale_processes_stops_stale_systemd_app_server_units(monkeypatch):
     client = cas.CodexAppServerClient()
     events: list[tuple[str, tuple[str, ...]]] = []
@@ -779,8 +831,12 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
     )
     assert calls[1] == (
         "thread/resume",
-        {"threadId": "th_resumed", "serviceTier": "flex"},
-        120.0,
+        {
+            "threadId": "th_resumed",
+            "excludeTurns": True,
+            "serviceTier": "flex",
+        },
+        30.0,
     )
     assert calls[2] == (
         "thread/list",
@@ -789,7 +845,7 @@ async def test_lifecycle_helpers_call_expected_methods(monkeypatch):
     )
     assert calls[3] == (
         "thread/read",
-        {"threadId": "th_main"},
+        {"threadId": "th_main", "includeTurns": True},
         60.0,
     )
     assert calls[4] == (
@@ -842,7 +898,7 @@ async def test_turn_start_includes_model_and_effort_overrides(monkeypatch):
                 "model": "gpt-5.6-sol",
                 "effort": "ultra",
             },
-            90.0,
+            cas.APP_SERVER_MUTATION_TIMEOUT_SECONDS,
         )
     ]
 
@@ -872,6 +928,55 @@ async def test_write_jsonrpc_uses_jsonl_wire_format():
 
 
 @pytest.mark.asyncio
+async def test_request_waiting_for_start_does_not_dispatch_after_stop(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    ensure_entered = asyncio.Event()
+    allow_start = asyncio.Event()
+
+    class _RespondingStdin(_FakeStdin):
+        async def drain(self) -> None:
+            payload = json.loads(self.writes[-1])
+            await client._handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"turn": {"id": "must-not-run"}},
+                }
+            )
+
+    fake_stdin = _RespondingStdin()
+
+    async def _delayed_ensure_started() -> None:
+        ensure_entered.set()
+        await allow_start.wait()
+        client._proc = SimpleNamespace(
+            returncode=None,
+            stdin=fake_stdin,
+        )
+        client._initialized = True
+        client._transport_generation += 1
+
+    monkeypatch.setattr(client, "ensure_started", _delayed_ensure_started)
+
+    request_task = asyncio.create_task(
+        client.request(
+            "turn/start",
+            {"threadId": "thread-before-stop"},
+        )
+    )
+    await asyncio.wait_for(ensure_entered.wait(), timeout=0.2)
+    await client.stop()
+    allow_start.set()
+
+    with pytest.raises(cas.CodexAppServerError, match="transport changed"):
+        await asyncio.wait_for(request_task, timeout=0.2)
+
+    assert fake_stdin.writes == []
+
+
+@pytest.mark.asyncio
 async def test_notification_handling_does_not_block_reader_loop():
     client = cas.CodexAppServerClient()
     gate = asyncio.Event()
@@ -894,6 +999,125 @@ async def test_notification_handling_does_not_block_reader_loop():
     assert client.get_active_turn_id("th_1") == "turn_1"
 
     await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_notification_carries_the_generation_captured_from_stdout():
+    client = cas.CodexAppServerClient()
+    client._transport_generation = 3
+    delivered = asyncio.Event()
+    observed: dict[str, object] = {}
+
+    async def _handler(_method: str, params: dict[str, object]) -> None:
+        observed.update(params)
+        delivered.set()
+
+    await client.set_handlers(notification_handler=_handler)
+
+    await client._handle_message(
+        {
+            "method": "turn/started",
+            "params": {"threadId": "th_1", "turn": {"id": "turn_1"}},
+        }
+    )
+    await asyncio.wait_for(delivered.wait(), timeout=0.2)
+
+    transport = observed[cas.INTERNAL_TRANSPORT_CONTEXT_KEY]
+    assert isinstance(transport, dict)
+    assert transport["epoch"] == client._transport_epoch
+    assert transport["generation"] == 3
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_notification_delivery_drops_an_old_transport_generation():
+    client = cas.CodexAppServerClient()
+    client._transport_generation = 4
+    delivered = asyncio.Event()
+
+    async def _handler(_method: str, _params: dict[str, object]) -> None:
+        delivered.set()
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    client._enqueue_notification(
+        "turn/completed",
+        {
+            "threadId": "th_1",
+            cas.INTERNAL_TRANSPORT_CONTEXT_KEY: {
+                "epoch": client._transport_epoch,
+                "generation": 3,
+            },
+        },
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert delivered.is_set() is False
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_slow_server_request_handler_does_not_block_unrelated_response(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    handler_gate = asyncio.Event()
+    response_written = asyncio.Event()
+
+    async def _slow_request_handler(
+        _method: str,
+        _params: dict[str, object],
+    ) -> dict[str, object]:
+        await handler_gate.wait()
+        return {"decision": "decline"}
+
+    async def _write_response(
+        _request_id: object,
+        *,
+        result: dict[str, object] | None = None,
+    ) -> None:
+        _ = result
+        response_written.set()
+
+    await client.set_handlers(server_request_handler=_slow_request_handler)
+    monkeypatch.setattr(client, "_write_response", _write_response)
+
+    loop = asyncio.get_running_loop()
+    unrelated_response: asyncio.Future[object] = loop.create_future()
+    client._pending["unrelated"] = unrelated_response
+
+    try:
+        await asyncio.wait_for(
+            client._handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "approval",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "thread-slow"},
+                }
+            ),
+            timeout=0.2,
+        )
+        await client._handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": "unrelated",
+                "result": {"ok": True},
+            }
+        )
+
+        assert await asyncio.wait_for(unrelated_response, timeout=0.2) == {"ok": True}
+
+        handler_gate.set()
+        await asyncio.wait_for(response_written.wait(), timeout=0.2)
+    finally:
+        handler_gate.set()
+        if not unrelated_response.done():
+            unrelated_response.cancel()
+        await client.stop()
 
 
 @pytest.mark.asyncio
@@ -1248,8 +1472,12 @@ async def test_ensure_started_recycles_when_transport_marked_unhealthy(monkeypat
         if isinstance(method, str):
             events.append(("notify", method))
 
-    monkeypatch.setattr(client, "stop", _fake_stop)
-    monkeypatch.setattr(cas.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(client, "_stop_locked", _fake_stop)
+    monkeypatch.setattr(
+        cas.asyncio,
+        "create_subprocess_exec",
+        _fake_create_subprocess_exec,
+    )
     monkeypatch.setattr(client, "_reader_loop", _noop_loop)
     monkeypatch.setattr(client, "_stderr_loop", _noop_loop)
     monkeypatch.setattr(client, "_request_started", _fake_request_started)
@@ -1264,7 +1492,113 @@ async def test_ensure_started_recycles_when_transport_marked_unhealthy(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_request_recycles_and_retries_once_on_turn_start_timeout(monkeypatch):
+async def test_request_recycles_and_retries_once_for_safe_read_timeout(monkeypatch):
+    client = cas.CodexAppServerClient()
+
+    ensure_calls: list[str] = []
+    stop_calls: list[str] = []
+    request_calls: list[str] = []
+
+    async def _fake_ensure_started() -> None:
+        ensure_calls.append("ensure")
+        client._proc = _FakeProc()
+        client._initialized = True
+
+    async def _fake_stop() -> None:
+        stop_calls.append("stop")
+
+    async def _fake_request_started(
+        method: str,
+        params: dict,
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ):
+        _ = params
+        _ = expected_stop_sequence
+        request_calls.append(method)
+        if len(request_calls) == 1:
+            raise cas.CodexAppServerError(
+                f"Timed out waiting for app-server response: {method}"
+            )
+        assert timeout == 90.0
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(client, "ensure_started", _fake_ensure_started)
+    monkeypatch.setattr(client, "_ensure_started_locked", _fake_ensure_started)
+    monkeypatch.setattr(client, "_stop_locked", _fake_stop)
+    monkeypatch.setattr(client, "_request_started", _fake_request_started)
+
+    result = await client.request("account/rateLimits/read", {}, timeout=90.0)
+
+    assert result == {"turn": {"id": "turn-1"}}
+    assert request_calls == [
+        "account/rateLimits/read",
+        "account/rateLimits/read",
+    ]
+    assert stop_calls == ["stop"]
+    # One initial start + one restart before retry.
+    assert ensure_calls == ["ensure", "ensure"]
+
+
+@pytest.mark.asyncio
+async def test_request_timeout_does_not_recycle_when_retry_disabled(monkeypatch):
+    client = cas.CodexAppServerClient()
+    client._transport_generation = 7
+    client._transport_reset_sequence = 3
+    client._active_turns["thread-live"] = "turn-live"
+    recycle_calls: list[dict[str, object]] = []
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout
+        _ = expected_stop_sequence
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
+
+    async def _recycle_timed_out_transport(**kwargs: object) -> bool:
+        recycle_calls.append(kwargs)
+        client._transport_generation += 1
+        client._transport_reset_sequence += 1
+        client._active_turns.clear()
+        return True
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "_request_started", _request_started)
+    monkeypatch.setattr(
+        client,
+        "_recycle_timed_out_transport",
+        _recycle_timed_out_transport,
+    )
+
+    with pytest.raises(
+        cas.CodexAppServerError,
+        match="Timed out waiting for app-server response: account/rateLimits/read",
+    ):
+        await client.request(
+            "account/rateLimits/read",
+            {},
+            timeout=0.01,
+            retry_safe_timeout=False,
+        )
+
+    assert recycle_calls == []
+    assert client._transport_generation == 7
+    assert client._transport_reset_sequence == 3
+    assert client.get_active_turn_id("thread-live") == "turn-live"
+
+
+@pytest.mark.asyncio
+async def test_timeout_recycles_without_replaying_mutating_request(monkeypatch):
     client = cas.CodexAppServerClient()
 
     ensure_calls: list[str] = []
@@ -1277,24 +1611,485 @@ async def test_request_recycles_and_retries_once_on_turn_start_timeout(monkeypat
     async def _fake_stop() -> None:
         stop_calls.append("stop")
 
-    async def _fake_request_started(method: str, params: dict, *, timeout: float = 60.0):
-        _ = params
+    async def _fake_request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout
+        _ = expected_stop_sequence
         request_calls.append(method)
-        if len(request_calls) == 1:
-            raise cas.CodexAppServerError(
-                f"Timed out waiting for app-server response: {method}"
-            )
-        assert timeout == 90.0
-        return {"turn": {"id": "turn-1"}}
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
 
     monkeypatch.setattr(client, "ensure_started", _fake_ensure_started)
-    monkeypatch.setattr(client, "stop", _fake_stop)
+    monkeypatch.setattr(client, "_ensure_started_locked", _fake_ensure_started)
+    monkeypatch.setattr(client, "_stop_locked", _fake_stop)
     monkeypatch.setattr(client, "_request_started", _fake_request_started)
 
-    result = await client.request("turn/start", {"threadId": "th_1"}, timeout=90.0)
+    with pytest.raises(
+        cas.CodexAppServerError,
+        match="Timed out waiting for app-server response: turn/steer",
+    ):
+        await client.request(
+            "turn/steer",
+            {
+                "threadId": "thread-1",
+                "expectedTurnId": "turn-stale",
+                "input": [{"type": "text", "text": "continue"}],
+            },
+            timeout=0.01,
+        )
 
-    assert result == {"turn": {"id": "turn-1"}}
-    assert request_calls == ["turn/start", "turn/start"]
+    assert request_calls == ["turn/steer"]
     assert stop_calls == ["stop"]
-    # One initial start + one restart before retry.
     assert ensure_calls == ["ensure", "ensure"]
+
+
+@pytest.mark.asyncio
+async def test_success_result_is_rejected_after_concurrent_timeout_recycles_transport(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+    client._transport_reset_sequence = 3
+    loop = asyncio.get_running_loop()
+    successful_response: asyncio.Future[object] = loop.create_future()
+    successful_request_waiting = asyncio.Event()
+    timeout_request_waiting = asyncio.Event()
+    successful_response_resolved = asyncio.Event()
+    allow_timeout = asyncio.Event()
+    recycled = asyncio.Event()
+    request_calls: list[str] = []
+
+    async def _request_started(
+        method: str,
+        params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout
+        _ = expected_stop_sequence
+        thread_id = str(params["threadId"])
+        request_calls.append(thread_id)
+        if thread_id == "thread-success":
+            successful_request_waiting.set()
+            result = await successful_response
+            successful_response_resolved.set()
+            await recycled.wait()
+            return result
+        timeout_request_waiting.set()
+        await allow_timeout.wait()
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
+
+    async def _recycle_timed_out_transport(**_kwargs) -> bool:
+        client._transport_generation = 8
+        client._transport_reset_sequence = 4
+        client._proc = _FakeProc()
+        client._initialized = True
+        recycled.set()
+        return True
+
+    monkeypatch.setattr(client, "_request_started", _request_started)
+    monkeypatch.setattr(
+        client,
+        "_recycle_timed_out_transport",
+        _recycle_timed_out_transport,
+    )
+
+    successful_task = asyncio.create_task(
+        client.request("turn/start", {"threadId": "thread-success"})
+    )
+    timeout_task = asyncio.create_task(
+        client.request("turn/start", {"threadId": "thread-timeout"})
+    )
+    await asyncio.wait_for(successful_request_waiting.wait(), timeout=0.2)
+    await asyncio.wait_for(timeout_request_waiting.wait(), timeout=0.2)
+
+    successful_response.set_result({"turn": {"id": "turn-stale"}})
+    await asyncio.wait_for(successful_response_resolved.wait(), timeout=0.2)
+    allow_timeout.set()
+
+    successful_result, timeout_result = await asyncio.gather(
+        successful_task,
+        timeout_task,
+        return_exceptions=True,
+    )
+
+    assert isinstance(successful_result, cas.CodexAppServerError)
+    assert "transport changed" in str(successful_result)
+    assert isinstance(timeout_result, cas.CodexAppServerError)
+    assert request_calls == ["thread-success", "thread-timeout"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_timeouts_share_one_generation_reset(monkeypatch):
+    client = cas.CodexAppServerClient()
+    spawn_calls: list[str] = []
+    reset_calls: list[tuple[object, ...]] = []
+    request_calls: list[str] = []
+    timeout_barrier = asyncio.Event()
+
+    async def _transport_reset_handler(*args: object) -> None:
+        reset_calls.append(args)
+
+    try:
+        await client.set_handlers(
+            transport_reset_handler=_transport_reset_handler,
+        )
+    except TypeError:
+        pytest.fail(
+            "set_handlers must accept a transport_reset_handler for generation resets"
+        )
+
+    async def _fake_create_subprocess_exec(*_args, **_kwargs):
+        spawn_calls.append("spawn")
+        return _FakeProc()
+
+    async def _noop_loop() -> None:
+        return None
+
+    async def _fake_request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout
+        _ = expected_stop_sequence
+        if method == "initialize":
+            return {"userAgent": "codex/test"}
+        request_calls.append(method)
+        if len(request_calls) >= 2:
+            timeout_barrier.set()
+        await timeout_barrier.wait()
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
+
+    async def _fake_write_jsonrpc(_payload: dict[str, object]) -> None:
+        return None
+
+    monkeypatch.setattr(cas.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(client, "_app_server_argv", lambda: ["codex", "app-server"])
+    monkeypatch.setattr(client, "_reader_loop", _noop_loop)
+    monkeypatch.setattr(client, "_stderr_loop", _noop_loop)
+    monkeypatch.setattr(client, "_request_started", _fake_request_started)
+    monkeypatch.setattr(client, "_write_jsonrpc", _fake_write_jsonrpc)
+    monkeypatch.setattr(client, "_remember_owned_pid", lambda _pid: None)
+    monkeypatch.setattr(client, "_forget_owned_pid", lambda _pid: None)
+    monkeypatch.setattr(client, "_clear_start_failure_state", lambda: None)
+
+    await client.ensure_started()
+    reset_calls.clear()
+
+    try:
+        errors = await asyncio.gather(
+            client.request("turn/start", {"threadId": "thread-1"}, timeout=0.01),
+            client.request("turn/start", {"threadId": "thread-2"}, timeout=0.01),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(error, cas.CodexAppServerError) for error in errors)
+        assert request_calls == ["turn/start", "turn/start"]
+        assert spawn_calls == ["spawn", "spawn"]
+        assert len(reset_calls) == 1
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_fences_queued_timeout_recyclers(monkeypatch):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 1
+    both_requests_timed_out = asyncio.Event()
+    first_recycle_stop_started = asyncio.Event()
+    allow_first_recycle_stop = asyncio.Event()
+    request_calls: list[str] = []
+    stop_calls: list[str] = []
+    ensure_calls: list[str] = []
+
+    async def _request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout
+        _ = expected_stop_sequence
+        request_calls.append(method)
+        if len(request_calls) == 2:
+            both_requests_timed_out.set()
+        await both_requests_timed_out.wait()
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
+
+    async def _stop_locked() -> None:
+        stop_calls.append("stop")
+        client._proc = None
+        client._initialized = False
+        if len(stop_calls) == 1:
+            first_recycle_stop_started.set()
+            await allow_first_recycle_stop.wait()
+
+    async def _ensure_started_locked() -> None:
+        ensure_calls.append("ensure")
+        client._proc = _FakeProc()
+        client._initialized = True
+        client._transport_generation += 1
+
+    monkeypatch.setattr(client, "_request_started", _request_started)
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+    monkeypatch.setattr(client, "_ensure_started_locked", _ensure_started_locked)
+    monkeypatch.setattr(client, "_notify_transport_reset", lambda *_args: asyncio.sleep(0))
+
+    request_tasks = [
+        asyncio.create_task(
+            client.request("turn/start", {"threadId": f"thread-{index}"})
+        )
+        for index in range(2)
+    ]
+    await asyncio.wait_for(first_recycle_stop_started.wait(), timeout=0.2)
+
+    stop_task = asyncio.create_task(client.stop())
+    await asyncio.sleep(0)
+    allow_first_recycle_stop.set()
+
+    errors = await asyncio.gather(*request_tasks, return_exceptions=True)
+    await stop_task
+
+    assert all(isinstance(error, cas.CodexAppServerError) for error in errors)
+    assert stop_calls == ["stop", "stop"]
+    assert ensure_calls == []
+    assert client.is_running() is False
+
+
+@pytest.mark.asyncio
+async def test_recycle_blocks_ordinary_start_until_cleanup_finishes(monkeypatch):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 1
+    stop_started = asyncio.Event()
+    allow_stop_to_finish = asyncio.Event()
+    ensure_calls: list[str] = []
+
+    async def _stop_locked() -> None:
+        client._proc = None
+        stop_started.set()
+        await allow_stop_to_finish.wait()
+        client._initialized = False
+
+    async def _ensure_started_locked() -> None:
+        ensure_calls.append("ensure")
+        client._proc = _FakeProc()
+        client._initialized = True
+        client._transport_generation += 1
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+    monkeypatch.setattr(client, "_ensure_started_locked", _ensure_started_locked)
+    monkeypatch.setattr(client, "_notify_transport_reset", lambda *_args: asyncio.sleep(0))
+
+    recycle_task = asyncio.create_task(
+        client._recycle_timed_out_transport(
+            expected_generation=1,
+            method="turn/start",
+        )
+    )
+    await asyncio.wait_for(stop_started.wait(), timeout=0.2)
+    ordinary_start = asyncio.create_task(client.ensure_started())
+    await asyncio.sleep(0)
+
+    assert ensure_calls == []
+
+    allow_stop_to_finish.set()
+    await asyncio.gather(recycle_task, ordinary_start)
+    assert ensure_calls
+
+
+@pytest.mark.asyncio
+async def test_health_probe_reraises_non_recycling_protocol_error(monkeypatch):
+    client = cas.CodexAppServerClient()
+    client._transport_generation = 3
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _request(*_args, **_kwargs):
+        raise cas.CodexAppServerError("authentication required")
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "request", _request)
+
+    with pytest.raises(cas.CodexAppServerError, match="authentication required"):
+        await client.probe_health(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_health_probe_timeout_is_inconclusive_without_recycling(monkeypatch):
+    client = cas.CodexAppServerClient()
+    client._transport_generation = 4
+    client._transport_reset_sequence = 2
+    client._active_turns["thread-live"] = "turn-live"
+    recycle_calls: list[dict[str, object]] = []
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout
+        _ = expected_stop_sequence
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
+
+    async def _recycle_timed_out_transport(**kwargs: object) -> bool:
+        recycle_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "_request_started", _request_started)
+    monkeypatch.setattr(
+        client,
+        "_recycle_timed_out_transport",
+        _recycle_timed_out_transport,
+    )
+
+    with pytest.raises(
+        cas.CodexAppServerError,
+        match="Timed out waiting for app-server response: account/rateLimits/read",
+    ):
+        await client.probe_health(timeout=0.01)
+
+    assert recycle_calls == []
+    assert client._transport_generation == 4
+    assert client._transport_reset_sequence == 2
+    assert client.get_active_turn_id("thread-live") == "turn-live"
+
+
+@pytest.mark.asyncio
+async def test_ensure_started_resets_state_after_abrupt_process_exit(monkeypatch):
+    client = cas.CodexAppServerClient()
+    exited_proc = _FakeProc()
+    exited_proc.returncode = 1
+    client._proc = exited_proc
+    client._initialized = True
+    client._transport_generation = 4
+    client._active_turns["thread-old"] = "turn-old"
+    reset_calls: list[tuple[str, int]] = []
+    spawn_calls: list[str] = []
+
+    async def _reset_handler(reason: str, generation: int) -> None:
+        reset_calls.append((reason, generation))
+
+    async def _fake_create_subprocess_exec(*_args, **_kwargs):
+        spawn_calls.append("spawn")
+        return _FakeProc()
+
+    async def _noop_loop() -> None:
+        return None
+
+    async def _fake_request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+    ) -> object:
+        _ = timeout
+        assert method == "initialize"
+        return {"userAgent": "codex/test"}
+
+    async def _fake_write_jsonrpc(_payload: dict[str, object]) -> None:
+        return None
+
+    await client.set_handlers(transport_reset_handler=_reset_handler)
+    monkeypatch.setattr(
+        cas.asyncio,
+        "create_subprocess_exec",
+        _fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(client, "_reader_loop", _noop_loop)
+    monkeypatch.setattr(client, "_stderr_loop", _noop_loop)
+    monkeypatch.setattr(client, "_request_started", _fake_request_started)
+    monkeypatch.setattr(client, "_write_jsonrpc", _fake_write_jsonrpc)
+    monkeypatch.setattr(client, "_remember_owned_pid", lambda _pid: None)
+    monkeypatch.setattr(client, "_forget_owned_pid", lambda _pid: None)
+    monkeypatch.setattr(client, "_clear_start_failure_state", lambda: None)
+
+    await client.ensure_started()
+
+    assert spawn_calls == ["spawn"]
+    assert reset_calls == [("process_exited", 4)]
+    assert client.get_active_turn_id("thread-old") is None
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_health_probe_detects_recovery_during_ensure_started(monkeypatch):
+    client = cas.CodexAppServerClient()
+    client._transport_generation = 8
+    client._transport_reset_sequence = 2
+
+    async def _ensure_started() -> None:
+        client._transport_generation = 9
+        client._transport_reset_sequence = 3
+
+    async def _request(*_args, **_kwargs):
+        return {"rateLimits": {}}
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "request", _request)
+
+    assert await client.probe_health(timeout=1.0) is False
+
+
+@pytest.mark.asyncio
+async def test_health_probe_does_not_report_cold_start_as_recovery(monkeypatch):
+    client = cas.CodexAppServerClient()
+
+    async def _ensure_started() -> None:
+        client._transport_generation = 1
+
+    async def _request(*_args, **_kwargs):
+        return {"rateLimits": {}}
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "request", _request)
+
+    assert await client.probe_health(timeout=1.0) is True
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_cancel_or_await_current_notification_task():
+    client = cas.CodexAppServerClient()
+    completed = asyncio.Event()
+
+    async def _stop_from_delivery_task() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        client._notification_delivery_tasks.add(current)
+        await client.stop()
+        completed.set()
+
+    task = asyncio.create_task(_stop_from_delivery_task())
+    await asyncio.wait_for(completed.wait(), timeout=0.2)
+    await task
