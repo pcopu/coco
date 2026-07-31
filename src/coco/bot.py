@@ -269,6 +269,45 @@ def _remote_transport_event_lock(machine_id: str) -> asyncio.Lock:
     return lock
 
 
+async def _remote_codex_mutation_dispatch_allowed(
+    machine_id: str,
+) -> bool | tuple[str, float]:
+    """Block replacements and bind modern mutations to the confirmed epoch."""
+    normalized_machine_id = machine_id.strip()
+    if not normalized_machine_id:
+        return False
+    async with _remote_transport_event_lock(normalized_machine_id):
+        state = _remote_transport_state_by_machine.get(normalized_machine_id)
+        if state is None:
+            window_ids = session_manager.get_window_ids_for_machine(
+                normalized_machine_id
+            )
+            if _remote_machine_allows_legacy_transport(
+                machine_id=normalized_machine_id,
+                window_ids=window_ids,
+            ):
+                return True
+            emit_telemetry(
+                "transport.app_server.remote_mutation_deferred",
+                machine_id=normalized_machine_id,
+                current_epoch="",
+                candidate_epoch="",
+                candidate_heartbeat_count=0,
+                reason="awaiting_authoritative_heartbeat",
+            )
+            return False
+        if not state.candidate_epoch:
+            return state.epoch, state.epoch_started_at
+        emit_telemetry(
+            "transport.app_server.remote_mutation_deferred",
+            machine_id=normalized_machine_id,
+            current_epoch=state.epoch,
+            candidate_epoch=state.candidate_epoch,
+            candidate_heartbeat_count=state.candidate_heartbeat_count,
+        )
+        return False
+
+
 # Track whether this turn already produced user-visible terminal output.
 # This is usually a final assistant text item, but image/document-only tool
 # output should also suppress the misleading "no final assistant response"
@@ -13893,11 +13932,23 @@ def _accept_remote_codex_transport_result_locked(
     last_reset_reason = str(
         result.get("transport_last_reset_reason", "")
     ).strip()
+    empty_lifecycle_noop = (
+        result.get("transport_lifecycle_noop") is True
+        and result.get("thread_id") == ""
+        and result.get("turn_id") == ""
+        and type(result.get("transport_generation")) is int
+        and result.get("transport_generation") == 0
+        and type(result.get("transport_reset_sequence")) is int
+        and result.get("transport_reset_sequence") == 0
+        and type(result.get("transport_last_reset_generation")) is int
+        and result.get("transport_last_reset_generation") == 0
+        and not last_reset_reason
+    )
     if (
         not machine_id
         or not transport_epoch
         or epoch_started_at <= 0
-        or generation <= 0
+        or (generation <= 0 and not empty_lifecycle_noop)
     ):
         has_transport_metadata = any(
             str(key).startswith("transport_") for key in result
@@ -13930,6 +13981,15 @@ def _accept_remote_codex_transport_result_locked(
             generation=generation,
         )
         return False
+
+    if empty_lifecycle_noop:
+        emit_telemetry(
+            "transport.app_server.remote_empty_lifecycle_accepted",
+            machine_id=machine_id,
+            window_id=window_id,
+            transport_epoch=transport_epoch,
+        )
+        return True
 
     accepted = _reconcile_remote_codex_transport_state(
         machine_id=machine_id,
@@ -15016,6 +15076,9 @@ async def post_init(application: Application) -> None:
     session_manager.set_remote_transport_result_handler(
         _accept_remote_codex_transport_result
     )
+    agent_rpc_client.set_codex_mutation_dispatch_gate(
+        _remote_codex_mutation_dispatch_allowed
+    )
 
     emit_telemetry(
         "runtime.mode",
@@ -15374,6 +15437,7 @@ async def post_shutdown(application: Application) -> None:
     global _status_poll_task, _controller_rpc_server, _update_check_task
     session_manager.set_transport_uncertainty_handler(None)
     session_manager.set_remote_transport_result_handler(None)
+    agent_rpc_client.set_codex_mutation_dispatch_gate(None)
 
     if _update_check_task:
         _update_check_task.cancel()

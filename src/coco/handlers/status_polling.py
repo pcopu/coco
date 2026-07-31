@@ -49,12 +49,15 @@ from .message_queue import get_pending_delivery_topics
 from .message_sender import safe_send
 from .topic_send import send_text_to_topic as _send_text_to_topic
 from .run_watchdog import (
+    clear_run_watch_state,
     get_due_run_checks,
+    get_immediate_auto_retry_candidate,
     note_auto_retry_attempt,
     note_auto_retry_result,
     note_run_started,
     note_transport_reset_uncertainty,
     prune_run_watch_topics,
+    rearm_run_watch_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -591,8 +594,8 @@ async def _emit_due_run_watchdog_checks(
         )
     elif auto_retry_reason == "transport_uncertain":
         action_line = (
-            "Action: prior transport reset left the turn outcome uncertain; "
-            "payload replay is suppressed."
+            "Action: a prior transport reset interrupted this turn; "
+            "it was not replayed. Send a new message to resume."
         )
     elif auto_retry_reason == "health_probe_failed":
         action_line = (
@@ -616,12 +619,35 @@ async def _emit_due_run_watchdog_checks(
             f"Checkpoint: `{checkpoint_label}`\n"
             f"{action_line}"
         )
-    await safe_send(
-        bot,
-        resolved_chat_id,
-        text,
-        message_thread_id=thread_id,
-    )
+    terminal_notice = auto_retry_reason in {
+        "transport_recycled",
+        "transport_uncertain",
+    }
+    sent_message = None
+    try:
+        sent_message = await safe_send(
+            bot,
+            resolved_chat_id,
+            text,
+            message_thread_id=thread_id,
+        )
+    finally:
+        if terminal_notice:
+            if sent_message is None:
+                rearm_run_watch_checkpoint(
+                    user_id,
+                    thread_id,
+                    window_id=window_id,
+                    watch_token=latest.watch_token,
+                    checkpoint_seconds=latest.checkpoint_seconds,
+                )
+            else:
+                clear_run_watch_state(
+                    user_id,
+                    thread_id,
+                    window_id=window_id,
+                    watch_token=latest.watch_token,
+                )
     emit_telemetry(
         "watchdog.check_fired",
         user_id=user_id,
@@ -1130,8 +1156,21 @@ async def status_poll_loop(bot: Bot) -> None:
 
             for user_id, chat_id, thread_id, wid in bindings:
                 try:
-                    if (thread_id or 0) in pending_delivery_topics.get(user_id, set()):
-                        continue
+                    pending_delivery = (thread_id or 0) in pending_delivery_topics.get(
+                        user_id,
+                        set(),
+                    )
+                    if pending_delivery:
+                        retry_candidate = get_immediate_auto_retry_candidate(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            window_id=wid,
+                        )
+                        if (
+                            retry_candidate is None
+                            or retry_candidate.auto_retry_reason != "transport_uncertain"
+                        ):
+                            continue
 
                     if chat_id is None:
                         await _emit_due_run_watchdog_checks(
@@ -1140,6 +1179,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             thread_id=thread_id,
                             window_id=wid,
                         )
+                        if pending_delivery:
+                            continue
                         await _emit_due_looper_prompt(
                             bot,
                             user_id=user_id,
@@ -1166,6 +1207,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             window_id=wid,
                             chat_id=chat_id,
                         )
+                        if pending_delivery:
+                            continue
                         await _emit_due_looper_prompt(
                             bot,
                             user_id=user_id,

@@ -53,6 +53,7 @@ class RunWatchState:
     started_at: float
     pending_text: str
     pending_fingerprint: str
+    watch_token: int
     retry_count: int = 0
     auto_retry_succeeded: bool = False
     activity_seen: bool = False
@@ -76,6 +77,7 @@ class RunWatchCheck:
     auto_retry_reason: str
     retry_count: int
     max_auto_retries: int
+    watch_token: int = 0
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,7 @@ _run_watch_state: dict[tuple[int, int], RunWatchState] = {}
 # "<user_id>:<thread_id_or_0>:<fingerprint>" -> {"count": int, "updated_at": float}
 _run_watch_retry_state: dict[str, dict[str, float | int]] = {}
 _run_watch_retry_state_loaded = False
+_run_watch_token_sequence = 0
 
 
 def _topic_key(user_id: int, thread_id: int | None) -> tuple[int, int]:
@@ -253,6 +256,7 @@ def note_run_started(
     persisted_now: float | None = None,
 ) -> None:
     """Start/reset pending-response tracking for a topic turn."""
+    global _run_watch_token_sequence
     ts = now if now is not None else time.monotonic()
     persisted_ts = persisted_now if persisted_now is not None else time.time()
     skey = _topic_key(user_id, thread_id)
@@ -274,11 +278,13 @@ def note_run_started(
         pending_fingerprint,
         now=persisted_ts,
     )
+    _run_watch_token_sequence += 1
     _run_watch_state[skey] = RunWatchState(
         window_id=window_id,
         started_at=ts,
         pending_text=text,
         pending_fingerprint=pending_fingerprint,
+        watch_token=_run_watch_token_sequence,
         retry_count=persisted_retries,
     )
     logger.info(
@@ -423,15 +429,47 @@ def clear_run_watch_state(
     thread_id: int | None = None,
     *,
     window_id: str | None = None,
+    watch_token: int | None = None,
 ) -> bool:
-    """Clear one topic's watchdog state when it still belongs to the window."""
+    """Clear one topic's watchdog state when it still matches the caller."""
     skey = _topic_key(user_id, thread_id)
     state = _run_watch_state.get(skey)
     if state is None:
         return False
     if window_id is not None and state.window_id != window_id:
         return False
+    if watch_token is not None and state.watch_token != watch_token:
+        return False
     _clear_topic_state(skey)
+    return True
+
+
+def rearm_run_watch_checkpoint(
+    user_id: int,
+    thread_id: int | None = None,
+    *,
+    window_id: str,
+    watch_token: int,
+    checkpoint_seconds: int,
+) -> bool:
+    """Make one consumed checkpoint due again for the same pending watch."""
+    skey = _topic_key(user_id, thread_id)
+    state = _run_watch_state.get(skey)
+    if state is None:
+        return False
+    if state.window_id != window_id or state.watch_token != watch_token:
+        return False
+    if checkpoint_seconds not in state.fired_checkpoints:
+        return False
+    state.fired_checkpoints.remove(checkpoint_seconds)
+    emit_telemetry(
+        "watchdog.check_rearmed",
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        checkpoint_seconds=checkpoint_seconds,
+        watch_token=watch_token,
+    )
     return True
 
 
@@ -625,11 +663,12 @@ def get_due_run_checks(
         if elapsed >= checkpoint:
             state.fired_checkpoints.add(checkpoint)
             auto_retry_allowed = False
-            auto_retry_reason = "checkpoint"
-            if checkpoint in RUN_AUTO_RESEND_CHECKPOINTS_SECONDS:
-                if state.replay_suppressed_reason:
-                    auto_retry_reason = state.replay_suppressed_reason
-                elif state.activity_seen:
+            auto_retry_reason = state.replay_suppressed_reason or "checkpoint"
+            if (
+                checkpoint in RUN_AUTO_RESEND_CHECKPOINTS_SECONDS
+                and not state.replay_suppressed_reason
+            ):
+                if state.activity_seen:
                     auto_retry_reason = "activity_seen"
                 elif state.auto_retry_succeeded:
                     auto_retry_reason = "already_sent"
@@ -657,6 +696,7 @@ def get_due_run_checks(
                     auto_retry_reason=auto_retry_reason,
                     retry_count=state.retry_count,
                     max_auto_retries=RUN_MAX_AUTO_RETRIES,
+                    watch_token=state.watch_token,
                 )
             )
             emit_telemetry(

@@ -48,6 +48,11 @@ from .utils import atomic_write_json, env_alias
 
 logger = logging.getLogger(__name__)
 
+
+class _CodexAggregateResumeLimitError(CodexAppServerError):
+    """Raised when another history would exceed the shared transport budget."""
+
+
 APP_SERVER_MAX_TEXT_CHARS_PER_INPUT = 3000
 APP_SERVER_TURN_START_TIMEOUT_SECONDS = 20.0
 APP_SERVER_THREAD_NOT_FOUND_RE = re.compile(r"\bthread not found\b", re.IGNORECASE)
@@ -449,6 +454,26 @@ class SessionManager:
         repr=False,
     )
     _session_file_path_cache: dict[str, Path] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _codex_resume_admission_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _codex_resume_admission_transport_state: tuple[str, float, int] = field(
+        default=("", 0.0, 0),
+        init=False,
+        repr=False,
+    )
+    _codex_resume_bytes_by_thread: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _codex_resume_paths_by_thread: dict[str, Path] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -2608,15 +2633,22 @@ class SessionManager:
             if not cwd:
                 return False, "No workspace bound to this topic. Run /folder first."
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
-
-                resume_result = await agent_rpc_client.resume_latest(
-                    machine_id,
-                    window_id=window_id,
-                    cwd=cwd,
-                    window_name=state.window_name or self.get_display_name(window_id),
-                    approval_mode=state.approval_mode.strip(),
+                from .agent_rpc import (
+                    RemoteCodexMutationDeferredError,
+                    agent_rpc_client,
                 )
+
+                try:
+                    resume_result = await agent_rpc_client.resume_latest(
+                        machine_id,
+                        window_id=window_id,
+                        cwd=cwd,
+                        window_name=state.window_name
+                        or self.get_display_name(window_id),
+                        approval_mode=state.approval_mode.strip(),
+                    )
+                except RemoteCodexMutationDeferredError as exc:
+                    return False, str(exc)
                 resumed_thread_id = str(resume_result.get("thread_id", "")).strip()
                 if resumed_thread_id:
                     self.set_window_codex_thread_id(window_id, resumed_thread_id)
@@ -2666,7 +2698,10 @@ class SessionManager:
         )
         if not apps and not codex_skills and not operator_context and not goal_context:
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
+                from .agent_rpc import (
+                    RemoteCodexMutationDeferredError,
+                    agent_rpc_client,
+                )
 
                 state = self.get_window_state(window_id)
                 cwd = state.cwd.strip()
@@ -2691,6 +2726,8 @@ class SessionManager:
                         reasoning_effort=reasoning_effort,
                         service_tier=service_tier,
                     )
+                except RemoteCodexMutationDeferredError as exc:
+                    return False, str(exc)
                 except Exception:
                     self._note_transport_uncertainty(
                         window_ids={window_id},
@@ -2763,7 +2800,10 @@ class SessionManager:
                 inputs.append({"type": "text", "text": goal_context})
             inputs.append({"type": "text", "text": text})
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
+                from .agent_rpc import (
+                    RemoteCodexMutationDeferredError,
+                    agent_rpc_client,
+                )
 
                 state = self.get_window_state(window_id)
                 cwd = state.cwd.strip()
@@ -2788,6 +2828,8 @@ class SessionManager:
                         reasoning_effort=reasoning_effort,
                         service_tier=service_tier,
                     )
+                except RemoteCodexMutationDeferredError as exc:
+                    return False, str(exc)
                 except Exception:
                     self._note_transport_uncertainty(
                         window_ids={window_id},
@@ -4512,11 +4554,25 @@ class SessionManager:
             )
             return ""
 
-        return await self.resume_codex_session_for_window(
-            window_id=window_id,
-            cwd=cwd,
-            thread_id=latest_thread_id,
-        )
+        try:
+            return await self.resume_codex_session_for_window(
+                window_id=window_id,
+                cwd=cwd,
+                thread_id=latest_thread_id,
+            )
+        except _CodexAggregateResumeLimitError:
+            self.set_window_codex_thread_id(window_id, "")
+            self.mark_window_pending_session_start_reason(
+                window_id,
+                "oversized_rollover",
+            )
+            logger.warning(
+                "Skipping Codex resume for %s because the shared transport "
+                "history budget is full (thread=%s); starting a fresh thread",
+                window_id,
+                latest_thread_id,
+            )
+            return ""
 
     async def resume_codex_session_for_window(
         self,
@@ -4560,9 +4616,91 @@ class SessionManager:
             else ""
         )
         known_transport_state = self.get_window_codex_transport_state(window_id)
-        result = await codex_app_server_client.thread_resume(
-            thread_id=normalized_thread_id
-        )
+        async with self._codex_resume_admission_lock:
+            admission_transport_state = self._normalize_codex_transport_snapshot(
+                codex_app_server_client.transport_state_snapshot()
+            )
+            if (
+                admission_transport_state
+                != self._codex_resume_admission_transport_state
+                or not codex_app_server_client.is_running()
+            ):
+                self._codex_resume_admission_transport_state = (
+                    admission_transport_state
+                )
+                self._codex_resume_bytes_by_thread.clear()
+                self._codex_resume_paths_by_thread.clear()
+
+            for admitted_thread_id, admitted_path in (
+                self._codex_resume_paths_by_thread.items()
+            ):
+                try:
+                    current_size = admitted_path.stat().st_size
+                except OSError:
+                    continue
+                self._codex_resume_bytes_by_thread[admitted_thread_id] = max(
+                    self._codex_resume_bytes_by_thread.get(admitted_thread_id, 0),
+                    current_size,
+                )
+
+            previous_size = self._codex_resume_bytes_by_thread.get(
+                normalized_thread_id,
+                0,
+            )
+            admitted_rollout_size = max(previous_size, rollout_size)
+            aggregate_size = (
+                sum(self._codex_resume_bytes_by_thread.values())
+                - previous_size
+                + admitted_rollout_size
+            )
+            if aggregate_size > resume_limit:
+                emit_telemetry(
+                    "transport.app_server.aggregate_resume_rejected",
+                    runtime_mode=config.runtime_mode,
+                    codex_transport=config.codex_transport,
+                    window_id=window_id,
+                    cwd=cwd,
+                    thread_id=normalized_thread_id,
+                    rollout_path=str(rollout_path),
+                    rollout_size_bytes=rollout_size,
+                    aggregate_resume_size_bytes=aggregate_size,
+                    resume_limit_bytes=resume_limit,
+                )
+                raise _CodexAggregateResumeLimitError(
+                    "Codex transcripts exceed aggregate resume limit "
+                    f"({aggregate_size} > {resume_limit} bytes): "
+                    f"{normalized_thread_id}"
+                )
+
+            self._codex_resume_bytes_by_thread[normalized_thread_id] = (
+                admitted_rollout_size
+            )
+            self._codex_resume_paths_by_thread[normalized_thread_id] = rollout_path
+            resume_succeeded = False
+            try:
+                result = await codex_app_server_client.thread_resume(
+                    thread_id=normalized_thread_id
+                )
+                resume_succeeded = True
+            finally:
+                current_admission_transport_state = (
+                    self._normalize_codex_transport_snapshot(
+                        codex_app_server_client.transport_state_snapshot()
+                    )
+                )
+                if current_admission_transport_state != admission_transport_state:
+                    self._codex_resume_admission_transport_state = (
+                        current_admission_transport_state
+                    )
+                    self._codex_resume_bytes_by_thread.clear()
+                    self._codex_resume_paths_by_thread.clear()
+                    if resume_succeeded or not admission_transport_state[0]:
+                        self._codex_resume_bytes_by_thread[
+                            normalized_thread_id
+                        ] = admitted_rollout_size
+                        self._codex_resume_paths_by_thread[
+                            normalized_thread_id
+                        ] = rollout_path
         resumed_thread_id = self._extract_lifecycle_thread_id(
             result,
             fallback=normalized_thread_id,

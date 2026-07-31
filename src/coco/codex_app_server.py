@@ -43,6 +43,14 @@ APP_SERVER_NOTIFICATION_DROP_WHEN_FULL = frozenset(
     }
 )
 SAFE_TIMEOUT_RETRY_METHODS = frozenset({"account/rateLimits/read"})
+SAFE_TIMEOUT_RECYCLE_METHODS = frozenset(
+    {
+        "account/rateLimits/read",
+        "thread/goal/get",
+        "thread/list",
+        "thread/read",
+    }
+)
 APP_SERVER_MUTATION_TIMEOUT_SECONDS = 20.0
 APP_SERVER_ENABLED_FEATURES = ("goals",)
 INTERNAL_TRANSPORT_CONTEXT_KEY = "__coco_transport"
@@ -91,8 +99,12 @@ class CodexAppServerClient:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._recycle_lock = asyncio.Lock()
+        self._request_lifecycle_lock = asyncio.Lock()
         self._request_id = 1
         self._pending: dict[str, asyncio.Future[Any]] = {}
+        self._in_flight_mutation_requests: dict[asyncio.Task[Any], str] = {}
+        self._dispatched_mutation_generations: dict[asyncio.Task[Any], int] = {}
+        self._uncertain_mutation_generations: set[int] = set()
 
         self._notification_handler: NotificationHandler | None = None
         self._server_request_handler: ServerRequestHandler | None = None
@@ -280,6 +292,7 @@ class CodexAppServerClient:
 
                 self._remember_owned_pid(self._proc.pid)
                 self._transport_generation += 1
+                self._uncertain_mutation_generations.clear()
                 self._initialized = False
                 self._server_user_agent = ""
                 self._transport_needs_restart = False
@@ -401,6 +414,7 @@ class CodexAppServerClient:
         self._initialized = False
         self._server_user_agent = ""
         self._transport_needs_restart = False
+        self._uncertain_mutation_generations.clear()
 
     async def _notify_transport_reset(self, reason: str, generation: int) -> None:
         self._transport_reset_sequence += 1
@@ -1535,6 +1549,48 @@ class CodexAppServerClient:
             if isinstance(thread_id, str) and isinstance(token_usage, dict):
                 self._thread_token_usage[thread_id] = token_usage
 
+    async def _begin_mutation_request(self, method: str) -> asyncio.Task[Any]:
+        task = asyncio.current_task()
+        if task is None:
+            raise CodexAppServerError("Mutation request has no asyncio task")
+        async with self._request_lifecycle_lock:
+            self._in_flight_mutation_requests[task] = method
+            self._dispatched_mutation_generations.pop(task, None)
+        return task
+
+    async def _finish_mutation_request(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        outcome_uncertain: bool,
+    ) -> None:
+        async with self._request_lifecycle_lock:
+            self._in_flight_mutation_requests.pop(task, None)
+            dispatched_generation = self._dispatched_mutation_generations.pop(
+                task,
+                None,
+            )
+            if outcome_uncertain and dispatched_generation is not None:
+                self._uncertain_mutation_generations.add(dispatched_generation)
+
+    def _mark_mutation_request_dispatched(self, method: object) -> None:
+        if not isinstance(method, str):
+            return
+        task = asyncio.current_task()
+        if task is None:
+            return
+        if self._in_flight_mutation_requests.get(task) == method:
+            self._dispatched_mutation_generations[task] = (
+                self._transport_generation
+            )
+
+    def _has_mutation_recycle_fence(self) -> bool:
+        return bool(
+            self._in_flight_mutation_requests
+            or self._transport_generation
+            in self._uncertain_mutation_generations
+        )
+
     async def _write_jsonrpc(
         self,
         payload: dict[str, Any],
@@ -1558,6 +1614,7 @@ class CodexAppServerClient:
             if not proc or not proc.stdin:
                 raise CodexAppServerError("codex app-server is not running")
             proc.stdin.write(frame)
+            self._mark_mutation_request_dispatched(payload.get("method"))
             await proc.stdin.drain()
 
     async def _write_response(
@@ -1602,17 +1659,14 @@ class CodexAppServerClient:
                 payload,
                 expected_stop_sequence=expected_stop_sequence,
             )
-        except Exception:
+            try:
+                return await asyncio.wait_for(fut, timeout=timeout)
+            except TimeoutError as e:
+                raise CodexAppServerError(
+                    f"Timed out waiting for app-server response: {method}"
+                ) from e
+        finally:
             self._pending.pop(req_id, None)
-            raise
-
-        try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError as e:
-            self._pending.pop(req_id, None)
-            raise CodexAppServerError(
-                f"Timed out waiting for app-server response: {method}"
-            ) from e
 
     async def _run_initialize_handshake(self) -> None:
         """Initialize app-server protocol once per process lifecycle."""
@@ -1653,6 +1707,44 @@ class CodexAppServerClient:
         timeout: float = 60.0,
         retry_safe_timeout: bool = True,
     ) -> Any:
+        if method in SAFE_TIMEOUT_RECYCLE_METHODS:
+            return await self._request_with_timeout_recovery(
+                method,
+                params,
+                timeout=timeout,
+                retry_safe_timeout=retry_safe_timeout,
+            )
+
+        mutation_task = await self._begin_mutation_request(method)
+        outcome_uncertain = False
+        try:
+            try:
+                return await self._request_with_timeout_recovery(
+                    method,
+                    params,
+                    timeout=timeout,
+                    retry_safe_timeout=retry_safe_timeout,
+                )
+            except asyncio.CancelledError:
+                outcome_uncertain = True
+                raise
+            except CodexAppServerError as exc:
+                outcome_uncertain = self._is_request_timeout(method, exc)
+                raise
+        finally:
+            await self._finish_mutation_request(
+                mutation_task,
+                outcome_uncertain=outcome_uncertain,
+            )
+
+    async def _request_with_timeout_recovery(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 60.0,
+        retry_safe_timeout: bool = True,
+    ) -> Any:
         stop_sequence = self._stop_sequence
         await self.ensure_started()
         generation = self._transport_generation
@@ -1683,6 +1775,28 @@ class CodexAppServerClient:
                     "App-server request timed out (%s); leaving transport "
                     "running because timeout recovery is disabled",
                     method,
+                )
+                raise
+            if method not in SAFE_TIMEOUT_RECYCLE_METHODS:
+                logger.warning(
+                    "App-server request timed out (%s); preserving shared "
+                    "transport because the request outcome is ambiguous",
+                    method,
+                )
+                raise
+            if self._has_mutation_recycle_fence():
+                logger.warning(
+                    "App-server request timed out (%s); preserving shared "
+                    "transport because a mutation is in flight or uncertain",
+                    method,
+                )
+                raise
+            if self._active_turns:
+                logger.warning(
+                    "App-server request timed out (%s); preserving shared "
+                    "transport because %d turn(s) remain active",
+                    method,
+                    len(self._active_turns),
                 )
                 raise
             logger.warning(
@@ -1762,21 +1876,37 @@ class CodexAppServerClient:
         if expected_stop_sequence is None:
             expected_stop_sequence = self._stop_sequence
         async with self._recycle_lock:
-            async with self._start_lock:
-                if self._stop_sequence != expected_stop_sequence:
-                    return False
-                if self._transport_generation != expected_generation:
+            async with self._request_lifecycle_lock:
+                async with self._start_lock:
+                    if self._stop_sequence != expected_stop_sequence:
+                        return False
+                    if self._transport_generation != expected_generation:
+                        await self._ensure_started_locked()
+                        return False
+                    if self._has_mutation_recycle_fence():
+                        logger.warning(
+                            "Skipping app-server timeout recycle (%s); a "
+                            "mutation became in flight or uncertain before cleanup",
+                            method,
+                        )
+                        return False
+                    if self._active_turns:
+                        logger.warning(
+                            "Skipping app-server timeout recycle (%s); %d turn(s) "
+                            "became active before cleanup",
+                            method,
+                            len(self._active_turns),
+                        )
+                        return False
+                    await self._stop_locked()
+                    await self._notify_transport_reset(
+                        f"request_timeout:{method}",
+                        expected_generation,
+                    )
+                    if self._stop_sequence != expected_stop_sequence:
+                        return False
                     await self._ensure_started_locked()
-                    return False
-                await self._stop_locked()
-                await self._notify_transport_reset(
-                    f"request_timeout:{method}",
-                    expected_generation,
-                )
-                if self._stop_sequence != expected_stop_sequence:
-                    return False
-                await self._ensure_started_locked()
-                return True
+                    return True
 
     async def thread_start(
         self,

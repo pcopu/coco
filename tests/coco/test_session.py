@@ -10,6 +10,7 @@ import pytest
 
 import coco.agent_rpc as agent_rpc_mod
 import coco.session as session_mod
+from coco.cluster_rpc import ClusterRpcError
 from coco.node_registry import NodeRegistry
 from coco.session import (
     CodexSessionSummary,
@@ -804,6 +805,59 @@ class TestHostFollowTakeover:
         assert message == "ok"
         assert sent == [("gpt-5.6-sol", "ultra")]
 
+    @pytest.mark.asyncio
+    async def test_remote_host_follow_deferred_resume_returns_clean_failure(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.set_window_codex_active_turn_id("@1", "turn-old")
+        uncertainty_calls: list[tuple[set[str], str]] = []
+        mgr.set_transport_uncertainty_handler(
+            lambda window_ids, reason: uncertainty_calls.append((window_ids, reason))
+        )
+
+        async def _resume_latest(_machine_id: str, **_kwargs):
+            raise agent_rpc_mod.RemoteCodexMutationDeferredError(
+                "Remote Codex resume latest was not dispatched because "
+                "transport replacement confirmation is pending"
+            )
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "resume_latest",
+            _resume_latest,
+        )
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="continue",
+        )
+
+        assert ok is False
+        assert "was not dispatched" in message
+        assert uncertainty_calls == []
+        assert mgr.get_window_codex_active_turn_id("@1") == "turn-old"
+        assert mgr.get_topic_sync_mode(100, 1) == TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL
+
 
 @pytest.mark.asyncio
 async def test_remote_send_rpc_failure_marks_transport_uncertain(
@@ -846,6 +900,58 @@ async def test_remote_send_rpc_failure_marks_transport_uncertain(
 
     assert uncertainty_calls == [({"@1"}, "remote_send_rpc_failed")]
     assert mgr.get_window_codex_active_turn_id("@1") == ""
+
+
+@pytest.mark.asyncio
+async def test_remote_send_deferred_before_dispatch_preserves_session_state(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-old",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+    mgr.set_window_codex_active_turn_id("@1", "turn-old")
+    uncertainty_calls: list[tuple[set[str], str]] = []
+    mgr.set_transport_uncertainty_handler(
+        lambda window_ids, reason: uncertainty_calls.append((window_ids, reason))
+    )
+    deferred_error = getattr(
+        agent_rpc_mod,
+        "RemoteCodexMutationDeferredError",
+        ClusterRpcError,
+    )
+
+    async def _send_inputs(_machine_id: str, **_kwargs):
+        raise deferred_error(
+            "Remote Codex send was not dispatched because transport "
+            "replacement confirmation is pending"
+        )
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=1,
+        window_id="@1",
+        text="continue",
+    )
+
+    assert ok is False
+    assert "was not dispatched" in message
+    assert uncertainty_calls == []
+    assert mgr.get_window_codex_active_turn_id("@1") == "turn-old"
 
 
 @pytest.mark.asyncio

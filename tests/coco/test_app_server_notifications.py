@@ -609,6 +609,66 @@ async def test_legacy_lifecycle_response_without_transport_metadata_is_accepted(
 
 
 @pytest.mark.asyncio
+async def test_modern_generation_zero_empty_lifecycle_noop_is_accepted(
+    monkeypatch,
+):
+    uncertainty_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_machine_id",
+        lambda _window_id: "remote-node",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_ids_for_machine",
+        lambda _machine_id: {"@remote"},
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_transport_state",
+        lambda _window_id: ("", 0.0, 0),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "clear_window_codex_turns",
+        lambda _window_ids: 1,
+    )
+    monkeypatch.setattr(
+        bot,
+        "note_transport_reset_uncertainty",
+        lambda **kwargs: uncertainty_calls.append(kwargs) or 1,
+    )
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "_remote_transport_state_by_machine", {})
+
+    result = {
+        "thread_id": "",
+        "turn_id": "",
+        "transport_lifecycle_noop": True,
+        "transport_epoch": "agent-epoch-idle",
+        "transport_epoch_started_at": 100.0,
+        "transport_generation": 0,
+        "transport_reset_sequence": 0,
+        "transport_last_reset_generation": 0,
+        "transport_last_reset_reason": "",
+    }
+    accepted = await bot._accept_remote_codex_transport_result(
+        "@remote",
+        result,
+    )
+
+    assert accepted is True
+    assert uncertainty_calls == []
+
+    result["thread_id"] = "thread-mutated"
+    rejected = await bot._accept_remote_codex_transport_result(
+        "@remote",
+        result,
+    )
+    assert rejected is False
+
+
+@pytest.mark.asyncio
 async def test_partial_transport_metadata_is_not_treated_as_legacy(
     monkeypatch,
 ):
@@ -947,6 +1007,121 @@ def test_new_agent_epoch_invalidates_old_generation_even_when_counter_rolls_back
             "reason": "remote_agent_transport_epoch_changed",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_remote_mutation_gate_blocks_unconfirmed_replacement_epoch(
+    monkeypatch,
+):
+    telemetry: list[tuple[str, dict[str, object]]] = []
+    state = bot._RemoteCodexTransportState(
+        epoch="agent-epoch-1",
+        epoch_started_at=100.0,
+        current_generation=8,
+        candidate_epoch="agent-epoch-2",
+        candidate_heartbeat_count=1,
+    )
+    monkeypatch.setattr(
+        bot,
+        "_remote_transport_state_by_machine",
+        {"remote-node": state},
+    )
+    monkeypatch.setattr(bot, "_remote_transport_event_locks", {})
+    monkeypatch.setattr(
+        bot,
+        "emit_telemetry",
+        lambda event, **fields: telemetry.append((event, fields)),
+    )
+
+    gate = getattr(
+        bot,
+        "_remote_codex_mutation_dispatch_allowed",
+        None,
+    )
+    assert callable(gate)
+    assert await gate("remote-node") is False
+    assert telemetry[-1] == (
+        "transport.app_server.remote_mutation_deferred",
+        {
+            "machine_id": "remote-node",
+            "current_epoch": "agent-epoch-1",
+            "candidate_epoch": "agent-epoch-2",
+            "candidate_heartbeat_count": 1,
+        },
+    )
+
+    state.candidate_epoch = ""
+    state.candidate_heartbeat_count = 0
+    assert await gate("remote-node") == ("agent-epoch-1", 100.0)
+
+
+@pytest.mark.asyncio
+async def test_remote_mutation_gate_blocks_modern_machine_without_heartbeat(
+    monkeypatch,
+):
+    monkeypatch.setattr(bot, "_remote_transport_state_by_machine", {})
+    monkeypatch.setattr(bot, "_remote_transport_event_locks", {})
+    monkeypatch.setattr(
+        bot,
+        "node_registry",
+        SimpleNamespace(
+            get_node=lambda _machine_id: SimpleNamespace(
+                is_local=False,
+                transport="agent_rpc",
+                runtime={"codex_transport_protocol_version": 1},
+                codex_transport_legacy_confirmed=False,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_ids_for_machine",
+        lambda _machine_id: {"@remote"},
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_transport_state",
+        lambda _window_id: ("", 0.0, 0),
+    )
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    assert await bot._remote_codex_mutation_dispatch_allowed(
+        "remote-node"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_remote_mutation_gate_allows_confirmed_legacy_machine(
+    monkeypatch,
+):
+    monkeypatch.setattr(bot, "_remote_transport_state_by_machine", {})
+    monkeypatch.setattr(bot, "_remote_transport_event_locks", {})
+    monkeypatch.setattr(
+        bot,
+        "node_registry",
+        SimpleNamespace(
+            get_node=lambda _machine_id: SimpleNamespace(
+                is_local=False,
+                transport="agent_rpc",
+                runtime={},
+                codex_transport_legacy_confirmed=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_ids_for_machine",
+        lambda _machine_id: {"@legacy"},
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_transport_state",
+        lambda _window_id: ("", 0.0, 0),
+    )
+
+    assert await bot._remote_codex_mutation_dispatch_allowed(
+        "remote-node"
+    ) is True
 
 
 @pytest.mark.asyncio

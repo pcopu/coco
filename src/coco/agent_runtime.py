@@ -24,6 +24,8 @@ from .tts_runtime import stop_tts_server
 
 logger = logging.getLogger(__name__)
 
+AGENT_SHUTDOWN_RESET_REPORT_TIMEOUT_SECONDS = 5.0
+
 
 def _forwarded_transport_context(
     params: dict[str, object],
@@ -73,6 +75,39 @@ async def _heartbeat_loop(controller_client: ControllerRpcClient) -> None:
         await asyncio.sleep(max(5.0, float(config.node_heartbeat_interval)))
 
 
+async def _drain_shutdown_reset_reports(
+    *,
+    earlier_reset_reports: set[asyncio.Task[None]],
+    reset_report_tasks: set[asyncio.Task[None]],
+    final_reset_report_scheduled: bool | None = None,
+) -> None:
+    """Prefer the final reset report, or preserve the sole earlier report."""
+    shutdown_reset_reports = reset_report_tasks - earlier_reset_reports
+    has_final_report = (
+        bool(shutdown_reset_reports)
+        if final_reset_report_scheduled is None
+        else final_reset_report_scheduled
+    )
+    if has_final_report:
+        for task in earlier_reset_reports:
+            task.cancel()
+        if earlier_reset_reports:
+            await asyncio.gather(*earlier_reset_reports, return_exceptions=True)
+        reports_to_drain = shutdown_reset_reports
+    else:
+        reports_to_drain = earlier_reset_reports
+
+    if not reports_to_drain:
+        return
+    _done, still_pending = await asyncio.wait(
+        reports_to_drain,
+        timeout=AGENT_SHUTDOWN_RESET_REPORT_TIMEOUT_SECONDS,
+    )
+    for task in still_pending:
+        task.cancel()
+    await asyncio.gather(*reports_to_drain, return_exceptions=True)
+
+
 async def run_agent_async() -> None:
     """Start the non-Telegram agent runtime."""
     logger.info("Starting CoCo agent")
@@ -90,6 +125,7 @@ async def run_agent_async() -> None:
     controller_client: ControllerRpcClient | None = None
     heartbeat_task: asyncio.Task[None] | None = None
     reset_report_tasks: set[asyncio.Task[None]] = set()
+    reset_report_sequence = 0
 
     async def _report_transport_reset(
         *,
@@ -126,6 +162,7 @@ async def run_agent_async() -> None:
             )
 
     async def _transport_reset_handler(reason: str, generation: int) -> None:
+        nonlocal reset_report_sequence
         local_machine_id, _local_machine_name = (
             session_manager._local_machine_identity()
         )
@@ -140,6 +177,7 @@ async def run_agent_async() -> None:
             cleared_turns,
         )
         if controller_client is not None:
+            reset_report_sequence += 1
             transport_state = codex_app_server_client.transport_state_snapshot()
             reset_sequence = int(transport_state["reset_sequence"])
             task = asyncio.create_task(
@@ -196,18 +234,31 @@ async def run_agent_async() -> None:
     try:
         await asyncio.Event().wait()
     finally:
-        pending_reset_reports = list(reset_report_tasks)
-        for task in pending_reset_reports:
-            task.cancel()
-        if pending_reset_reports:
-            await asyncio.gather(*pending_reset_reports, return_exceptions=True)
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
-        await server.stop()
-        await stop_tts_server()
-        await codex_app_server_client.stop()
+        earlier_reset_reports = set(reset_report_tasks)
+        reset_report_sequence_before_stop = reset_report_sequence
+        try:
+            await server.stop()
+        finally:
+            try:
+                await codex_app_server_client.stop()
+            finally:
+                try:
+                    await _drain_shutdown_reset_reports(
+                        earlier_reset_reports=earlier_reset_reports,
+                        reset_report_tasks=set(reset_report_tasks),
+                        final_reset_report_scheduled=(
+                            reset_report_sequence
+                            > reset_report_sequence_before_stop
+                        ),
+                    )
+                finally:
+                    try:
+                        if heartbeat_task is not None:
+                            heartbeat_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await heartbeat_task
+                    finally:
+                        await stop_tts_server()
 
 
 def run_agent() -> None:

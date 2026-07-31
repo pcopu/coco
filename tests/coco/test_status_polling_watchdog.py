@@ -1,13 +1,27 @@
 """Tests for watchdog resend behavior in status polling."""
 
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter
 
+import coco.handlers.run_watchdog as run_watchdog
 import coco.handlers.status_polling as status_polling
 from coco.handlers.run_watchdog import RunWatchCheck
+
+
+@pytest.fixture
+def isolated_run_watchdog(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_watchdog,
+        "_RUN_RETRY_STATE_FILE",
+        tmp_path / "run_watchdog_retry_state.json",
+    )
+    run_watchdog.reset_run_watchdog_for_tests()
+    yield
+    run_watchdog.reset_run_watchdog_for_tests()
 
 
 @pytest.mark.asyncio
@@ -529,6 +543,320 @@ async def test_emit_due_watchdog_does_not_label_protocol_error_as_recycle(
 
 
 @pytest.mark.asyncio
+async def test_transport_uncertainty_notice_is_one_shot_and_clears_watch(
+    monkeypatch,
+    isolated_run_watchdog,
+):
+    sent_messages: list[str] = []
+    now = [605.0]
+
+    run_watchdog.note_run_started(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+    run_watchdog.note_transport_reset_uncertainty(
+        window_ids={"@reset"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    monkeypatch.setattr(run_watchdog.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "resolve_chat_id",
+        lambda _u, _t: -100,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_display_name",
+        lambda _w: "demo",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_thread_id",
+        lambda _w: "",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _w: "",
+    )
+
+    async def _safe_send(_bot, _chat_id, text: str, **_kwargs):
+        sent_messages.append(text)
+        return SimpleNamespace(message_id=1)
+
+    monkeypatch.setattr(status_polling, "safe_send", _safe_send)
+
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+    )
+    now[0] = 1205.0
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+    )
+
+    assert len(sent_messages) == 1
+    assert "interrupted" in sent_messages[0].lower()
+    assert "send a new message to resume" in sent_messages[0].lower()
+    assert run_watchdog.get_immediate_auto_retry_candidate(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        now=1205.0,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_transport_uncertainty_notice_does_not_clear_replacement_watch(
+    monkeypatch,
+    isolated_run_watchdog,
+):
+    run_watchdog.note_run_started(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+    run_watchdog.note_transport_reset_uncertainty(
+        window_ids={"@reset"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    monkeypatch.setattr(run_watchdog.time, "monotonic", lambda: 35.0)
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "resolve_chat_id",
+        lambda _u, _t: -100,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_display_name",
+        lambda _w: "demo",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_thread_id",
+        lambda _w: "",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _w: "",
+    )
+
+    async def _safe_send(*_args, **_kwargs):
+        # Simulate the user sending the same text again while Telegram delivery
+        # of the prior interruption notice is still in flight.
+        run_watchdog.note_run_started(
+            user_id=1,
+            thread_id=12,
+            window_id="@reset",
+            source="user_input",
+            expect_response=True,
+            pending_text="run once",
+            now=36.0,
+        )
+        return SimpleNamespace(message_id=2)
+
+    monkeypatch.setattr(status_polling, "safe_send", _safe_send)
+
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+    )
+
+    candidate = run_watchdog.get_immediate_auto_retry_candidate(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        now=36.0,
+    )
+    assert candidate is not None
+    assert candidate.auto_retry_reason == "eligible"
+
+
+@pytest.mark.asyncio
+async def test_transport_uncertainty_safe_send_none_retries_on_next_poll(
+    monkeypatch,
+    isolated_run_watchdog,
+):
+    run_watchdog.note_run_started(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+    run_watchdog.note_transport_reset_uncertainty(
+        window_ids={"@reset"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    monkeypatch.setattr(run_watchdog.time, "monotonic", lambda: 1805.0)
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "resolve_chat_id",
+        lambda _u, _t: -100,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_display_name",
+        lambda _w: "demo",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_thread_id",
+        lambda _w: "",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _w: "",
+    )
+
+    send_attempts = 0
+
+    async def _safe_send(*_args, **_kwargs):
+        nonlocal send_attempts
+        send_attempts += 1
+        if send_attempts == 1:
+            return None
+        return SimpleNamespace(message_id=3)
+
+    monkeypatch.setattr(status_polling, "safe_send", _safe_send)
+
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+    )
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+    )
+
+    assert send_attempts == 2
+    assert run_watchdog.get_immediate_auto_retry_candidate(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        now=1805.0,
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "send_error",
+    [
+        pytest.param(NetworkError("telegram unavailable"), id="network-error"),
+        pytest.param(RetryAfter(timedelta(seconds=1)), id="retry-after"),
+    ],
+)
+async def test_transport_uncertainty_send_failure_retries_on_next_poll(
+    monkeypatch,
+    isolated_run_watchdog,
+    send_error,
+):
+    run_watchdog.note_run_started(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+    run_watchdog.note_transport_reset_uncertainty(
+        window_ids={"@reset"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    monkeypatch.setattr(run_watchdog.time, "monotonic", lambda: 1805.0)
+    monkeypatch.setattr(status_polling, "get_interactive_window", lambda _u, _t: None)
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "resolve_chat_id",
+        lambda _u, _t: -100,
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_display_name",
+        lambda _w: "demo",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_thread_id",
+        lambda _w: "",
+    )
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _w: "",
+    )
+
+    send_attempts = 0
+
+    async def _safe_send(*_args, **_kwargs):
+        nonlocal send_attempts
+        send_attempts += 1
+        if send_attempts == 1:
+            raise send_error
+        return SimpleNamespace(message_id=4)
+
+    monkeypatch.setattr(status_polling, "safe_send", _safe_send)
+
+    with pytest.raises(type(send_error)):
+        await status_polling._emit_due_run_watchdog_checks(
+            bot=SimpleNamespace(),
+            user_id=1,
+            thread_id=12,
+            window_id="@reset",
+        )
+    await status_polling._emit_due_run_watchdog_checks(
+        bot=SimpleNamespace(),
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+    )
+
+    assert send_attempts == 2
+    assert run_watchdog.get_immediate_auto_retry_candidate(
+        user_id=1,
+        thread_id=12,
+        window_id="@reset",
+        now=1805.0,
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_emit_due_watchdog_records_retry_result_on_success(monkeypatch):
     sent_messages: list[str] = []
     recorded_results: list[bool] = []
@@ -920,3 +1248,95 @@ async def test_status_poll_loop_skips_only_busy_topic_not_all_user_topics(monkey
     assert "personality:@idle" in events
     assert "autoresearch:@idle" in events
     assert pending_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_status_poll_loop_checks_transport_interruption_for_busy_topic(
+    monkeypatch,
+    isolated_run_watchdog,
+):
+    events: list[str] = []
+
+    run_watchdog.note_run_started(
+        user_id=1,
+        thread_id=10,
+        window_id="@reset",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+    run_watchdog.note_transport_reset_uncertainty(
+        window_ids={"@reset"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    monkeypatch.setattr(status_polling.config, "session_provider", "codex")
+    monkeypatch.setattr(status_polling.config, "runtime_mode", "app_server_only")
+    monkeypatch.setattr(
+        status_polling.session_manager,
+        "iter_topic_window_bindings",
+        lambda: [(1, 10, "@reset")],
+    )
+    monkeypatch.setattr(status_polling, "prune_run_watch_topics", lambda _topics: None)
+    monkeypatch.setattr(status_polling, "prune_looper_topics", lambda _topics: None)
+    monkeypatch.setattr(status_polling, "TOPIC_CHECK_INTERVAL", 60.0)
+    monkeypatch.setattr(status_polling.time, "monotonic", lambda: 35.0)
+
+    async def _no_op_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(status_polling, "_probe_stale_nodes", _no_op_async)
+    monkeypatch.setattr(status_polling, "_emit_node_status_notifications", _no_op_async)
+    monkeypatch.setattr(
+        status_polling,
+        "_emit_due_resource_monitor_notifications",
+        _no_op_async,
+    )
+    monkeypatch.setattr(
+        status_polling,
+        "_emit_due_codex_account_notifications",
+        _no_op_async,
+    )
+
+    async def _get_pending_delivery_topics(_uid: int) -> set[int]:
+        return {10}
+
+    monkeypatch.setattr(
+        status_polling,
+        "get_pending_delivery_topics",
+        _get_pending_delivery_topics,
+    )
+
+    async def _emit_watchdog(
+        _bot,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        window_id: str,
+    ):
+        _ = user_id, thread_id
+        events.append(f"watchdog:{window_id}")
+
+    async def _emit_background(*_args, **_kwargs):
+        events.append("background")
+
+    monkeypatch.setattr(status_polling, "_emit_due_run_watchdog_checks", _emit_watchdog)
+    monkeypatch.setattr(status_polling, "_emit_due_looper_prompt", _emit_background)
+    monkeypatch.setattr(status_polling, "_emit_due_personality_delivery", _emit_background)
+    monkeypatch.setattr(status_polling, "_emit_due_autoresearch_delivery", _emit_background)
+
+    async def _cancel_sleep(_seconds: float):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(status_polling.asyncio, "sleep", _cancel_sleep)
+
+    class _Bot:
+        async def unpin_all_forum_topic_messages(self, **_kwargs):
+            raise AssertionError("topic probe should not run")
+
+    with pytest.raises(asyncio.CancelledError):
+        await status_polling.status_poll_loop(_Bot())
+
+    assert events == ["watchdog:@reset"]

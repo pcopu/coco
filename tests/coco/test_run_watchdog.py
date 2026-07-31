@@ -606,6 +606,35 @@ def test_transport_uncertainty_suppresses_replay_without_known_turn_id():
     _clear()
 
 
+def test_transport_uncertainty_reason_survives_delayed_first_poll():
+    _clear()
+    watchdog.note_run_started(
+        user_id=5,
+        thread_id=51,
+        window_id="@5",
+        source="user_input",
+        expect_response=True,
+        pending_text="run once",
+        now=0.0,
+    )
+    watchdog.note_transport_reset_uncertainty(
+        window_ids={"@5"},
+        reason="request_timeout:turn/start",
+        now=5.0,
+    )
+
+    due = watchdog.get_due_run_checks(
+        user_id=5,
+        thread_id=51,
+        window_id="@5",
+        now=605.0,
+    )
+
+    assert [item.checkpoint_seconds for item in due] == [30, 60, 180, 300, 600]
+    assert {item.auto_retry_reason for item in due} == {"transport_uncertain"}
+    assert all(item.auto_retry_allowed is False for item in due)
+
+
 def test_window_change_clears_stale_state():
     _clear()
     watchdog.note_run_started(
