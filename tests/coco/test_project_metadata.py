@@ -36,6 +36,15 @@ def test_package_version_matches_project_metadata() -> None:
     assert coco.__version__ == payload["project"]["version"]
 
 
+def test_runtime_dependencies_cover_audio_and_legacy_markdown_imports() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = set(payload["project"]["dependencies"])
+
+    assert "soundfile>=0.13.1" in dependencies
+    assert "mistletoe==1.4.0" in dependencies
+    assert "telegramify-markdown>=0.5.0,<1.0.0" in dependencies
+
+
 def test_readme_uses_coco_title() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert readme.startswith("# CoCo: Orchestrate Codex across machines through Telegram.\n")
