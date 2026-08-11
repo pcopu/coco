@@ -1865,12 +1865,49 @@ class CodexAppServerClient:
             return False
         return f"Timed out waiting for app-server response: {method}" in str(err)
 
+    async def recover_uncertain_turn_timeout(
+        self,
+        *,
+        method: str,
+        thread_id: str = "",
+        turn_id: str = "",
+    ) -> bool:
+        """Replace a poisoned turn transport once, without replaying the request."""
+        if method not in {"turn/start", "turn/steer"}:
+            raise ValueError(f"Unsupported uncertain turn method: {method}")
+
+        uncertain_thread_id = thread_id.strip() if method == "turn/steer" else ""
+        uncertain_turn_id = turn_id.strip() if uncertain_thread_id else ""
+        expected_generation = self._transport_generation
+        expected_stop_sequence = self._stop_sequence
+        recycled = await self._recycle_timed_out_transport(
+            expected_generation=expected_generation,
+            expected_stop_sequence=expected_stop_sequence,
+            method=method,
+            recover_uncertain_turn=True,
+            uncertain_thread_id=uncertain_thread_id,
+            uncertain_turn_id=uncertain_turn_id,
+        )
+        if recycled:
+            return True
+        return bool(
+            (
+                self._transport_generation != expected_generation
+                or expected_generation
+                not in self._uncertain_mutation_generations
+            )
+            and self._is_transport_ready()
+        )
+
     async def _recycle_timed_out_transport(
         self,
         *,
         expected_generation: int,
         expected_stop_sequence: int | None = None,
         method: str,
+        recover_uncertain_turn: bool = False,
+        uncertain_thread_id: str = "",
+        uncertain_turn_id: str = "",
     ) -> bool:
         """Recycle one failed generation exactly once across concurrent callers."""
         if expected_stop_sequence is None:
@@ -1883,14 +1920,48 @@ class CodexAppServerClient:
                     if self._transport_generation != expected_generation:
                         await self._ensure_started_locked()
                         return False
-                    if self._has_mutation_recycle_fence():
+                    if recover_uncertain_turn and (
+                        expected_generation
+                        not in self._uncertain_mutation_generations
+                    ):
+                        # The failed generation was already recovered while this
+                        # caller waited. Never recycle its healthy replacement.
+                        return self._is_transport_ready()
+                    if recover_uncertain_turn and self._in_flight_mutation_requests:
+                        logger.warning(
+                            "Skipping uncertain app-server timeout recovery (%s); "
+                            "%d unrelated mutation(s) remain in flight",
+                            method,
+                            len(self._in_flight_mutation_requests),
+                        )
+                        return False
+                    unrelated_active_turns = sum(
+                        1
+                        for active_thread_id, active_turn_id in self._active_turns.items()
+                        if not (
+                            active_thread_id == uncertain_thread_id
+                            and active_turn_id == uncertain_turn_id
+                        )
+                    )
+                    if recover_uncertain_turn and unrelated_active_turns:
+                        logger.warning(
+                            "Skipping uncertain app-server timeout recovery (%s); "
+                            "%d unrelated turn(s) remain active",
+                            method,
+                            unrelated_active_turns,
+                        )
+                        return False
+                    if (
+                        not recover_uncertain_turn
+                        and self._has_mutation_recycle_fence()
+                    ):
                         logger.warning(
                             "Skipping app-server timeout recycle (%s); a "
                             "mutation became in flight or uncertain before cleanup",
                             method,
                         )
                         return False
-                    if self._active_turns:
+                    if not recover_uncertain_turn and self._active_turns:
                         logger.warning(
                             "Skipping app-server timeout recycle (%s); %d turn(s) "
                             "became active before cleanup",
@@ -1898,9 +1969,20 @@ class CodexAppServerClient:
                             len(self._active_turns),
                         )
                         return False
+                    if recover_uncertain_turn:
+                        logger.warning(
+                            "Recycling app-server after uncertain %s timeout "
+                            "(generation=%d)",
+                            method,
+                            expected_generation,
+                        )
                     await self._stop_locked()
                     await self._notify_transport_reset(
-                        f"request_timeout:{method}",
+                        (
+                            f"uncertain_timeout:{method}"
+                            if recover_uncertain_turn
+                            else f"request_timeout:{method}"
+                        ),
                         expected_generation,
                     )
                     if self._stop_sequence != expected_stop_sequence:

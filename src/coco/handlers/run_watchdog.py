@@ -2,7 +2,7 @@
 
 Phase A behavior:
   - Track user turns awaiting the first assistant signal per (user, topic).
-  - Trigger checks at 30s, 1m, 3m, 5m, 10m, 20m, 30m, then every 30m.
+  - Trigger finite checks at 30s, 1m, 3m, 5m, 10m, 20m, and 30m.
   - Optional auto-resend uses the original pending user text.
   - Auto-resend is capped (max 2), skips oversized payloads, and is persisted
     by message fingerprint.
@@ -31,8 +31,6 @@ RUN_CHECKPOINTS_SECONDS: tuple[int, ...] = (
     20 * 60,
     30 * 60,
 )
-# After the last explicit checkpoint, keep pinging every 30 minutes.
-RUN_REPEAT_CHECKPOINT_INTERVAL_SECONDS = 30 * 60
 # Only these checkpoints may trigger an auto-resend.
 RUN_AUTO_RESEND_CHECKPOINTS_SECONDS: tuple[int, ...] = (30, 60)
 # Hard cap per pending message fingerprint.
@@ -649,15 +647,7 @@ def get_due_run_checks(
     elapsed = max(0.0, ts - state.started_at)
     due: list[RunWatchCheck] = []
 
-    checkpoints = list(RUN_CHECKPOINTS_SECONDS)
-    if checkpoints:
-        last_checkpoint = checkpoints[-1]
-        repeat_checkpoint = last_checkpoint + RUN_REPEAT_CHECKPOINT_INTERVAL_SECONDS
-        while repeat_checkpoint <= elapsed:
-            checkpoints.append(repeat_checkpoint)
-            repeat_checkpoint += RUN_REPEAT_CHECKPOINT_INTERVAL_SECONDS
-
-    for checkpoint in checkpoints:
+    for checkpoint in RUN_CHECKPOINTS_SECONDS:
         if checkpoint in state.fired_checkpoints:
             continue
         if elapsed >= checkpoint:

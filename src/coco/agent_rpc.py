@@ -566,6 +566,11 @@ class AgentRpcServer:
             "turn_id": turn_id,
             "model_slug": model_slug,
             "reasoning_effort": reasoning_effort,
+            "session_start_reason": (
+                session_manager.peek_window_pending_session_start_reason(
+                    window_id
+                )
+            ),
             "transport_lifecycle_noop": not bool(thread_id),
             **_codex_transport_response_fields(),
         }

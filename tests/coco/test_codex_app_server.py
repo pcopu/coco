@@ -2089,6 +2089,272 @@ async def test_mutating_request_timeout_preserves_idle_transport_without_replay(
 
 
 @pytest.mark.asyncio
+async def test_uncertain_turn_timeout_recovery_preserves_unrelated_active_turn(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+    client._uncertain_mutation_generations.add(7)
+    client._active_turns["thread-other"] = "turn-other"
+    lifecycle_calls: list[str] = []
+
+    async def _stop_locked() -> None:
+        lifecycle_calls.append("stop")
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+
+    recovered = await client.recover_uncertain_turn_timeout(method="turn/start")
+
+    assert recovered is False
+    assert lifecycle_calls == []
+    assert client.get_active_turn_id("thread-other") == "turn-other"
+    assert client._transport_generation == 7
+
+
+@pytest.mark.asyncio
+async def test_uncertain_turn_timeout_recovery_recycles_with_exact_target_turn(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+    client._uncertain_mutation_generations.add(7)
+    client._active_turns["thread-stale"] = "turn-stale"
+    lifecycle_calls: list[str] = []
+
+    async def _stop_locked() -> None:
+        lifecycle_calls.append("stop")
+        client._proc = None
+        client._initialized = False
+        client._active_turns.clear()
+        client._uncertain_mutation_generations.clear()
+
+    async def _ensure_started_locked() -> None:
+        lifecycle_calls.append("start")
+        client._proc = _FakeProc()
+        client._initialized = True
+        client._transport_generation += 1
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+    monkeypatch.setattr(client, "_ensure_started_locked", _ensure_started_locked)
+    monkeypatch.setattr(
+        client,
+        "_notify_transport_reset",
+        lambda *_args: asyncio.sleep(0),
+    )
+
+    recovered = await client.recover_uncertain_turn_timeout(
+        method="turn/steer",
+        thread_id="thread-stale",
+        turn_id="turn-stale",
+    )
+
+    assert recovered is True
+    assert lifecycle_calls == ["stop", "start"]
+    assert client._transport_generation == 8
+
+
+@pytest.mark.asyncio
+async def test_uncertain_turn_timeout_recovery_preserves_newer_target_turn(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+    client._uncertain_mutation_generations.add(7)
+    client._active_turns["thread-stale"] = "turn-stale"
+    lifecycle_calls: list[str] = []
+
+    async def _stop_locked() -> None:
+        lifecycle_calls.append("stop")
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+
+    await client._recycle_lock.acquire()
+    recovery_task = asyncio.create_task(
+        client.recover_uncertain_turn_timeout(
+            method="turn/steer",
+            thread_id="thread-stale",
+            turn_id="turn-stale",
+        )
+    )
+    await asyncio.sleep(0)
+    client._active_turns["thread-stale"] = "turn-new"
+    client._recycle_lock.release()
+
+    recovered = await recovery_task
+
+    assert recovered is False
+    assert lifecycle_calls == []
+    assert client.get_active_turn_id("thread-stale") == "turn-new"
+
+
+@pytest.mark.asyncio
+async def test_uncertain_turn_timeout_recovery_preserves_unrelated_mutation(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+    client._uncertain_mutation_generations.add(7)
+    unrelated_task = asyncio.create_task(asyncio.sleep(60))
+    client._in_flight_mutation_requests[unrelated_task] = "thread/start"
+    lifecycle_calls: list[str] = []
+
+    async def _stop_locked() -> None:
+        lifecycle_calls.append("stop")
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+
+    try:
+        recovered = await client.recover_uncertain_turn_timeout(
+            method="turn/start"
+        )
+    finally:
+        unrelated_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await unrelated_task
+
+    assert recovered is False
+    assert lifecycle_calls == []
+    assert client._transport_generation == 7
+
+
+@pytest.mark.asyncio
+async def test_concurrent_uncertain_timeout_recovery_waits_for_replacement(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+    client._uncertain_mutation_generations.add(7)
+    stop_entered = asyncio.Event()
+    allow_restart = asyncio.Event()
+    lifecycle_calls: list[str] = []
+
+    async def _stop_locked() -> None:
+        lifecycle_calls.append("stop")
+        client._proc = None
+        client._initialized = False
+        client._uncertain_mutation_generations.clear()
+        stop_entered.set()
+        await allow_restart.wait()
+
+    async def _ensure_started_locked() -> None:
+        if client._is_transport_ready():
+            return
+        lifecycle_calls.append("start")
+        client._proc = _FakeProc()
+        client._initialized = True
+        client._transport_generation += 1
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+    monkeypatch.setattr(client, "_ensure_started_locked", _ensure_started_locked)
+    monkeypatch.setattr(
+        client,
+        "_notify_transport_reset",
+        lambda *_args: asyncio.sleep(0),
+    )
+
+    first = asyncio.create_task(
+        client.recover_uncertain_turn_timeout(method="turn/start")
+    )
+    await asyncio.wait_for(stop_entered.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        client.recover_uncertain_turn_timeout(method="turn/start")
+    )
+    await asyncio.sleep(0)
+    allow_restart.set()
+
+    recovered = await asyncio.gather(first, second)
+
+    assert recovered == [True, True]
+    assert lifecycle_calls == ["stop", "start"]
+    assert client._transport_generation == 8
+
+
+@pytest.mark.asyncio
+async def test_uncertain_turn_timeout_recovery_recycles_once_without_replay(
+    monkeypatch,
+):
+    client = cas.CodexAppServerClient()
+    client._proc = _FakeProc()
+    client._initialized = True
+    client._transport_generation = 7
+
+    request_calls: list[str] = []
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+    ) -> object:
+        _ = timeout, expected_stop_sequence
+        request_calls.append(method)
+        client._mark_mutation_request_dispatched(method)
+        raise cas.CodexAppServerError(
+            f"Timed out waiting for app-server response: {method}"
+        )
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "_request_started", _request_started)
+
+    with pytest.raises(
+        cas.CodexAppServerError,
+        match="Timed out waiting for app-server response: turn/start",
+    ):
+        await client.request("turn/start", {}, timeout=0.01)
+
+    assert request_calls == ["turn/start"]
+    assert client._uncertain_mutation_generations == {7}
+
+    lifecycle_calls: list[str] = []
+    reset_calls: list[tuple[str, int]] = []
+
+    async def _stop_locked() -> None:
+        lifecycle_calls.append("stop")
+        client._proc = None
+        client._initialized = False
+        client._active_turns.clear()
+        client._uncertain_mutation_generations.clear()
+
+    async def _ensure_started_locked() -> None:
+        lifecycle_calls.append("start")
+        client._proc = _FakeProc()
+        client._initialized = True
+        client._transport_generation += 1
+
+    async def _notify_transport_reset(reason: str, generation: int) -> None:
+        reset_calls.append((reason, generation))
+
+    monkeypatch.setattr(client, "_stop_locked", _stop_locked)
+    monkeypatch.setattr(client, "_ensure_started_locked", _ensure_started_locked)
+    monkeypatch.setattr(client, "_notify_transport_reset", _notify_transport_reset)
+
+    recovered = await asyncio.gather(
+        client.recover_uncertain_turn_timeout(method="turn/start"),
+        client.recover_uncertain_turn_timeout(method="turn/start"),
+    )
+
+    assert recovered == [True, True]
+    assert request_calls == ["turn/start"]
+    assert lifecycle_calls == ["stop", "start"]
+    assert reset_calls == [("uncertain_timeout:turn/start", 7)]
+    assert client._transport_generation == 8
+
+
+@pytest.mark.asyncio
 async def test_success_result_survives_concurrent_mutation_timeout_without_recycle(
     monkeypatch,
 ):

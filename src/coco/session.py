@@ -53,6 +53,23 @@ class _CodexAggregateResumeLimitError(CodexAppServerError):
     """Raised when another history would exceed the shared transport budget."""
 
 
+class _CodexTurnTimeoutError(CodexAppServerError):
+    """Turn timeout carrying the immutable thread/turn selected at dispatch."""
+
+    def __init__(
+        self,
+        error: CodexAppServerError,
+        *,
+        method: str,
+        thread_id: str,
+        turn_id: str = "",
+    ) -> None:
+        super().__init__(str(error))
+        self.method = method
+        self.thread_id = thread_id.strip()
+        self.turn_id = turn_id.strip()
+
+
 APP_SERVER_MAX_TEXT_CHARS_PER_INPUT = 3000
 APP_SERVER_TURN_START_TIMEOUT_SECONDS = 20.0
 APP_SERVER_THREAD_NOT_FOUND_RE = re.compile(r"\bthread not found\b", re.IGNORECASE)
@@ -2630,6 +2647,7 @@ class SessionManager:
         ):
             state = self.get_window_state(window_id)
             cwd = state.cwd.strip()
+            oversized_rollover = False
             if not cwd:
                 return False, "No workspace bound to this topic. Run /folder first."
             if machine_id and machine_id != local_machine_id:
@@ -2650,6 +2668,10 @@ class SessionManager:
                 except RemoteCodexMutationDeferredError as exc:
                     return False, str(exc)
                 resumed_thread_id = str(resume_result.get("thread_id", "")).strip()
+                oversized_rollover = (
+                    str(resume_result.get("session_start_reason", "")).strip()
+                    == "oversized_rollover"
+                )
                 if resumed_thread_id:
                     self.set_window_codex_thread_id(window_id, resumed_thread_id)
                     self.set_window_codex_active_turn_id(
@@ -2677,12 +2699,18 @@ class SessionManager:
                         }.items()
                         if value
                     }
+                elif oversized_rollover:
+                    self.set_window_codex_thread_id(window_id, "")
             else:
                 resumed_thread_id = await self.resume_latest_codex_session_for_window(
                     window_id=window_id,
                     cwd=cwd,
                 )
-            if not resumed_thread_id:
+                oversized_rollover = (
+                    self.peek_window_pending_session_start_reason(window_id)
+                    == "oversized_rollover"
+                )
+            if not resumed_thread_id and not oversized_rollover:
                 return False, "Failed to resume the latest Codex session for this folder."
 
         goal_context = await self._build_live_goal_context(
@@ -5038,11 +5066,21 @@ class SessionManager:
             steer = False
 
         if steer or active_turn:
-            result = await codex_app_server_client.turn_steer(
-                thread_id=thread_id,
-                expected_turn_id=active_turn,
-                inputs=turn_inputs,
-            )
+            try:
+                result = await codex_app_server_client.turn_steer(
+                    thread_id=thread_id,
+                    expected_turn_id=active_turn,
+                    inputs=turn_inputs,
+                )
+            except CodexAppServerError as error:
+                if self._is_turn_steer_timeout_error(error):
+                    raise _CodexTurnTimeoutError(
+                        error,
+                        method="turn/steer",
+                        thread_id=thread_id,
+                        turn_id=active_turn,
+                    ) from error
+                raise
             new_turn_id = result.get("turnId") if isinstance(result, dict) else None
             state.codex_active_turn_id = (
                 new_turn_id
@@ -5055,13 +5093,22 @@ class SessionManager:
                 turn_start_kwargs["model_slug"] = model_slug
             if reasoning_effort:
                 turn_start_kwargs["reasoning_effort"] = reasoning_effort
-            result = await self._turn_start_with_retry(
-                thread_id=thread_id,
-                inputs=turn_inputs,
-                approval_policy=approval_policy,
-                service_tier=service_tier,
-                **turn_start_kwargs,
-            )
+            try:
+                result = await self._turn_start_with_retry(
+                    thread_id=thread_id,
+                    inputs=turn_inputs,
+                    approval_policy=approval_policy,
+                    service_tier=service_tier,
+                    **turn_start_kwargs,
+                )
+            except CodexAppServerError as error:
+                if self._is_turn_start_timeout(error):
+                    raise _CodexTurnTimeoutError(
+                        error,
+                        method="turn/start",
+                        thread_id=thread_id,
+                    ) from error
+                raise
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None
             state.codex_active_turn_id = turn_id if isinstance(turn_id, str) else ""
@@ -5137,6 +5184,20 @@ class SessionManager:
                     stale_thread_id = fallback_state.codex_thread_id.strip()
                     stale_turn_id = fallback_state.codex_active_turn_id.strip()
                     error_text = str(e)
+                    turn_timeout_method = (
+                        "turn/start"
+                        if self._is_turn_start_timeout(e)
+                        else (
+                            "turn/steer"
+                            if self._is_turn_steer_timeout_error(e)
+                            else ""
+                        )
+                    )
+                    timeout_thread_id = stale_thread_id
+                    timeout_turn_id = stale_turn_id
+                    if isinstance(e, _CodexTurnTimeoutError):
+                        timeout_thread_id = e.thread_id
+                        timeout_turn_id = e.turn_id
                     if self._is_missing_codex_thread_error(e):
                         try:
                             return await self._retry_send_after_missing_codex_thread(
@@ -5162,26 +5223,36 @@ class SessionManager:
                             error_text = (
                                 f"{error_text}; retry with new thread failed: {retry_error}"
                             )
-                    elif self._is_turn_steer_timeout_error(e):
-                        if stale_thread_id:
-                            codex_app_server_client.clear_active_turn(
-                                stale_thread_id
+                            retry_timeout_method = (
+                                retry_error.method
+                                if isinstance(retry_error, _CodexTurnTimeoutError)
+                                else (
+                                    "turn/start"
+                                    if self._is_turn_start_timeout(retry_error)
+                                    else (
+                                        "turn/steer"
+                                        if self._is_turn_steer_timeout_error(
+                                            retry_error
+                                        )
+                                        else ""
+                                    )
+                                )
                             )
-                        self.clear_window_codex_turn(window_id)
-                        emit_telemetry(
-                            "transport.app_server.steer_timeout_uncertain",
-                            runtime_mode=config.runtime_mode,
-                            codex_transport=config.codex_transport,
-                            window_id=window_id,
-                            display=display,
-                            steer=steer,
-                            stale_turn_id=stale_turn_id,
-                            thread_id=stale_thread_id,
-                        )
-                        error_text = (
-                            f"{error_text}; transport recycled and the "
-                            "uncertain request was not replayed"
-                        )
+                            if retry_timeout_method:
+                                turn_timeout_method = retry_timeout_method
+                                if isinstance(
+                                    retry_error,
+                                    _CodexTurnTimeoutError,
+                                ):
+                                    timeout_thread_id = retry_error.thread_id
+                                    timeout_turn_id = retry_error.turn_id
+                                else:
+                                    timeout_thread_id = (
+                                        fallback_state.codex_thread_id.strip()
+                                    )
+                                    timeout_turn_id = (
+                                        fallback_state.codex_active_turn_id.strip()
+                                    )
                     elif self._is_no_active_turn_error(e):
                         try:
                             return await self._retry_send_after_no_active_turn(
@@ -5209,6 +5280,107 @@ class SessionManager:
                             error_text = (
                                 f"{error_text}; retry with turn/start failed: {retry_error}"
                             )
+                            retry_timeout_method = (
+                                retry_error.method
+                                if isinstance(retry_error, _CodexTurnTimeoutError)
+                                else (
+                                    "turn/start"
+                                    if self._is_turn_start_timeout(retry_error)
+                                    else (
+                                        "turn/steer"
+                                        if self._is_turn_steer_timeout_error(
+                                            retry_error
+                                        )
+                                        else ""
+                                    )
+                                )
+                            )
+                            if retry_timeout_method:
+                                turn_timeout_method = retry_timeout_method
+                                if isinstance(
+                                    retry_error,
+                                    _CodexTurnTimeoutError,
+                                ):
+                                    timeout_thread_id = retry_error.thread_id
+                                    timeout_turn_id = retry_error.turn_id
+                                else:
+                                    timeout_thread_id = (
+                                        fallback_state.codex_thread_id.strip()
+                                    )
+                                    timeout_turn_id = (
+                                        fallback_state.codex_active_turn_id.strip()
+                                    )
+                    if turn_timeout_method:
+                        if turn_timeout_method == "turn/steer":
+                            emit_telemetry(
+                                "transport.app_server.steer_timeout_uncertain",
+                                runtime_mode=config.runtime_mode,
+                                codex_transport=config.codex_transport,
+                                window_id=window_id,
+                                display=display,
+                                steer=steer,
+                                stale_turn_id=timeout_turn_id,
+                                thread_id=timeout_thread_id,
+                            )
+                        recovery_error = ""
+                        try:
+                            recover_timeout = (
+                                codex_app_server_client.recover_uncertain_turn_timeout
+                            )
+                            recovery_kwargs = {"method": turn_timeout_method}
+                            if turn_timeout_method == "turn/steer":
+                                recovery_kwargs.update(
+                                    {
+                                        "thread_id": timeout_thread_id,
+                                        "turn_id": timeout_turn_id,
+                                    }
+                                )
+                            transport_recovered = await recover_timeout(**recovery_kwargs)
+                        except Exception as recovery_exception:
+                            transport_recovered = False
+                            recovery_error = str(recovery_exception)
+                            logger.exception(
+                                "Failed recovering app-server after uncertain %s "
+                                "timeout",
+                                turn_timeout_method,
+                            )
+                        if (
+                            fallback_state.codex_thread_id.strip()
+                            == timeout_thread_id
+                        ):
+                            self.set_window_codex_active_turn_id(
+                                window_id,
+                                codex_app_server_client.get_active_turn_id(
+                                    timeout_thread_id
+                                )
+                                or "",
+                            )
+                        recovery_event = (
+                            "transport.app_server.uncertain_turn_timeout_recovered"
+                            if transport_recovered
+                            else "transport.app_server.uncertain_turn_timeout_recovery_failed"
+                        )
+                        emit_telemetry(
+                            recovery_event,
+                            runtime_mode=config.runtime_mode,
+                            codex_transport=config.codex_transport,
+                            window_id=window_id,
+                            display=display,
+                            steer=steer,
+                            method=turn_timeout_method,
+                            stale_turn_id=timeout_turn_id,
+                            thread_id=timeout_thread_id,
+                            error=recovery_error,
+                        )
+                        recovery_status = (
+                            "transport recovered"
+                            if transport_recovered
+                            else "transport recovery failed"
+                        )
+                        error_text = (
+                            f"{error_text}; {recovery_status}; the uncertain "
+                            "request was not replayed"
+                        )
                     logger.warning(
                         "App-server send failed for %s (%s): %s",
                         window_id,

@@ -155,7 +155,7 @@ def test_due_checkpoints_fire_once_at_expanding_intervals_with_resend_policy():
         window_id="@2",
         now=3600.0,
     )
-    assert [item.checkpoint_seconds for item in due_3600] == [3600]
+    assert due_3600 == []
 
     assert watchdog.get_due_run_checks(
         user_id=2,
@@ -164,6 +164,40 @@ def test_due_checkpoints_fire_once_at_expanding_intervals_with_resend_policy():
         now=3601.0,
     ) == []
     _clear()
+
+
+def test_checkpoint_schedule_stops_after_terminal_30_minute_check():
+    watchdog.note_run_started(
+        user_id=3,
+        thread_id=30,
+        window_id="@3",
+        source="user_input",
+        expect_response=True,
+        pending_text="long-running request",
+        now=0.0,
+    )
+
+    for checkpoint in watchdog.RUN_CHECKPOINTS_SECONDS:
+        due = watchdog.get_due_run_checks(
+            user_id=3,
+            thread_id=30,
+            window_id="@3",
+            now=float(checkpoint),
+        )
+        assert [item.checkpoint_seconds for item in due] == [checkpoint]
+
+    assert watchdog.get_due_run_checks(
+        user_id=3,
+        thread_id=30,
+        window_id="@3",
+        now=60 * 60,
+    ) == []
+    assert watchdog.get_due_run_checks(
+        user_id=3,
+        thread_id=30,
+        window_id="@3",
+        now=48 * 60 * 60,
+    ) == []
 
 
 def test_retry_count_persists_for_same_text_across_restart():

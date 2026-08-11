@@ -274,6 +274,10 @@ async def test_agent_resume_latest_marks_empty_result_as_lifecycle_noop(
 
     async def _resume_latest(*, window_id: str, cwd: str) -> str:
         _ = window_id, cwd
+        session_manager.mark_window_pending_session_start_reason(
+            window_id,
+            "oversized_rollover",
+        )
         return ""
 
     monkeypatch.setattr(
@@ -300,6 +304,7 @@ async def test_agent_resume_latest_marks_empty_result_as_lifecycle_noop(
             }
         )
     finally:
+        session_manager.consume_window_pending_session_start_reason(window_id)
         if previous_state is None:
             session_manager.window_states.pop(window_id, None)
         else:
@@ -307,6 +312,7 @@ async def test_agent_resume_latest_marks_empty_result_as_lifecycle_noop(
 
     assert payload["thread_id"] == ""
     assert payload["turn_id"] == ""
+    assert payload["session_start_reason"] == "oversized_rollover"
     assert payload["transport_generation"] == 0
     assert payload["transport_lifecycle_noop"] is True
 

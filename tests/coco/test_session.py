@@ -686,6 +686,102 @@ class TestHostFollowTakeover:
         assert mgr.is_window_external_turn_active("@1") is False
 
     @pytest.mark.asyncio
+    async def test_oversized_resume_rollover_starts_fresh_thread_and_preserves_prompt(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-oversized",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+        started_in: list[str | None] = []
+        captured_inputs: list[dict[str, object]] = []
+
+        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+            assert window_id == "@1"
+            assert cwd == "/tmp/proj"
+            mgr.set_window_codex_thread_id(window_id, "")
+            mgr.mark_window_pending_session_start_reason(
+                window_id,
+                "oversized_rollover",
+            )
+            return ""
+
+        async def _thread_start(
+            *,
+            cwd: str | None = None,
+            approval_policy: str | None = None,
+            model: str | None = None,
+            effort: str | None = None,
+            service_tier: str | None = None,
+        ) -> dict[str, object]:
+            _ = approval_policy, model, effort, service_tier
+            started_in.append(cwd)
+            return {"thread": {"id": "thread-fresh"}}
+
+        async def _turn_start(
+            *,
+            thread_id: str,
+            inputs: list[dict[str, object]],
+            approval_policy: str | None = None,
+            service_tier: str | None = None,
+            timeout: float = 90.0,
+        ) -> dict[str, object]:
+            _ = approval_policy, service_tier, timeout
+            assert thread_id == "thread-fresh"
+            captured_inputs.extend(inputs)
+            return {"turn": {"id": "turn-fresh"}}
+
+        monkeypatch.setattr(
+            mgr,
+            "resume_latest_codex_session_for_window",
+            _resume_latest,
+        )
+        monkeypatch.setattr(
+            session_mod.codex_app_server_client,
+            "thread_start",
+            _thread_start,
+        )
+        monkeypatch.setattr(
+            session_mod.codex_app_server_client,
+            "turn_start",
+            _turn_start,
+        )
+        monkeypatch.setattr(
+            session_mod.codex_app_server_client,
+            "get_active_turn_id",
+            lambda _thread_id: None,
+        )
+        monkeypatch.setattr(
+            SessionManager,
+            "_runtime_write_state",
+            staticmethod(lambda _cwd: ("/tmp/proj", True)),
+        )
+
+        ok, msg = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="keep this exact request",
+        )
+
+        assert ok is True
+        assert msg == "Sent via app-server to proj"
+        assert started_in == ["/tmp/proj"]
+        assert {"type": "text", "text": "keep this exact request"} in captured_inputs
+        assert "Session start reason: oversized_rollover" in str(
+            captured_inputs[0]["text"]
+        )
+        assert mgr.get_window_codex_thread_id("@1") == "thread-fresh"
+        assert mgr.peek_window_pending_session_start_reason("@1") == ""
+
+    @pytest.mark.asyncio
     async def test_host_follow_refreshes_goal_after_resuming_latest_thread(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
@@ -804,6 +900,81 @@ class TestHostFollowTakeover:
         assert ok is True
         assert message == "ok"
         assert sent == [("gpt-5.6-sol", "ultra")]
+
+    @pytest.mark.asyncio
+    async def test_remote_oversized_resume_rollover_starts_fresh_thread_and_preserves_prompt(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-oversized",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+        sent: list[dict[str, object]] = []
+
+        async def _resume_latest(_machine_id: str, **_kwargs):
+            return {
+                "thread_id": "",
+                "turn_id": "",
+                "model_slug": "",
+                "reasoning_effort": "",
+                "session_start_reason": "oversized_rollover",
+                "transport_lifecycle_noop": True,
+            }
+
+        async def _send_inputs(_machine_id: str, **kwargs):
+            sent.append(kwargs)
+            return {
+                "ok": True,
+                "message": "ok",
+                "thread_id": "thread-fresh",
+                "turn_id": "turn-fresh",
+                "transport_epoch": "agent-epoch-1",
+                "transport_epoch_started_at": 100.0,
+                "transport_generation": 4,
+                "transport_reset_sequence": 0,
+                "transport_last_reset_generation": 0,
+                "transport_last_reset_reason": "",
+            }
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "resume_latest",
+            _resume_latest,
+        )
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "send_inputs",
+            _send_inputs,
+        )
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="keep this exact request",
+        )
+
+        assert ok is True
+        assert message == "ok"
+        assert len(sent) == 1
+        assert sent[0]["thread_id"] == ""
+        assert sent[0]["inputs"] == [
+            {"type": "text", "text": "keep this exact request"}
+        ]
+        assert mgr.get_window_codex_thread_id("@1") == "thread-fresh"
 
     @pytest.mark.asyncio
     async def test_remote_host_follow_deferred_resume_returns_clean_failure(
@@ -2940,6 +3111,82 @@ async def test_send_inputs_to_window_thread_not_found_retry_failure_returns_comb
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retry_method", ["turn/start", "turn/steer"])
+async def test_send_inputs_to_window_thread_not_found_retry_timeout_recovers_transport(
+    mgr: SessionManager,
+    monkeypatch,
+    retry_method: str,
+):
+    state = mgr.get_window_state("@900010")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-old"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    attempts = 0
+    recovery_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        _ = window_id, cwd
+        return ""
+
+    async def _send_inputs_via_codex_app_server(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise session_mod.CodexAppServerError("thread not found: thread-old")
+        if retry_method == "turn/steer":
+            mgr.set_window_codex_thread_id("@900010", "thread-retry")
+            mgr.set_window_codex_active_turn_id("@900010", "turn-retry")
+        raise session_mod.CodexAppServerError(
+            f"Timed out waiting for app-server response: {retry_method}"
+        )
+
+    async def _recover_uncertain_turn_timeout(
+        *, method: str, thread_id: str = "", turn_id: str = ""
+    ) -> bool:
+        recovery_calls.append((method, thread_id, turn_id))
+        return True
+
+    monkeypatch.setattr(
+        mgr,
+        "resume_latest_codex_session_for_window",
+        _resume_latest,
+    )
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900010",
+        [{"type": "text", "text": "run exactly once"}],
+        steer=False,
+    )
+
+    assert ok is False
+    assert attempts == 2
+    expected_recovery = (
+        ("turn/steer", "thread-retry", "turn-retry")
+        if retry_method == "turn/steer"
+        else ("turn/start", "", "")
+    )
+    assert recovery_calls == [expected_recovery]
+    assert "retry with new thread failed" in msg
+    assert "transport recovered" in msg
+    assert "uncertain request was not replayed" in msg
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_to_window_turn_steer_timeout_is_not_replayed(
     mgr: SessionManager,
     monkeypatch,
@@ -2956,6 +3203,7 @@ async def test_send_inputs_to_window_turn_steer_timeout_is_not_replayed(
 
     call_states: list[tuple[str, str]] = []
     cleared_thread_ids: list[str] = []
+    recovery_calls: list[tuple[str, str, str]] = []
 
     async def _send_inputs_via_codex_app_server(
         *,
@@ -2984,6 +3232,18 @@ async def test_send_inputs_to_window_turn_steer_timeout_is_not_replayed(
         lambda thread_id: cleared_thread_ids.append(thread_id),
     )
 
+    async def _recover_uncertain_turn_timeout(
+        *, method: str, thread_id: str = "", turn_id: str = ""
+    ) -> bool:
+        recovery_calls.append((method, thread_id, turn_id))
+        return True
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
     telemetry_events: list[tuple[str, dict[str, object]]] = []
 
     def _emit(event: str, **payload):
@@ -3002,10 +3262,259 @@ async def test_send_inputs_to_window_turn_steer_timeout_is_not_replayed(
     assert "not replayed" in msg
     assert call_states == [("thread-live", "turn-stale")]
     assert mgr.get_window_codex_active_turn_id("@900005") == ""
-    assert cleared_thread_ids == ["thread-live"]
+    assert cleared_thread_ids == []
+    assert recovery_calls == [("turn/steer", "thread-live", "turn-stale")]
     event_names = [event for event, _payload in telemetry_events]
     assert "transport.app_server.steer_timeout_uncertain" in event_names
+    assert "transport.app_server.uncertain_turn_timeout_recovered" in event_names
     assert "transport.app_server.send_failed" in event_names
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_to_window_skipped_steer_recovery_preserves_active_turn(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    state = mgr.get_window_state("@900011")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+    state.codex_active_turn_id = "turn-stale"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    cleared_thread_ids: list[str] = []
+    recovery_calls: list[tuple[str, str, str]] = []
+
+    async def _send_inputs_via_codex_app_server(**_kwargs):
+        raise session_mod.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/steer"
+        )
+
+    async def _recover_uncertain_turn_timeout(
+        *, method: str, thread_id: str = "", turn_id: str = ""
+    ) -> bool:
+        recovery_calls.append((method, thread_id, turn_id))
+        return False
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "clear_active_turn",
+        lambda thread_id: cleared_thread_ids.append(thread_id),
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda thread_id: "turn-stale" if thread_id == "thread-live" else None,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900011",
+        [{"type": "text", "text": "hello"}],
+        steer=True,
+    )
+
+    assert ok is False
+    assert "transport recovery failed" in msg
+    assert cleared_thread_ids == []
+    assert recovery_calls == [("turn/steer", "thread-live", "turn-stale")]
+    assert mgr.get_window_codex_active_turn_id("@900011") == "turn-stale"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_recovered", [False, True])
+async def test_send_inputs_to_window_uses_dispatched_turn_and_preserves_newer_turn(
+    mgr: SessionManager,
+    monkeypatch,
+    transport_recovered: bool,
+):
+    state = mgr.get_window_state("@900013")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+    state.codex_active_turn_id = "turn-dispatched"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    recovery_calls: list[tuple[str, str, str]] = []
+
+    async def _turn_steer(**_kwargs):
+        mgr.set_window_codex_active_turn_id("@900013", "turn-new")
+        raise session_mod.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/steer"
+        )
+
+    async def _recover_uncertain_turn_timeout(
+        *, method: str, thread_id: str = "", turn_id: str = ""
+    ) -> bool:
+        recovery_calls.append((method, thread_id, turn_id))
+        return transport_recovered
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_steer",
+        _turn_steer,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda thread_id: "turn-new" if thread_id == "thread-live" else None,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900013",
+        [{"type": "text", "text": "hello"}],
+        steer=True,
+    )
+
+    assert ok is False
+    expected_status = (
+        "transport recovered"
+        if transport_recovered
+        else "transport recovery failed"
+    )
+    assert expected_status in msg
+    assert recovery_calls == [
+        ("turn/steer", "thread-live", "turn-dispatched")
+    ]
+    assert mgr.get_window_codex_active_turn_id("@900013") == "turn-new"
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_to_window_turn_start_timeout_recovers_transport_without_replay(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    state = mgr.get_window_state("@900009")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    send_calls: list[str] = []
+    recovery_calls: list[str] = []
+
+    async def _send_inputs_via_codex_app_server(**_kwargs):
+        send_calls.append("send")
+        raise session_mod.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/start"
+        )
+
+    async def _recover_uncertain_turn_timeout(*, method: str) -> bool:
+        recovery_calls.append(method)
+        return True
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
+    telemetry_events: list[tuple[str, dict[str, object]]] = []
+
+    def _emit(event: str, **payload):
+        telemetry_events.append((event, payload))
+
+    monkeypatch.setattr(session_mod, "emit_telemetry", _emit)
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900009",
+        [{"type": "text", "text": "run exactly once"}],
+        steer=False,
+    )
+
+    assert ok is False
+    assert send_calls == ["send"]
+    assert recovery_calls == ["turn/start"]
+    assert "transport recovered" in msg
+    assert "uncertain request was not replayed" in msg
+    event_names = [event for event, _payload in telemetry_events]
+    assert "transport.app_server.uncertain_turn_timeout_recovered" in event_names
+    assert "transport.app_server.send_failed" in event_names
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_to_window_turn_start_timeout_clears_stale_cached_turn(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    state = mgr.get_window_state("@900014")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+    state.codex_active_turn_id = "turn-stale"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    async def _send_inputs_via_codex_app_server(**kwargs):
+        assert kwargs["force_new_turn"] is True
+        raise session_mod.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/start"
+        )
+
+    async def _recover_uncertain_turn_timeout(*, method: str) -> bool:
+        assert method == "turn/start"
+        return False
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900014",
+        [{"type": "text", "text": "run exactly once"}],
+        force_new_turn=True,
+    )
+
+    assert ok is False
+    assert "transport recovery failed" in msg
+    assert mgr.get_window_codex_active_turn_id("@900014") == ""
 
 
 @pytest.mark.asyncio
@@ -3062,6 +3571,73 @@ async def test_send_inputs_to_window_no_active_turn_retry_failure_returns_combin
     event, payload = telemetry_events[-1]
     assert event == "transport.app_server.send_failed"
     assert payload["fallback_allowed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_method", ["turn/start", "turn/steer"])
+async def test_send_inputs_to_window_no_active_turn_retry_timeout_recovers_transport(
+    mgr: SessionManager,
+    monkeypatch,
+    retry_method: str,
+):
+    state = mgr.get_window_state("@900012")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+    state.codex_active_turn_id = "turn-stale"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    attempts = 0
+    recovery_calls: list[tuple[str, str, str]] = []
+
+    async def _send_inputs_via_codex_app_server(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise session_mod.CodexAppServerError("no active turn to steer")
+        if retry_method == "turn/steer":
+            mgr.set_window_codex_active_turn_id("@900012", "turn-retry")
+        raise session_mod.CodexAppServerError(
+            f"Timed out waiting for app-server response: {retry_method}"
+        )
+
+    async def _recover_uncertain_turn_timeout(
+        *, method: str, thread_id: str = "", turn_id: str = ""
+    ) -> bool:
+        recovery_calls.append((method, thread_id, turn_id))
+        return True
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "recover_uncertain_turn_timeout",
+        _recover_uncertain_turn_timeout,
+    )
+
+    ok, msg = await mgr.send_inputs_to_window(
+        "@900012",
+        [{"type": "text", "text": "run exactly once"}],
+        steer=True,
+    )
+
+    assert ok is False
+    assert attempts == 2
+    expected_recovery = (
+        ("turn/steer", "thread-live", "turn-retry")
+        if retry_method == "turn/steer"
+        else ("turn/start", "", "")
+    )
+    assert recovery_calls == [expected_recovery]
+    assert "retry with turn/start failed" in msg
+    assert "transport recovered" in msg
+    assert "uncertain request was not replayed" in msg
 
 
 @pytest.mark.asyncio
