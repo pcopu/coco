@@ -10,12 +10,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from .cluster_rpc import ClusterRpcClient, ClusterRpcError, ClusterRpcServer
 from .codex_app_server import codex_app_server_client
 from .config import config
+from .controller_rpc import REMOTE_CODEX_MACHINE_CONTEXT_KEY
 from .handlers.directory_browser import clamp_browse_path, resolve_browse_root
 from .node_registry import node_registry
 from .session import session_manager
@@ -48,7 +50,110 @@ ALLOWED_TELEGRAM_VIDEO_TYPES = {
     ".mpg": "video/mpeg",
 }
 TELEGRAM_ATTACHMENT_MAX_BYTES = 45 * 1024 * 1024
+EXPECTED_CODEX_TRANSPORT_LEGACY_PARAM = "expected_transport_legacy"
+EXPECTED_CODEX_TRANSPORT_EPOCH_PARAM = "expected_transport_epoch"
+EXPECTED_CODEX_TRANSPORT_EPOCH_STARTED_AT_PARAM = (
+    "expected_transport_epoch_started_at"
+)
+REMOTE_CODEX_MUTATION_DEFERRED_MESSAGE_PREFIX = (
+    "Remote Codex mutation was not dispatched"
+)
 _remote_restart_requested = False
+
+
+class RemoteCodexMutationDeferredError(ClusterRpcError):
+    """A remote Codex mutation was definitively blocked before dispatch."""
+
+
+def _require_expected_codex_transport(params: dict[str, Any]) -> None:
+    """Reject a modern controller mutation routed to another agent epoch."""
+    has_expected_legacy = EXPECTED_CODEX_TRANSPORT_LEGACY_PARAM in params
+    has_expected_epoch = EXPECTED_CODEX_TRANSPORT_EPOCH_PARAM in params
+    has_expected_started_at = (
+        EXPECTED_CODEX_TRANSPORT_EPOCH_STARTED_AT_PARAM in params
+    )
+    if has_expected_legacy:
+        if (
+            params.get(EXPECTED_CODEX_TRANSPORT_LEGACY_PARAM) is not True
+            or has_expected_epoch
+            or has_expected_started_at
+        ):
+            raise RemoteCodexMutationDeferredError(
+                "Remote Codex mutation was not dispatched because the "
+                "legacy transport fence is invalid"
+            )
+        # A legacy agent ignores this new field. Reaching this validator means
+        # the endpoint changed to a modern replacement after controller gating.
+        raise RemoteCodexMutationDeferredError(
+            "Remote Codex mutation was not dispatched because its legacy "
+            "transport fence reached a replacement agent"
+        )
+    if not has_expected_epoch and not has_expected_started_at:
+        # Older controllers do not carry a fence.
+        return
+
+    raw_expected_epoch = params.get(EXPECTED_CODEX_TRANSPORT_EPOCH_PARAM)
+    raw_expected_started_at = params.get(
+        EXPECTED_CODEX_TRANSPORT_EPOCH_STARTED_AT_PARAM
+    )
+    if (
+        not isinstance(raw_expected_epoch, str)
+        or not raw_expected_epoch.strip()
+        or isinstance(raw_expected_started_at, bool)
+    ):
+        raise RemoteCodexMutationDeferredError(
+            "Remote Codex mutation was not dispatched because the expected "
+            "transport epoch fence is invalid"
+        )
+    try:
+        expected_started_at = float(raw_expected_started_at)
+    except (TypeError, ValueError) as exc:
+        raise RemoteCodexMutationDeferredError(
+            "Remote Codex mutation was not dispatched because the expected "
+            "transport epoch fence is invalid"
+        ) from exc
+    if expected_started_at <= 0:
+        raise RemoteCodexMutationDeferredError(
+            "Remote Codex mutation was not dispatched because the expected "
+            "transport epoch fence is invalid"
+        )
+
+    transport_state = codex_app_server_client.transport_state_snapshot()
+    observed_epoch = str(transport_state.get("epoch", "")).strip()
+    try:
+        observed_started_at = float(
+            transport_state.get("epoch_started_at", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        observed_started_at = 0.0
+    expected_epoch = raw_expected_epoch.strip()
+    if (
+        observed_epoch != expected_epoch
+        or observed_started_at != expected_started_at
+    ):
+        raise RemoteCodexMutationDeferredError(
+            "Remote Codex mutation was not dispatched: expected transport "
+            f"epoch {expected_epoch}, but the replacement agent has epoch "
+            f"{observed_epoch or '<unknown>'}"
+        )
+
+
+def _codex_transport_response_fields(
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return transport identity fields shared by agent lifecycle responses."""
+    if state is None:
+        state = codex_app_server_client.transport_state_snapshot()
+    return {
+        "transport_epoch": state["epoch"],
+        "transport_epoch_started_at": state["epoch_started_at"],
+        "transport_generation": state["generation"],
+        "transport_reset_sequence": state["reset_sequence"],
+        "transport_last_reset_generation": state["last_reset_generation"],
+        "transport_last_reset_reason": state["last_reset_reason"],
+    }
+
+
 _COCO_SELF_UPDATE_COMMAND_ENV = "COCO_SELF_UPDATE_COMMAND"
 _CODEX_UPGRADE_COMMAND_ENV = "COCO_CODEX_UPGRADE_COMMAND"
 
@@ -284,6 +389,7 @@ class AgentRpcServer:
         self._server = ClusterRpcServer(shared_secret=shared_secret)
         self._probe_client = ClusterRpcClient(shared_secret=shared_secret, timeout_seconds=10.0)
         self._server.register("agent/ping", self._ping)
+        self._server.register("agent/probe_codex_health", self._probe_codex_health)
         self._server.register("agent/probe_machine", self._probe_machine)
         self._server.register("agent/probe_workspace_write_access", self._probe_workspace_write_access)
         self._server.register("agent/browse", self._browse)
@@ -314,6 +420,20 @@ class AgentRpcServer:
     async def _ping(self, _params: dict[str, Any]) -> dict[str, Any]:
         node = node_registry.ensure_local_node(now=asyncio.get_running_loop().time())
         return node.to_dict()
+
+    async def _probe_codex_health(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            timeout = float(params.get("timeout", 5.0) or 5.0)
+        except (TypeError, ValueError):
+            timeout = 5.0
+        healthy = await codex_app_server_client.probe_health(timeout=timeout)
+        return {
+            "healthy": healthy,
+            **codex_app_server_client.transport_state_snapshot(),
+        }
 
     async def _probe_machine(self, params: dict[str, Any]) -> dict[str, Any]:
         target_host = str(params.get("target_host", "")).strip()
@@ -386,6 +506,7 @@ class AgentRpcServer:
         return {"items": items, "list_error": list_error}
 
     async def _ensure_thread(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
         cwd = str(params.get("cwd", "")).strip()
         window_name = str(params.get("window_name", "")).strip()
@@ -415,9 +536,11 @@ class AgentRpcServer:
         return {
             "thread_id": thread_id,
             "turn_id": session_manager.get_window_codex_active_turn_id(window_id),
+            **_codex_transport_response_fields(),
         }
 
     async def _resume_latest(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
         cwd = str(params.get("cwd", "")).strip()
         window_name = str(params.get("window_name", "")).strip()
@@ -443,9 +566,17 @@ class AgentRpcServer:
             "turn_id": turn_id,
             "model_slug": model_slug,
             "reasoning_effort": reasoning_effort,
+            "session_start_reason": (
+                session_manager.peek_window_pending_session_start_reason(
+                    window_id
+                )
+            ),
+            "transport_lifecycle_noop": not bool(thread_id),
+            **_codex_transport_response_fields(),
         }
 
     async def _fork_thread(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
         thread_id = str(params.get("thread_id", "")).strip()
         turn_id = str(params.get("turn_id", "")).strip()
@@ -458,9 +589,14 @@ class AgentRpcServer:
         if forked_thread_id:
             session_manager.set_window_codex_thread_id(window_id, forked_thread_id)
             session_manager.set_window_codex_active_turn_id(window_id, forked_turn_id)
-        return {"thread_id": forked_thread_id, "turn_id": forked_turn_id}
+        return {
+            "thread_id": forked_thread_id,
+            "turn_id": forked_turn_id,
+            **_codex_transport_response_fields(),
+        }
 
     async def _rollback_thread(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
         thread_id = str(params.get("thread_id", "")).strip()
         num_turns = int(params.get("num_turns", 1) or 1)
@@ -473,7 +609,11 @@ class AgentRpcServer:
         if rolled_thread_id:
             session_manager.set_window_codex_thread_id(window_id, rolled_thread_id)
             session_manager.set_window_codex_active_turn_id(window_id, rolled_turn_id)
-        return {"thread_id": rolled_thread_id, "turn_id": rolled_turn_id}
+        return {
+            "thread_id": rolled_thread_id,
+            "turn_id": rolled_turn_id,
+            **_codex_transport_response_fields(),
+        }
 
     async def _read_attachments(self, params: dict[str, Any]) -> dict[str, Any]:
         workspace_dir = str(params.get("workspace_dir", "")).strip()
@@ -532,6 +672,7 @@ class AgentRpcServer:
         return {"documents": result.get("documents", [])}
 
     async def _resume_thread(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
         cwd = str(params.get("cwd", "")).strip()
         requested_thread_id = str(params.get("thread_id", "")).strip()
@@ -542,16 +683,16 @@ class AgentRpcServer:
             cwd=cwd,
             window_name=window_name,
             approval_mode=approval_mode,
-            codex_thread_id=requested_thread_id,
+            codex_thread_id="",
         )
-        result = await codex_app_server_client.thread_resume(thread_id=requested_thread_id)
-        resumed_thread_id = session_manager._extract_lifecycle_thread_id(
-            result,
-            fallback=requested_thread_id,
+        resumed_thread_id = await session_manager.resume_codex_session_for_window(
+            window_id=window_id,
+            cwd=cwd,
+            thread_id=requested_thread_id,
         )
-        resumed_turn_id = session_manager._extract_lifecycle_turn_id(result)
-        session_manager.set_window_codex_thread_id(window_id, resumed_thread_id)
-        session_manager.set_window_codex_active_turn_id(window_id, resumed_turn_id)
+        resumed_turn_id = session_manager.get_window_codex_active_turn_id(
+            window_id
+        )
         model_slug, reasoning_effort = session_manager.get_codex_session_model_selection_for_thread(
             resumed_thread_id,
             cwd=cwd,
@@ -561,6 +702,7 @@ class AgentRpcServer:
             "turn_id": resumed_turn_id,
             "model_slug": model_slug,
             "reasoning_effort": reasoning_effort,
+            **_codex_transport_response_fields(),
         }
 
     async def _thread_goal_get(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -573,6 +715,7 @@ class AgentRpcServer:
         return result
 
     async def _thread_goal_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         thread_id = str(params.get("thread_id", "")).strip()
         goal = str(params.get("goal", "")).strip()
         if not thread_id:
@@ -588,6 +731,7 @@ class AgentRpcServer:
         return result
 
     async def _thread_goal_clear(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         thread_id = str(params.get("thread_id", "")).strip()
         if not thread_id:
             raise ClusterRpcError("thread_id is required")
@@ -597,6 +741,7 @@ class AgentRpcServer:
         return result
 
     async def _send_inputs(self, params: dict[str, Any]) -> dict[str, Any]:
+        _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
         cwd = str(params.get("cwd", "")).strip()
         window_name = str(params.get("window_name", "")).strip()
@@ -617,6 +762,12 @@ class AgentRpcServer:
             approval_mode=approval_mode,
             codex_thread_id=codex_thread_id,
         )
+        # Establish the transport before fencing the mutation so an ordinary
+        # first startup is not mistaken for a concurrent recycle.
+        await codex_app_server_client.ensure_started()
+        transport_state_before = (
+            codex_app_server_client.transport_state_snapshot()
+        )
         ok, message = await session_manager.send_inputs_to_window(
             window_id,
             inputs,
@@ -627,11 +778,38 @@ class AgentRpcServer:
             service_tier=service_tier,
         )
         state = session_manager.get_window_state(window_id)
+        transport_state = codex_app_server_client.transport_state_snapshot()
+        transport_identity_before = (
+            transport_state_before["epoch"],
+            transport_state_before["epoch_started_at"],
+            transport_state_before["generation"],
+            transport_state_before["reset_sequence"],
+        )
+        transport_identity_after = (
+            transport_state["epoch"],
+            transport_state["epoch_started_at"],
+            transport_state["generation"],
+            transport_state["reset_sequence"],
+        )
+        if transport_identity_after != transport_identity_before:
+            logger.warning(
+                "Rejecting remote send acknowledgement after transport change "
+                "(window_id=%s before=%r after=%r)",
+                window_id,
+                transport_identity_before,
+                transport_identity_after,
+            )
+            raise ClusterRpcError(
+                "Codex transport changed during remote send; "
+                "the mutation outcome is uncertain and will not be replayed"
+            )
         return {
             "ok": ok,
             "message": message,
             "thread_id": state.codex_thread_id,
             "turn_id": state.codex_active_turn_id,
+            **_codex_transport_response_fields(transport_state),
+            "transport_reset_occurred": False,
         }
 
     async def _run_update(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -663,6 +841,116 @@ class AgentRpcClient:
 
     def __init__(self, *, shared_secret: str) -> None:
         self._client = ClusterRpcClient(shared_secret=shared_secret)
+        self._codex_mutation_dispatch_gate: (
+            Callable[
+                [str],
+                Awaitable[bool | tuple[str, float]],
+            ]
+            | None
+        ) = None
+
+    def set_codex_mutation_dispatch_gate(
+        self,
+        handler: (
+            Callable[
+                [str],
+                Awaitable[bool | tuple[str, float]],
+            ]
+            | None
+        ),
+    ) -> None:
+        """Register the controller gate for remote Codex mutations."""
+        self._codex_mutation_dispatch_gate = handler
+
+    async def _require_codex_mutation_dispatch(
+        self,
+        *,
+        machine_id: str,
+        operation: str,
+    ) -> dict[str, str | float | bool]:
+        handler = self._codex_mutation_dispatch_gate
+        if handler is None:
+            return {}
+        decision = await handler(machine_id)
+        if decision is False:
+            raise RemoteCodexMutationDeferredError(
+                f"Remote Codex {operation} was not dispatched because "
+                "transport replacement confirmation is pending"
+            )
+        if decision is True:
+            # Legacy agents ignore this field; a modern replacement rejects it.
+            return {EXPECTED_CODEX_TRANSPORT_LEGACY_PARAM: True}
+        if (
+            not isinstance(decision, tuple)
+            or len(decision) != 2
+            or not isinstance(decision[0], str)
+            or not decision[0].strip()
+            or isinstance(decision[1], bool)
+        ):
+            raise RemoteCodexMutationDeferredError(
+                f"Remote Codex {operation} was not dispatched because its "
+                "transport epoch binding is invalid"
+            )
+        try:
+            epoch_started_at = float(decision[1])
+        except (TypeError, ValueError) as exc:
+            raise RemoteCodexMutationDeferredError(
+                f"Remote Codex {operation} was not dispatched because its "
+                "transport epoch binding is invalid"
+            ) from exc
+        if epoch_started_at <= 0:
+            raise RemoteCodexMutationDeferredError(
+                f"Remote Codex {operation} was not dispatched because its "
+                "transport epoch binding is invalid"
+            )
+        return {
+            EXPECTED_CODEX_TRANSPORT_EPOCH_PARAM: decision[0].strip(),
+            EXPECTED_CODEX_TRANSPORT_EPOCH_STARTED_AT_PARAM: epoch_started_at,
+        }
+
+    async def _call_codex_mutation(
+        self,
+        *,
+        host: str,
+        port: int,
+        method: str,
+        params: dict[str, Any],
+    ) -> Any:
+        """Preserve a definitive agent-side fence rejection for callers."""
+        try:
+            return await self._client.call(
+                host=host,
+                port=port,
+                method=method,
+                params=params,
+            )
+        except ClusterRpcError as exc:
+            message = str(exc)
+            if message.startswith(
+                REMOTE_CODEX_MUTATION_DEFERRED_MESSAGE_PREFIX
+            ):
+                raise RemoteCodexMutationDeferredError(message) from exc
+            raise
+
+    @staticmethod
+    async def _record_remote_transport_result(
+        *,
+        machine_id: str,
+        window_id: str,
+        result: dict[str, Any],
+        operation: str,
+    ) -> None:
+        validation_result = {
+            **result,
+            REMOTE_CODEX_MACHINE_CONTEXT_KEY: machine_id.strip(),
+        }
+        if not await session_manager._accept_remote_transport_result(
+            window_id=window_id,
+            result=validation_result,
+        ):
+            raise ClusterRpcError(
+                f"remote Codex transport changed during {operation}"
+            )
 
     @staticmethod
     def _resolve_endpoint(machine_id: str) -> tuple[str, int]:
@@ -681,6 +969,104 @@ class AgentRpcClient:
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid ping response")
         return result
+
+    async def probe_codex_health(
+        self,
+        machine_id: str,
+        *,
+        timeout: float = 5.0,
+    ) -> bool:
+        result = await self.probe_codex_health_state(
+            machine_id,
+            timeout=timeout,
+        )
+        return bool(result["healthy"])
+
+    async def probe_codex_health_state(
+        self,
+        machine_id: str,
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Probe Codex and retain the transport identity used by the result."""
+        host, port = self._resolve_endpoint(machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/probe_codex_health",
+            params={"timeout": timeout},
+        )
+        if not isinstance(result, dict) or not isinstance(
+            result.get("healthy"),
+            bool,
+        ):
+            raise ClusterRpcError("invalid Codex health probe response")
+        epoch = str(
+            result.get("transport_epoch", result.get("epoch", ""))
+        ).strip()
+        try:
+            epoch_started_at = float(
+                result.get(
+                    "transport_epoch_started_at",
+                    result.get("epoch_started_at", 0.0),
+                )
+                or 0.0
+            )
+            generation = int(
+                result.get(
+                    "transport_generation",
+                    result.get("generation", -1),
+                )
+            )
+            reset_sequence = int(
+                result.get(
+                    "transport_reset_sequence",
+                    result.get("reset_sequence", -1),
+                )
+            )
+            last_reset_generation = int(
+                result.get(
+                    "transport_last_reset_generation",
+                    result.get("last_reset_generation", -1),
+                )
+            )
+            last_reset_at = float(
+                result.get(
+                    "transport_last_reset_at",
+                    result.get("last_reset_at", 0.0),
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ClusterRpcError(
+                "invalid Codex health probe transport metadata"
+            ) from exc
+        if (
+            not epoch
+            or epoch_started_at <= 0
+            or generation < 0
+            or reset_sequence < 0
+            or last_reset_generation < 0
+            or last_reset_at < 0
+        ):
+            raise ClusterRpcError(
+                "invalid Codex health probe transport metadata"
+            )
+        return {
+            "healthy": bool(result["healthy"]),
+            "transport_epoch": epoch,
+            "transport_epoch_started_at": epoch_started_at,
+            "transport_generation": generation,
+            "transport_reset_sequence": reset_sequence,
+            "transport_last_reset_generation": last_reset_generation,
+            "transport_last_reset_reason": str(
+                result.get(
+                    "transport_last_reset_reason",
+                    result.get("last_reset_reason", ""),
+                )
+            ).strip(),
+            "transport_last_reset_at": last_reset_at,
+        }
 
     async def probe_machine(
         self,
@@ -798,8 +1184,12 @@ class AgentRpcClient:
         window_name: str = "",
         approval_mode: str = "",
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="resume latest",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/resume_latest",
@@ -808,10 +1198,17 @@ class AgentRpcClient:
                 "cwd": cwd,
                 "window_name": window_name,
                 "approval_mode": approval_mode,
+                **dispatch_fence,
             },
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid resume latest response")
+        await self._record_remote_transport_result(
+            machine_id=machine_id,
+            window_id=window_id,
+            result=result,
+            operation="resume latest",
+        )
         return result
 
     async def fork_thread(
@@ -822,8 +1219,12 @@ class AgentRpcClient:
         thread_id: str,
         turn_id: str = "",
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="fork",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/fork_thread",
@@ -831,10 +1232,17 @@ class AgentRpcClient:
                 "window_id": window_id,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
+                **dispatch_fence,
             },
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid fork response")
+        await self._record_remote_transport_result(
+            machine_id=machine_id,
+            window_id=window_id,
+            result=result,
+            operation="fork",
+        )
         return result
 
     async def rollback_thread(
@@ -845,8 +1253,12 @@ class AgentRpcClient:
         thread_id: str,
         num_turns: int,
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="rollback",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/rollback_thread",
@@ -854,10 +1266,17 @@ class AgentRpcClient:
                 "window_id": window_id,
                 "thread_id": thread_id,
                 "num_turns": num_turns,
+                **dispatch_fence,
             },
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid rollback response")
+        await self._record_remote_transport_result(
+            machine_id=machine_id,
+            window_id=window_id,
+            result=result,
+            operation="rollback",
+        )
         return result
 
     async def read_documents(
@@ -985,8 +1404,12 @@ class AgentRpcClient:
         reasoning_effort: str = "",
         service_tier: str = "",
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="ensure thread",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/ensure_thread",
@@ -998,10 +1421,17 @@ class AgentRpcClient:
                 "model_slug": model_slug,
                 "reasoning_effort": reasoning_effort,
                 "service_tier": service_tier,
+                **dispatch_fence,
             },
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid ensure thread response")
+        await self._record_remote_transport_result(
+            machine_id=machine_id,
+            window_id=window_id,
+            result=result,
+            operation="ensure thread",
+        )
         return result
 
     async def resume_thread(
@@ -1014,8 +1444,12 @@ class AgentRpcClient:
         window_name: str = "",
         approval_mode: str = "",
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="resume thread",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/resume_thread",
@@ -1025,10 +1459,17 @@ class AgentRpcClient:
                 "thread_id": thread_id,
                 "window_name": window_name,
                 "approval_mode": approval_mode,
+                **dispatch_fence,
             },
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid resume thread response")
+        await self._record_remote_transport_result(
+            machine_id=machine_id,
+            window_id=window_id,
+            result=result,
+            operation="resume thread",
+        )
         return result
 
     async def send_inputs(
@@ -1047,8 +1488,12 @@ class AgentRpcClient:
         reasoning_effort: str = "",
         service_tier: str = "",
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="send",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/send_inputs",
@@ -1064,6 +1509,7 @@ class AgentRpcClient:
                 "model_slug": model_slug,
                 "reasoning_effort": reasoning_effort,
                 "service_tier": service_tier,
+                **dispatch_fence,
             },
         )
         if not isinstance(result, dict):
@@ -1094,12 +1540,20 @@ class AgentRpcClient:
         thread_id: str,
         goal: str,
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="goal set",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/thread_goal_set",
-            params={"thread_id": thread_id, "goal": goal},
+            params={
+                "thread_id": thread_id,
+                "goal": goal,
+                **dispatch_fence,
+            },
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid goal set response")
@@ -1111,12 +1565,16 @@ class AgentRpcClient:
         *,
         thread_id: str,
     ) -> dict[str, Any]:
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=machine_id,
+            operation="goal clear",
+        )
         host, port = self._resolve_endpoint(machine_id)
-        result = await self._client.call(
+        result = await self._call_codex_mutation(
             host=host,
             port=port,
             method="agent/thread_goal_clear",
-            params={"thread_id": thread_id},
+            params={"thread_id": thread_id, **dispatch_fence},
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid goal clear response")

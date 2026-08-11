@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 from types import SimpleNamespace
 
@@ -7,6 +9,10 @@ import pytest
 
 from coco.agent_rpc import AgentRpcClient, AgentRpcServer
 import coco.agent_rpc as agent_rpc
+from coco.cluster_rpc import ClusterRpcError
+from coco.node_registry import NodeRegistry
+from coco.node_registry import node_registry
+from coco.session import session_manager
 
 
 def test_run_command_sync_decodes_timeout_output(monkeypatch):
@@ -26,9 +32,6 @@ def test_run_command_sync_decodes_timeout_output(monkeypatch):
     assert stdout == "partial stdout�"
     assert stderr == "partial stderr�"
     assert error == "timeout"
-from coco.node_registry import NodeRegistry
-from coco.node_registry import node_registry
-from coco.session import session_manager
 
 
 def test_agent_rpc_resolve_codex_upgrade_command_prefers_npm_for_nvm_installs(monkeypatch):
@@ -163,6 +166,158 @@ async def test_agent_rpc_browse_round_trip(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_resume_response_preserves_metadata_only_active_turn(
+    monkeypatch,
+    tmp_path,
+):
+    window_id = "@remote-metadata-resume"
+    thread_id = "thread-remote-metadata"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_root = tmp_path / "sessions"
+    session_dir = sessions_root / "2026" / "07"
+    session_dir.mkdir(parents=True)
+    rollout = session_dir / f"rollout-2026-07-23T12-00-00-{thread_id}.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "cwd": str(workspace.resolve()),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agent_rpc.config, "sessions_path", sessions_root)
+    monkeypatch.setattr(
+        agent_rpc.config,
+        "codex_max_resume_bytes",
+        rollout.stat().st_size + 1,
+        raising=False,
+    )
+    monkeypatch.setattr(session_manager, "_save_state", lambda: None)
+
+    previous_state = session_manager.window_states.pop(window_id, None)
+    state = session_manager.get_window_state(window_id)
+    state.cwd = str(workspace)
+    state.codex_thread_id = thread_id
+    state.codex_active_turn_id = "turn-remote-live"
+    state.codex_transport_epoch = "agent-epoch-live"
+    state.codex_transport_epoch_started_at = 100.0
+    state.codex_transport_generation = 7
+    transport_state = {
+        "epoch": "agent-epoch-live",
+        "epoch_started_at": 100.0,
+        "generation": 7,
+        "reset_sequence": 0,
+        "last_reset_generation": 0,
+        "last_reset_reason": "",
+        "last_reset_at": 0.0,
+    }
+
+    async def _thread_resume(*, thread_id: str):
+        return {"thread": {"id": thread_id}}
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "thread_resume",
+        _thread_resume,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: dict(transport_state),
+    )
+
+    try:
+        payload = await AgentRpcServer(
+            shared_secret="rpc-secret"
+        )._resume_thread(
+            {
+                "window_id": window_id,
+                "cwd": str(workspace),
+                "thread_id": thread_id,
+            }
+        )
+    finally:
+        if previous_state is None:
+            session_manager.window_states.pop(window_id, None)
+        else:
+            session_manager.window_states[window_id] = previous_state
+
+    assert payload["thread_id"] == thread_id
+    assert payload["turn_id"] == "turn-remote-live"
+
+
+@pytest.mark.asyncio
+async def test_agent_resume_latest_marks_empty_result_as_lifecycle_noop(
+    monkeypatch,
+):
+    window_id = "@remote-empty-resume"
+    transport_state = {
+        "epoch": "agent-epoch-idle",
+        "epoch_started_at": 100.0,
+        "generation": 0,
+        "reset_sequence": 0,
+        "last_reset_generation": 0,
+        "last_reset_reason": "",
+        "last_reset_at": 0.0,
+    }
+
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        _ = window_id, cwd
+        session_manager.mark_window_pending_session_start_reason(
+            window_id,
+            "oversized_rollover",
+        )
+        return ""
+
+    monkeypatch.setattr(
+        session_manager,
+        "resume_latest_codex_session_for_window",
+        _resume_latest,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: dict(transport_state),
+    )
+    monkeypatch.setattr(session_manager, "_save_state", lambda: None)
+
+    previous_state = session_manager.window_states.pop(window_id, None)
+    try:
+        payload = await AgentRpcServer(
+            shared_secret="rpc-secret"
+        )._resume_latest(
+            {
+                "window_id": window_id,
+                "cwd": "/tmp/demo",
+                "window_name": "demo",
+            }
+        )
+    finally:
+        session_manager.consume_window_pending_session_start_reason(window_id)
+        if previous_state is None:
+            session_manager.window_states.pop(window_id, None)
+        else:
+            session_manager.window_states[window_id] = previous_state
+
+    assert payload["thread_id"] == ""
+    assert payload["turn_id"] == ""
+    assert payload["session_start_reason"] == "oversized_rollover"
+    assert payload["transport_generation"] == 0
+    assert payload["transport_lifecycle_noop"] is True
+
+
+@pytest.mark.asyncio
 async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
     state = session_manager.get_window_state("@remote")
     state.cwd = ""
@@ -195,7 +350,15 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         current.codex_active_turn_id = "turn-1"
         return True, "ok"
 
+    async def _ensure_started() -> None:
+        return None
+
     monkeypatch.setattr(session_manager, "send_inputs_to_window", _fake_send_inputs_to_window)
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "ensure_started",
+        _ensure_started,
+    )
     monkeypatch.setattr(session_manager, "_save_state", lambda: None)
 
     server = AgentRpcServer(shared_secret="rpc-secret")
@@ -229,8 +392,746 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         assert captured["service_tier"] == "fast"
         assert payload["thread_id"] == "thread-1"
         assert payload["turn_id"] == "turn-1"
+        assert isinstance(payload["transport_epoch"], str)
+        assert payload["transport_epoch"]
+        assert payload["transport_epoch_started_at"] > 0
+        assert payload["transport_generation"] >= 0
+        assert payload["transport_reset_sequence"] >= 0
+        assert "transport_reset_occurred" in payload
+        assert "transport_last_reset_generation" in payload
+        assert "transport_last_reset_reason" in payload
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_validation_uses_target_machine_before_window_is_bound(
+    monkeypatch,
+):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda machine_id: (
+            ("127.0.0.1", 8787)
+            if machine_id == "remote-node"
+            else ("", 0)
+        ),
+    )
+
+    async def _call(**_kwargs):
+        return {"thread_id": "thread-1", "turn_id": ""}
+
+    observed: dict[str, object] = {}
+
+    async def _accept_remote_result(*, window_id, result):
+        observed["window_id"] = window_id
+        observed["result"] = result
+        return result.get("_coco_remote_machine_id") == "remote-node"
+
+    monkeypatch.setattr(client._client, "call", _call)
+    monkeypatch.setattr(
+        session_manager,
+        "_accept_remote_transport_result",
+        _accept_remote_result,
+    )
+
+    payload = await client.ensure_thread(
+        "remote-node",
+        window_id="@new-unbound-window",
+        cwd="/tmp/demo",
+    )
+
+    assert payload == {"thread_id": "thread-1", "turn_id": ""}
+    assert observed == {
+        "window_id": "@new-unbound-window",
+        "result": {
+            "thread_id": "thread-1",
+            "turn_id": "",
+            "_coco_remote_machine_id": "remote-node",
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "ensure_thread",
+        "resume_latest",
+        "resume_thread",
+        "fork_thread",
+        "rollback_thread",
+        "send_inputs",
+        "thread_goal_set",
+        "thread_goal_clear",
+    ],
+)
+async def test_agent_rpc_blocks_mutation_before_unconfirmed_epoch_dispatch(
+    monkeypatch,
+    operation,
+):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    rpc_calls: list[str] = []
+
+    async def _reject_gate(machine_id: str) -> bool:
+        assert machine_id == "remote-node"
+        return False
+
+    gate_setter = getattr(
+        client,
+        "set_codex_mutation_dispatch_gate",
+        None,
+    )
+    assert callable(gate_setter)
+    gate_setter(_reject_gate)
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+
+    async def _call(**kwargs):
+        rpc_calls.append(str(kwargs.get("method", "")))
+        return {"thread_id": "", "turn_id": ""}
+
+    monkeypatch.setattr(client._client, "call", _call)
+
+    with pytest.raises(ClusterRpcError, match="was not dispatched"):
+        if operation == "ensure_thread":
+            await client.ensure_thread(
+                "remote-node",
+                window_id="@remote",
+                cwd="/tmp/demo",
+            )
+        elif operation == "resume_latest":
+            await client.resume_latest(
+                "remote-node",
+                window_id="@remote",
+                cwd="/tmp/demo",
+            )
+        elif operation == "resume_thread":
+            await client.resume_thread(
+                "remote-node",
+                window_id="@remote",
+                cwd="/tmp/demo",
+                thread_id="thread-1",
+            )
+        elif operation == "fork_thread":
+            await client.fork_thread(
+                "remote-node",
+                window_id="@remote",
+                thread_id="thread-1",
+            )
+        elif operation == "rollback_thread":
+            await client.rollback_thread(
+                "remote-node",
+                window_id="@remote",
+                thread_id="thread-1",
+                num_turns=1,
+            )
+        elif operation == "send_inputs":
+            await client.send_inputs(
+                "remote-node",
+                window_id="@remote",
+                cwd="/tmp/demo",
+                window_name="demo",
+                inputs=[{"type": "text", "text": "hello"}],
+                steer=False,
+            )
+        elif operation == "thread_goal_set":
+            await client.thread_goal_set(
+                "remote-node",
+                thread_id="thread-1",
+                goal="ship it",
+            )
+        else:
+            await client.thread_goal_clear(
+                "remote-node",
+                thread_id="thread-1",
+            )
+
+    assert rpc_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "ensure_thread",
+        "resume_latest",
+        "resume_thread",
+        "fork_thread",
+        "rollback_thread",
+        "send_inputs",
+        "thread_goal_set",
+        "thread_goal_clear",
+    ],
+)
+async def test_agent_rpc_binds_confirmed_epoch_to_each_mutation(
+    monkeypatch,
+    operation,
+):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    rpc_params: list[dict[str, object]] = []
+
+    async def _confirmed_gate(machine_id: str):
+        assert machine_id == "remote-node"
+        return "confirmed-agent-epoch", 100.0
+
+    async def _call(**kwargs):
+        rpc_params.append(dict(kwargs["params"]))
+        return {"thread_id": "thread-1", "turn_id": ""}
+
+    async def _accept_remote_result(*, window_id, result):
+        _ = window_id, result
+        return True
+
+    client.set_codex_mutation_dispatch_gate(_confirmed_gate)
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+    monkeypatch.setattr(client._client, "call", _call)
+    monkeypatch.setattr(
+        session_manager,
+        "_accept_remote_transport_result",
+        _accept_remote_result,
+    )
+
+    if operation == "ensure_thread":
+        await client.ensure_thread(
+            "remote-node",
+            window_id="@remote",
+            cwd="/tmp/demo",
+        )
+    elif operation == "resume_latest":
+        await client.resume_latest(
+            "remote-node",
+            window_id="@remote",
+            cwd="/tmp/demo",
+        )
+    elif operation == "resume_thread":
+        await client.resume_thread(
+            "remote-node",
+            window_id="@remote",
+            cwd="/tmp/demo",
+            thread_id="thread-1",
+        )
+    elif operation == "fork_thread":
+        await client.fork_thread(
+            "remote-node",
+            window_id="@remote",
+            thread_id="thread-1",
+        )
+    elif operation == "rollback_thread":
+        await client.rollback_thread(
+            "remote-node",
+            window_id="@remote",
+            thread_id="thread-1",
+            num_turns=1,
+        )
+    elif operation == "send_inputs":
+        await client.send_inputs(
+            "remote-node",
+            window_id="@remote",
+            cwd="/tmp/demo",
+            window_name="demo",
+            inputs=[{"type": "text", "text": "hello"}],
+            steer=False,
+        )
+    elif operation == "thread_goal_set":
+        await client.thread_goal_set(
+            "remote-node",
+            thread_id="thread-1",
+            goal="ship it",
+        )
+    else:
+        await client.thread_goal_clear(
+            "remote-node",
+            thread_id="thread-1",
+        )
+
+    assert len(rpc_params) == 1
+    assert rpc_params[0]["expected_transport_epoch"] == (
+        "confirmed-agent-epoch"
+    )
+    assert rpc_params[0]["expected_transport_epoch_started_at"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_marks_confirmed_legacy_mutation_for_replacement_fence(
+    monkeypatch,
+):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    rpc_params: list[dict[str, object]] = []
+
+    async def _confirmed_legacy_gate(_machine_id: str) -> bool:
+        return True
+
+    async def _call(**kwargs):
+        rpc_params.append(dict(kwargs["params"]))
+        return {"cleared": True}
+
+    client.set_codex_mutation_dispatch_gate(_confirmed_legacy_gate)
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+    monkeypatch.setattr(client._client, "call", _call)
+
+    assert await client.thread_goal_clear(
+        "remote-node",
+        thread_id="thread-1",
+    ) == {"cleared": True}
+    assert rpc_params == [
+        {
+            "thread_id": "thread-1",
+            "expected_transport_legacy": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_preserves_remote_epoch_rejection_as_deferred(
+    monkeypatch,
+):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+
+    async def _confirmed_gate(_machine_id: str):
+        return "confirmed-agent-epoch", 100.0
+
+    async def _call(**_kwargs):
+        raise ClusterRpcError(
+            "Remote Codex mutation was not dispatched: expected transport "
+            "epoch confirmed-agent-epoch, but the replacement agent has "
+            "epoch replacement-agent-epoch"
+        )
+
+    client.set_codex_mutation_dispatch_gate(_confirmed_gate)
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+    monkeypatch.setattr(client._client, "call", _call)
+
+    with pytest.raises(
+        agent_rpc.RemoteCodexMutationDeferredError,
+        match="replacement agent",
+    ):
+        await client.thread_goal_clear(
+            "remote-node",
+            thread_id="thread-1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_modern_agent_rejects_legacy_fence_before_codex_mutation(
+    monkeypatch,
+):
+    mutation_calls: list[str] = []
+
+    async def _goal_clear(*, thread_id: str):
+        mutation_calls.append(thread_id)
+        return {"cleared": True}
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "thread_goal_clear",
+        _goal_clear,
+    )
+
+    with pytest.raises(
+        ClusterRpcError,
+        match="legacy transport fence.*replacement agent",
+    ):
+        await AgentRpcServer(
+            shared_secret="rpc-secret"
+        )._thread_goal_clear(
+            {
+                "thread_id": "thread-1",
+                "expected_transport_legacy": True,
+            }
+        )
+
+    assert mutation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_allows_unfenced_mutation_from_older_controller(
+    monkeypatch,
+):
+    mutation_calls: list[str] = []
+
+    async def _goal_clear(*, thread_id: str):
+        mutation_calls.append(thread_id)
+        return {"cleared": True}
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "thread_goal_clear",
+        _goal_clear,
+    )
+
+    assert await AgentRpcServer(
+        shared_secret="rpc-secret"
+    )._thread_goal_clear({"thread_id": "thread-1"}) == {"cleared": True}
+    assert mutation_calls == ["thread-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fence",
+    [
+        {"expected_transport_epoch": "agent-epoch-1"},
+        {"expected_transport_epoch_started_at": 100.0},
+        {"expected_transport_legacy": False},
+        {
+            "expected_transport_legacy": True,
+            "expected_transport_epoch": "agent-epoch-1",
+            "expected_transport_epoch_started_at": 100.0,
+        },
+    ],
+)
+async def test_agent_rejects_partial_or_invalid_transport_fence_before_mutation(
+    monkeypatch,
+    fence,
+):
+    mutation_calls: list[str] = []
+
+    async def _goal_clear(*, thread_id: str):
+        mutation_calls.append(thread_id)
+        return {"cleared": True}
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "thread_goal_clear",
+        _goal_clear,
+    )
+
+    with pytest.raises(ClusterRpcError, match="fence is invalid"):
+        await AgentRpcServer(
+            shared_secret="rpc-secret"
+        )._thread_goal_clear(
+            {"thread_id": "thread-1", **fence}
+        )
+
+    assert mutation_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "ensure_thread",
+        "resume_latest",
+        "resume_thread",
+        "fork_thread",
+        "rollback_thread",
+        "send_inputs",
+        "thread_goal_set",
+        "thread_goal_clear",
+    ],
+)
+async def test_agent_rejects_mismatched_expected_epoch_before_codex_mutation(
+    monkeypatch,
+    operation,
+):
+    mutation_calls: list[str] = []
+
+    async def _record_mutation(*_args, **_kwargs):
+        mutation_calls.append(operation)
+        if operation == "ensure_thread":
+            return "thread-new", ""
+        if operation in {"resume_latest", "resume_thread"}:
+            return "thread-new"
+        if operation == "send_inputs":
+            return True, "ok"
+        return {"thread": {"id": "thread-new"}}
+
+    async def _ensure_started() -> None:
+        return None
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: {
+            "epoch": "replacement-agent-epoch",
+            "epoch_started_at": 200.0,
+            "generation": 1,
+            "reset_sequence": 0,
+            "last_reset_generation": 0,
+            "last_reset_reason": "",
+            "last_reset_at": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "ensure_started",
+        _ensure_started,
+    )
+    monkeypatch.setattr(agent_rpc, "_configure_remote_window", lambda **_kwargs: None)
+    monkeypatch.setattr(session_manager, "_save_state", lambda: None)
+
+    if operation == "ensure_thread":
+        monkeypatch.setattr(
+            session_manager,
+            "_ensure_codex_thread_for_window",
+            _record_mutation,
+        )
+    elif operation == "resume_latest":
+        monkeypatch.setattr(
+            session_manager,
+            "resume_latest_codex_session_for_window",
+            _record_mutation,
+        )
+    elif operation == "resume_thread":
+        monkeypatch.setattr(
+            session_manager,
+            "resume_codex_session_for_window",
+            _record_mutation,
+        )
+    elif operation == "fork_thread":
+        monkeypatch.setattr(
+            agent_rpc.codex_app_server_client,
+            "thread_fork",
+            _record_mutation,
+        )
+    elif operation == "rollback_thread":
+        monkeypatch.setattr(
+            agent_rpc.codex_app_server_client,
+            "thread_rollback",
+            _record_mutation,
+        )
+    elif operation == "send_inputs":
+        monkeypatch.setattr(
+            session_manager,
+            "send_inputs_to_window",
+            _record_mutation,
+        )
+    elif operation == "thread_goal_set":
+        monkeypatch.setattr(
+            agent_rpc.codex_app_server_client,
+            "thread_goal_set",
+            _record_mutation,
+        )
+    else:
+        monkeypatch.setattr(
+            agent_rpc.codex_app_server_client,
+            "thread_goal_clear",
+            _record_mutation,
+        )
+
+    params = {
+        "expected_transport_epoch": "confirmed-agent-epoch",
+        "expected_transport_epoch_started_at": 100.0,
+        "window_id": "@remote",
+        "cwd": "/tmp/demo",
+        "window_name": "demo",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "num_turns": 1,
+        "inputs": [{"type": "text", "text": "hello"}],
+        "goal": "ship it",
+    }
+    server = AgentRpcServer(shared_secret="rpc-secret")
+
+    with pytest.raises(
+        ClusterRpcError,
+        match="expected transport epoch.*replacement agent",
+    ):
+        await getattr(server, f"_{operation}")(params)
+
+    assert mutation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_mutation_gate_does_not_block_goal_read(monkeypatch):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+
+    async def _reject_gate(_machine_id: str) -> bool:
+        return False
+
+    client.set_codex_mutation_dispatch_gate(_reject_gate)
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+
+    async def _call(**kwargs):
+        assert kwargs["method"] == "agent/thread_goal_get"
+        return {"goal": "ship it"}
+
+    monkeypatch.setattr(client._client, "call", _call)
+
+    assert await client.thread_goal_get(
+        "remote-node",
+        thread_id="thread-1",
+    ) == {"goal": "ship it"}
+
+
+@pytest.mark.asyncio
+async def test_agent_send_rejects_ack_if_transport_recycles_during_mutation(
+    monkeypatch,
+):
+    window_id = "@remote-send-reset-race"
+    transport_state: dict[str, object] = {
+        "epoch": "agent-epoch-1",
+        "epoch_started_at": 100.0,
+        "generation": 11,
+        "reset_sequence": 3,
+        "last_reset_generation": 0,
+        "last_reset_reason": "",
+        "last_reset_at": 0.0,
+    }
+    send_entered = asyncio.Event()
+    allow_send_to_return = asyncio.Event()
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _send_inputs_to_window(
+        _window_id,
+        _inputs,
+        **_kwargs,
+    ):
+        state = session_manager.get_window_state(window_id)
+        state.codex_thread_id = "thread-before-reset"
+        state.codex_active_turn_id = "turn-before-reset"
+        send_entered.set()
+        await allow_send_to_return.wait()
+        return True, "ok"
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "ensure_started",
+        _ensure_started,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: dict(transport_state),
+    )
+    monkeypatch.setattr(
+        session_manager,
+        "send_inputs_to_window",
+        _send_inputs_to_window,
+    )
+    monkeypatch.setattr(session_manager, "_save_state", lambda: None)
+
+    previous_state = session_manager.window_states.pop(window_id, None)
+    try:
+        send_task = asyncio.create_task(
+            AgentRpcServer(shared_secret="rpc-secret")._send_inputs(
+                {
+                    "window_id": window_id,
+                    "cwd": "/tmp/demo",
+                    "window_name": "demo",
+                    "inputs": [{"type": "text", "text": "hello"}],
+                }
+            )
+        )
+        await send_entered.wait()
+        transport_state.update(
+            {
+                "generation": 12,
+                "reset_sequence": 4,
+                "last_reset_generation": 11,
+                "last_reset_reason": "request_timeout:turn/start",
+                "last_reset_at": 101.0,
+            }
+        )
+        allow_send_to_return.set()
+
+        with pytest.raises(
+            ClusterRpcError,
+            match="transport changed.*outcome is uncertain",
+        ):
+            await send_task
+    finally:
+        allow_send_to_return.set()
+        if previous_state is None:
+            session_manager.window_states.pop(window_id, None)
+        else:
+            session_manager.window_states[window_id] = previous_state
+
+
+@pytest.mark.asyncio
+async def test_agent_send_starts_transport_before_acknowledgement_fence(
+    monkeypatch,
+):
+    window_id = "@remote-send-startup-fence"
+    transport_state: dict[str, object] = {
+        "epoch": "agent-epoch-1",
+        "epoch_started_at": 100.0,
+        "generation": 0,
+        "reset_sequence": 0,
+        "last_reset_generation": 0,
+        "last_reset_reason": "",
+        "last_reset_at": 0.0,
+    }
+    events: list[str] = []
+
+    async def _ensure_started() -> None:
+        events.append("ensure_started")
+        transport_state["generation"] = 1
+
+    async def _send_inputs_to_window(
+        _window_id,
+        _inputs,
+        **_kwargs,
+    ):
+        assert events == ["ensure_started"]
+        assert transport_state["generation"] == 1
+        events.append("send")
+        state = session_manager.get_window_state(window_id)
+        state.codex_thread_id = "thread-1"
+        state.codex_active_turn_id = "turn-1"
+        return True, "ok"
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "ensure_started",
+        _ensure_started,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: dict(transport_state),
+    )
+    monkeypatch.setattr(
+        session_manager,
+        "send_inputs_to_window",
+        _send_inputs_to_window,
+    )
+    monkeypatch.setattr(session_manager, "_save_state", lambda: None)
+
+    previous_state = session_manager.window_states.pop(window_id, None)
+    try:
+        payload = await AgentRpcServer(
+            shared_secret="rpc-secret"
+        )._send_inputs(
+            {
+                "window_id": window_id,
+                "cwd": "/tmp/demo",
+                "window_name": "demo",
+                "inputs": [{"type": "text", "text": "hello"}],
+            }
+        )
+    finally:
+        if previous_state is None:
+            session_manager.window_states.pop(window_id, None)
+        else:
+            session_manager.window_states[window_id] = previous_state
+
+    assert payload["ok"] is True
+    assert payload["transport_generation"] == 1
+    assert payload["transport_reset_occurred"] is False
+    assert events == ["ensure_started", "send"]
 
 
 @pytest.mark.asyncio
@@ -446,5 +1347,54 @@ async def test_agent_rpc_thread_goal_round_trip(monkeypatch):
         assert payload["goal"]["status"] == "active"
         payload = await client.thread_goal_clear("goal-node", thread_id="thread-1")
         assert payload["cleared"] is True
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_rpc_codex_health_probe_round_trip(monkeypatch):
+    observed_timeouts: list[float] = []
+
+    async def _probe_health(*, timeout: float) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "probe_health",
+        _probe_health,
+    )
+
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        host, port = server.bound_address()
+        node_registry.note_heartbeat(
+            machine_id="health-node",
+            display_name="Health Node",
+            transport="agent_rpc",
+            rpc_host=host,
+            rpc_port=port,
+            is_local=False,
+            now=100.0,
+        )
+        client = AgentRpcClient(shared_secret="rpc-secret")
+
+        healthy = await client.probe_codex_health(
+            "health-node",
+            timeout=4.0,
+        )
+        health_state = await client.probe_codex_health_state(
+            "health-node",
+            timeout=3.0,
+        )
+
+        assert healthy is False
+        assert health_state["healthy"] is False
+        assert health_state["transport_epoch"]
+        assert health_state["transport_epoch_started_at"] > 0
+        assert health_state["transport_generation"] >= 0
+        assert health_state["transport_reset_sequence"] >= 0
+        assert observed_timeouts == [4.0, 3.0]
     finally:
         await server.stop()

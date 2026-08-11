@@ -1,8 +1,9 @@
 """Monitor state persistence — tracks byte offsets for each session.
 
-Persists TrackedSession records (session_id, file_path, last_byte_offset)
-to the configured CoCo state dir so the session monitor can resume
-incremental reading after restarts without re-sending old messages.
+Persists TrackedSession records (session id, file path, safe byte offset,
+and any bounded oversized-record drain cursor) to the configured CoCo state
+dir so the monitor can resume incremental reading after restarts without
+re-sending old messages or rescanning giant partial records.
 
 Key classes: MonitorState, TrackedSession.
 """
@@ -23,6 +24,8 @@ class TrackedSession:
     session_id: str
     file_path: str  # Path to .jsonl file
     last_byte_offset: int = 0  # Byte offset for incremental reading
+    pending_record_start_offset: int | None = None
+    pending_record_drain_offset: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -37,10 +40,32 @@ class TrackedSession:
             last_byte_offset = int(data.get("last_byte_offset", 0))
         except (TypeError, ValueError, OverflowError):
             last_byte_offset = 0
+        try:
+            pending_record_start_offset = int(
+                data["pending_record_start_offset"]
+            )
+            pending_record_drain_offset = int(
+                data["pending_record_drain_offset"]
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pending_record_start_offset = None
+            pending_record_drain_offset = None
+        if (
+            pending_record_start_offset is not None
+            and (
+                pending_record_start_offset < 0
+                or pending_record_drain_offset is None
+                or pending_record_drain_offset < pending_record_start_offset
+            )
+        ):
+            pending_record_start_offset = None
+            pending_record_drain_offset = None
         return cls(
             session_id=session_id if isinstance(session_id, str) else "",
             file_path=file_path if isinstance(file_path, str) else "",
             last_byte_offset=max(0, last_byte_offset),
+            pending_record_start_offset=pending_record_start_offset,
+            pending_record_drain_offset=pending_record_drain_offset,
         )
 
 

@@ -22,8 +22,13 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..agent_rpc import agent_rpc_client
 from ..codex_app_server import codex_app_server_client
 from ..config import config
+from ..controller_rpc import (
+    CODEX_TRANSPORT_PROTOCOL_VERSION,
+    CODEX_TRANSPORT_PROTOCOL_VERSION_KEY,
+)
 from ..node_registry import NODE_STATUS_OFFLINE, NODE_STATUS_ONLINE, node_registry
 from ..session import session_manager
 from ..telemetry import emit_telemetry
@@ -44,11 +49,15 @@ from .message_queue import get_pending_delivery_topics
 from .message_sender import safe_send
 from .topic_send import send_text_to_topic as _send_text_to_topic
 from .run_watchdog import (
+    clear_run_watch_state,
     get_due_run_checks,
+    get_immediate_auto_retry_candidate,
     note_auto_retry_attempt,
     note_auto_retry_result,
     note_run_started,
+    note_transport_reset_uncertainty,
     prune_run_watch_topics,
+    rearm_run_watch_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +81,67 @@ WATCHDOG_ACTIVE_TURN_KEEPALIVE_EMOJIS: tuple[str, ...] = (
     "📡",
     "🛠️",
 )
+
+
+async def _probe_window_codex_transport_health(
+    *,
+    window_id: str,
+    timeout: float,
+) -> bool:
+    """Probe the app-server transport on the machine that owns a window."""
+    machine_id = session_manager.get_window_machine_id(window_id)
+    local_machine_id, _local_machine_name = (
+        session_manager._local_machine_identity()
+    )
+    if machine_id and machine_id != local_machine_id:
+        epoch, epoch_started_at, generation = (
+            session_manager.get_window_codex_transport_state(window_id)
+        )
+        node = node_registry.get_node(machine_id)
+        runtime = getattr(node, "runtime", {}) if node is not None else {}
+        try:
+            protocol_version = int(
+                runtime.get(CODEX_TRANSPORT_PROTOCOL_VERSION_KEY, 0)
+                if isinstance(runtime, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            protocol_version = 0
+        legacy_transport_confirmed = bool(
+            getattr(
+                node,
+                "codex_transport_legacy_confirmed",
+                False,
+            )
+        )
+        supports_transport_probe = (
+            not legacy_transport_confirmed
+            and (
+                protocol_version >= CODEX_TRANSPORT_PROTOCOL_VERSION
+                or bool(epoch.strip())
+                or float(epoch_started_at) > 0
+                or int(generation) > 0
+            )
+        )
+        if not supports_transport_probe:
+            # Pre-protocol agents do not expose the state-bearing health RPC.
+            # Preserve their active-turn no-replay behavior during rollout;
+            # a later modern heartbeat enables the fenced probe.
+            return True
+        result = await asyncio.wait_for(
+            agent_rpc_client.probe_codex_health_state(
+                machine_id,
+                timeout=timeout,
+            ),
+            timeout=max(1.0, timeout + 2.0),
+        )
+        if not await session_manager._accept_remote_transport_result(
+            window_id=window_id,
+            result=result,
+        ):
+            return False
+        return bool(result["healthy"])
+    return await codex_app_server_client.probe_health(timeout=timeout)
 
 
 async def _emit_due_resource_monitor_notifications(bot: Bot) -> None:
@@ -418,14 +488,43 @@ async def _emit_due_run_watchdog_checks(
 
     codex_thread_id = session_manager.get_window_codex_thread_id(window_id)
     active_turn_id = session_manager.get_window_codex_active_turn_id(window_id)
-    if (
-        auto_retry_allowed
-        and isinstance(codex_thread_id, str)
+    active_turn = bool(
+        isinstance(codex_thread_id, str)
         and codex_thread_id
-        and (active_turn_id or codex_app_server_client.is_turn_in_progress(codex_thread_id))
-    ):
+        and (
+            active_turn_id
+            or codex_app_server_client.is_turn_in_progress(codex_thread_id)
+        )
+    )
+    if active_turn:
         auto_retry_allowed = False
-        auto_retry_reason = "active_turn"
+        try:
+            transport_healthy = await _probe_window_codex_transport_health(
+                window_id=window_id,
+                timeout=5.0,
+            )
+        except Exception as probe_error:
+            transport_healthy = True
+            auto_retry_reason = "health_probe_failed"
+            logger.warning(
+                "Codex app-server health probe returned without recovery "
+                "(window=%s thread=%s): %s",
+                window_id,
+                codex_thread_id,
+                probe_error,
+            )
+        else:
+            auto_retry_reason = (
+                "active_turn" if transport_healthy else "transport_recycled"
+            )
+        if auto_retry_reason == "transport_recycled":
+            # Preserve the watch but permanently suppress payload replay after
+            # an uncertain, interrupted generation.
+            note_transport_reset_uncertainty(
+                window_ids={window_id},
+                reason="health_probe_recycled",
+            )
+            session_manager.clear_window_codex_turn(window_id)
 
     if auto_retry_allowed and latest.resend_text.strip():
         auto_retry_attempted = True
@@ -486,6 +585,23 @@ async def _emit_due_run_watchdog_checks(
         )
     elif auto_retry_reason == "active_turn":
         action_line = "Action: active turn detected; skipped automatic resend."
+    elif auto_retry_reason == "activity_seen":
+        action_line = "Action: assistant activity observed; skipped automatic resend."
+    elif auto_retry_reason == "transport_recycled":
+        action_line = (
+            "Action: unresponsive Codex transport recycled; "
+            "the interrupted turn was not replayed."
+        )
+    elif auto_retry_reason == "transport_uncertain":
+        action_line = (
+            "Action: a prior transport reset interrupted this turn; "
+            "it was not replayed. Send a new message to resume."
+        )
+    elif auto_retry_reason == "health_probe_failed":
+        action_line = (
+            "Action: health probe failed without a transport recycle; "
+            "active turn retained and payload replay skipped."
+        )
     else:
         action_line = "Action: no automatic retry."
 
@@ -494,6 +610,8 @@ async def _emit_due_run_watchdog_checks(
         text = random.choice(WATCHDOG_ACTIVE_TURN_KEEPALIVE_EMOJIS)
         notification_kind = "active_turn_keepalive"
     else:
+        if auto_retry_reason == "transport_recycled":
+            notification_kind = "transport_recycled"
         text = (
             "🩺 *Run Watchdog Check*\n\n"
             f"Session: `{display}`\n"
@@ -501,12 +619,35 @@ async def _emit_due_run_watchdog_checks(
             f"Checkpoint: `{checkpoint_label}`\n"
             f"{action_line}"
         )
-    await safe_send(
-        bot,
-        resolved_chat_id,
-        text,
-        message_thread_id=thread_id,
-    )
+    terminal_notice = auto_retry_reason in {
+        "transport_recycled",
+        "transport_uncertain",
+    }
+    sent_message = None
+    try:
+        sent_message = await safe_send(
+            bot,
+            resolved_chat_id,
+            text,
+            message_thread_id=thread_id,
+        )
+    finally:
+        if terminal_notice:
+            if sent_message is None:
+                rearm_run_watch_checkpoint(
+                    user_id,
+                    thread_id,
+                    window_id=window_id,
+                    watch_token=latest.watch_token,
+                    checkpoint_seconds=latest.checkpoint_seconds,
+                )
+            else:
+                clear_run_watch_state(
+                    user_id,
+                    thread_id,
+                    window_id=window_id,
+                    watch_token=latest.watch_token,
+                )
     emit_telemetry(
         "watchdog.check_fired",
         user_id=user_id,
@@ -1015,8 +1156,21 @@ async def status_poll_loop(bot: Bot) -> None:
 
             for user_id, chat_id, thread_id, wid in bindings:
                 try:
-                    if (thread_id or 0) in pending_delivery_topics.get(user_id, set()):
-                        continue
+                    pending_delivery = (thread_id or 0) in pending_delivery_topics.get(
+                        user_id,
+                        set(),
+                    )
+                    if pending_delivery:
+                        retry_candidate = get_immediate_auto_retry_candidate(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            window_id=wid,
+                        )
+                        if (
+                            retry_candidate is None
+                            or retry_candidate.auto_retry_reason != "transport_uncertain"
+                        ):
+                            continue
 
                     if chat_id is None:
                         await _emit_due_run_watchdog_checks(
@@ -1025,6 +1179,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             thread_id=thread_id,
                             window_id=wid,
                         )
+                        if pending_delivery:
+                            continue
                         await _emit_due_looper_prompt(
                             bot,
                             user_id=user_id,
@@ -1051,6 +1207,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             window_id=wid,
                             chat_id=chat_id,
                         )
+                        if pending_delivery:
+                            continue
                         await _emit_due_looper_prompt(
                             bot,
                             user_id=user_id,

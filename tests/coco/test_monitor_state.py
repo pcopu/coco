@@ -13,17 +13,23 @@ class TestTrackedSession:
             session_id="sess-1",
             file_path="/tmp/test.jsonl",
             last_byte_offset=42,
+            pending_record_start_offset=42,
+            pending_record_drain_offset=99,
         )
         restored = TrackedSession.from_dict(original.to_dict())
         assert restored.session_id == "sess-1"
         assert restored.file_path == "/tmp/test.jsonl"
         assert restored.last_byte_offset == 42
+        assert restored.pending_record_start_offset == 42
+        assert restored.pending_record_drain_offset == 99
 
     def test_from_dict_missing_fields_uses_defaults(self):
         session = TrackedSession.from_dict({})
         assert session.session_id == ""
         assert session.file_path == ""
         assert session.last_byte_offset == 0
+        assert session.pending_record_start_offset is None
+        assert session.pending_record_drain_offset is None
 
     def test_from_dict_non_finite_offset_uses_zero(self):
         session = TrackedSession.from_dict({"last_byte_offset": float("inf")})
@@ -53,6 +59,31 @@ class TestMonitorStateLoad:
         state.load()
         assert "s1" in state.tracked_sessions
         assert state.tracked_sessions["s1"].last_byte_offset == 100
+
+    def test_load_restores_pending_oversized_record_drain(self, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "tracked_sessions": {
+                        "s1": {
+                            "session_id": "s1",
+                            "file_path": "/a.jsonl",
+                            "last_byte_offset": 100,
+                            "pending_record_start_offset": 100,
+                            "pending_record_drain_offset": 300,
+                        }
+                    }
+                }
+            )
+        )
+
+        state = MonitorState(state_file=state_file)
+        state.load()
+
+        tracked = state.tracked_sessions["s1"]
+        assert tracked.pending_record_start_offset == 100
+        assert tracked.pending_record_drain_offset == 300
 
     def test_load_corrupt_json(self, tmp_path):
         state_file = tmp_path / "state.json"

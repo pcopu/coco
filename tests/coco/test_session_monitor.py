@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import coco.session as session_module
+import coco.session_monitor as session_monitor_module
 from coco.monitor_state import TrackedSession
 from coco.session_monitor import SessionInfo, SessionMonitor
 
@@ -116,6 +117,136 @@ class TestReadNewLinesOffsetRecovery:
 
         assert result == [entry]
         assert session.last_byte_offset == jsonl_file.stat().st_size
+
+    @pytest.mark.asyncio
+    async def test_backlog_is_drained_in_bounded_batches_without_duplicates(
+        self,
+        monitor,
+        monkeypatch,
+        tmp_path,
+        make_jsonl_entry,
+    ):
+        jsonl_file = tmp_path / "session.jsonl"
+        entries = [
+            make_jsonl_entry(msg_type="assistant", content=f"message-{index}")
+            for index in range(3)
+        ]
+        encoded_lines = [
+            (json.dumps(entry) + "\n").encode("utf-8")
+            for entry in entries
+        ]
+        jsonl_file.write_bytes(b"".join(encoded_lines))
+        monkeypatch.setattr(
+            session_monitor_module,
+            "SESSION_MONITOR_MAX_BATCH_BYTES",
+            len(encoded_lines[0]),
+            raising=False,
+        )
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        batches: list[list[dict]] = []
+        while session.last_byte_offset < jsonl_file.stat().st_size:
+            previous_offset = session.last_byte_offset
+            batch = await monitor._read_new_lines(session, jsonl_file)
+            assert session.last_byte_offset > previous_offset
+            batches.append(batch)
+
+        assert [len(batch) for batch in batches] == [1, 1, 1]
+        assert [entry for batch in batches for entry in batch] == entries
+
+    @pytest.mark.asyncio
+    async def test_oversized_complete_record_is_skipped_before_json_parse(
+        self,
+        monitor,
+        monkeypatch,
+        tmp_path,
+        make_jsonl_entry,
+    ):
+        jsonl_file = tmp_path / "session.jsonl"
+        max_bytes = 128
+        entry = make_jsonl_entry(msg_type="assistant", content="x" * 512)
+        encoded_record = (json.dumps(entry) + "\n").encode("utf-8")
+        assert len(encoded_record) > max_bytes
+        jsonl_file.write_bytes(encoded_record)
+        monkeypatch.setattr(
+            session_monitor_module,
+            "SESSION_MONITOR_MAX_BATCH_BYTES",
+            max_bytes,
+        )
+        monkeypatch.setattr(
+            session_monitor_module.TranscriptParser,
+            "parse_line",
+            lambda _line: pytest.fail("oversized record reached the JSON parser"),
+        )
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        drain_offsets: list[int] = []
+        while session.last_byte_offset < len(encoded_record):
+            result = await monitor._read_new_lines(session, jsonl_file)
+            assert result == []
+            drain_offsets.append(
+                session.pending_record_drain_offset
+                if session.pending_record_drain_offset is not None
+                else session.last_byte_offset
+            )
+
+        assert drain_offsets
+        assert all(
+            current - previous <= max_bytes
+            for previous, current in zip([0, *drain_offsets], drain_offsets)
+        )
+        assert session.last_byte_offset == len(encoded_record)
+        assert session.pending_record_start_offset is None
+        assert session.pending_record_drain_offset is None
+
+    @pytest.mark.asyncio
+    async def test_oversized_partial_record_keeps_last_safe_offset(
+        self,
+        monitor,
+        monkeypatch,
+        tmp_path,
+    ):
+        jsonl_file = tmp_path / "session.jsonl"
+        max_bytes = 128
+        partial_record = b'{"type":"assistant","payload":"' + (b"x" * 512)
+        jsonl_file.write_bytes(partial_record)
+        monkeypatch.setattr(
+            session_monitor_module,
+            "SESSION_MONITOR_MAX_BATCH_BYTES",
+            max_bytes,
+        )
+        monkeypatch.setattr(
+            session_monitor_module.TranscriptParser,
+            "parse_line",
+            lambda _line: pytest.fail("oversized partial record reached the JSON parser"),
+        )
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        assert result == []
+        assert session.last_byte_offset == 0
+        assert session.pending_record_start_offset == 0
+        assert session.pending_record_drain_offset == max_bytes
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        assert result == []
+        assert session.last_byte_offset == 0
+        assert session.pending_record_start_offset == 0
+        assert session.pending_record_drain_offset == max_bytes * 2
 
 
 def test_resolve_codex_session_files_prefers_tracked_file_path(tmp_path):

@@ -7,6 +7,19 @@ from telegram.error import NetworkError
 
 import coco.bot as bot
 import coco.handlers.commands as commands
+import coco.handlers.run_watchdog as watchdog
+
+
+@pytest.fixture(autouse=True)
+def _isolated_watchdog_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        watchdog,
+        "_RUN_RETRY_STATE_FILE",
+        tmp_path / "run_watchdog_retry_state.json",
+    )
+    watchdog.reset_run_watchdog_for_tests()
+    yield
+    watchdog.reset_run_watchdog_for_tests()
 
 
 @pytest.mark.asyncio
@@ -26,6 +39,15 @@ async def test_esc_recovers_active_turn_from_thread_read_and_fences_before_inter
         message=message,
     )
     context = SimpleNamespace(bot=object())
+    watchdog.note_run_started(
+        user_id=42,
+        thread_id=777,
+        window_id="@7",
+        source="user_input",
+        expect_response=True,
+        pending_text="must not replay after abort",
+        now=0.0,
+    )
 
     commands._sync_bot_globals()
     monkeypatch.setattr(commands, "_sync_bot_globals", lambda: None)
@@ -137,6 +159,16 @@ async def test_esc_recovers_active_turn_from_thread_read_and_fences_before_inter
         expected_events.append("interrupt:th-7:turn-live")
     expected_events.extend(["dock-cleared", "progress-cleared"])
     assert events == expected_events
+    due_checks = watchdog.get_due_run_checks(
+        user_id=42,
+        thread_id=777,
+        window_id="@7",
+        now=30.0,
+    )
+    if failure_mode == "interrupt":
+        assert [check.checkpoint_seconds for check in due_checks] == [30]
+    else:
+        assert due_checks == []
     if fail_status_reply:
         assert replies == []
         return
