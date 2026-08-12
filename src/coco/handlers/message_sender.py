@@ -69,11 +69,18 @@ _VOICE_EXTENSION_BY_MEDIA_TYPE = {
     "audio/ogg": ".ogg",
 }
 _RICH_TEXT_FORMATS = {"html", "markdown"}
+_GENERAL_TOPIC_THREAD_ID = 1
 
 
 def _thread_id_from_kwargs(kwargs: dict[str, Any]) -> int | None:
     tid = kwargs.get("message_thread_id")
     return tid if isinstance(tid, int) else None
+
+
+def _omit_general_topic_for_telegram(kwargs: dict[str, Any]) -> None:
+    """Send forum General as topic-less while retaining internal topic key 1."""
+    if kwargs.get("message_thread_id") == _GENERAL_TOPIC_THREAD_ID:
+        kwargs.pop("message_thread_id", None)
 
 
 def _build_rich_message(
@@ -165,6 +172,7 @@ async def send_with_fallback(
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     thread_id = _thread_id_from_kwargs(kwargs)
+    _omit_general_topic_for_telegram(kwargs)
     rich_text = kwargs.pop("rich_text", None)
     fallback_text = rich_text if isinstance(rich_text, str) else text
     rich_format = kwargs.pop("rich_format", "markdown")
@@ -243,6 +251,7 @@ async def send_photo(
     """
     if not image_data:
         return
+    _omit_general_topic_for_telegram(kwargs)
     try:
         if len(image_data) == 1:
             _media_type, raw_bytes = image_data[0]
@@ -293,6 +302,7 @@ async def send_video(
     **kwargs: Any,
 ) -> None:
     """Send one video to chat with document fallback."""
+    _omit_general_topic_for_telegram(kwargs)
     try:
         await bot.send_video(
             chat_id=chat_id,
@@ -329,6 +339,7 @@ async def send_documents(
     """Send one or more documents to chat."""
     if not document_data:
         return
+    _omit_general_topic_for_telegram(kwargs)
     try:
         for filename, raw_bytes in document_data:
             await bot.send_document(
@@ -352,6 +363,7 @@ async def send_voice(
     **kwargs: Any,
 ) -> None:
     """Send one voice note to chat with audio/document fallback."""
+    _omit_general_topic_for_telegram(kwargs)
     extension = _VOICE_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
     try:
         await bot.send_voice(
@@ -511,6 +523,7 @@ async def safe_send(
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
+    _omit_general_topic_for_telegram(kwargs)
     rich_text = kwargs.pop("rich_text", None)
     fallback_text = rich_text if isinstance(rich_text, str) else text
     rich_format = kwargs.pop("rich_format", "markdown")

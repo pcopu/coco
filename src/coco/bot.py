@@ -162,6 +162,7 @@ from .handlers.looper import (
     stop_looper,
 )
 from .handlers.message_queue import (
+    capture_topic_ownership,
     cancel_topic_delivery,
     clear_queued_topic_dock,
     clear_queued_topic_inputs,
@@ -175,9 +176,10 @@ from .handlers.message_queue import (
     enqueue_status_update,
     get_progress_text,
     get_message_queue,
+    is_topic_ownership_current,
     is_progress_active,
     prepend_queued_topic_input,
-    pop_queued_topic_input,
+    pop_queued_topic_input_with_ownership,
     queued_topic_input_count,
     shutdown_workers,
     sync_queued_topic_dock,
@@ -200,9 +202,13 @@ from .handlers.run_watchdog import (
 )
 from .handlers.status_polling import emit_looper_tick, status_poll_loop
 from .session import (
+    GENERAL_TOPIC_THREAD_ID,
+    CocoControlMigration,
     CocoControlTopic,
     TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL,
     TOPIC_SYNC_MODE_TELEGRAM_LIVE,
+    TopicOwnership,
+    TopicSendDispatchState,
     TopicBinding,
     session_manager,
 )
@@ -328,6 +334,39 @@ _pending_transient_app_server_errors: dict[
 # the marker.
 _interrupted_codex_threads: set[_CodexThreadStateKey] = set()
 _interrupted_codex_turns: dict[_CodexThreadStateKey, str] = {}
+
+# A host writer can outlive its final transcript event by a short interval.
+# Retry only deterministic, pre-dispatch writer conflicts; uncertain sends must
+# never be replayed automatically.
+QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS = 1.0
+QUEUE_ACTIVE_WRITER_MAX_RETRIES = 3
+# Only one drain may pop/requeue a topic at a time. Event-loop execution makes
+# the membership check/add below atomic until the first await.
+_queued_topic_drains: set[tuple[int, int, int]] = set()
+_queued_topic_drain_wakeups: dict[
+    tuple[int, int, int], tuple[Bot, str, int | None]
+] = {}
+
+
+def _queued_topic_drain_key(
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+) -> tuple[int, int, int]:
+    resolved_chat_id = session_manager.resolve_chat_id(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    return user_id, resolved_chat_id, thread_id
+
+
+def _is_queued_topic_drain_active(
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+) -> bool:
+    return _queued_topic_drain_key(user_id, thread_id, chat_id) in _queued_topic_drains
 
 # Prevent duplicate /restart handling races.
 _restart_requested = False
@@ -583,7 +622,6 @@ CC_COMMANDS: dict[str, str] = {
     "help": "↗ Show assistant help",
 }
 
-
 def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
 
@@ -603,12 +641,14 @@ def _is_chat_allowed(chat) -> bool:
 
 
 def _get_thread_id(update: Update) -> int | None:
-    """Extract thread_id from an update, returning None if not in a named topic."""
+    """Extract a topic key, including the forum General topic sentinel."""
     msg = update.effective_message
     if msg is None:
         return None
     tid = getattr(msg, "message_thread_id", None)
-    if tid not in (None, 1):
+    if tid == GENERAL_TOPIC_THREAD_ID:
+        return GENERAL_TOPIC_THREAD_ID
+    if tid is not None:
         return tid
 
     # Telegram occasionally omits message_thread_id on command messages sent in
@@ -623,6 +663,10 @@ def _get_thread_id(update: Update) -> int | None:
                 (msg.text or "")[:60],
             )
             return reply_tid
+
+    chat = update.effective_chat or getattr(msg, "chat", None)
+    if getattr(chat, "is_forum", False):
+        return GENERAL_TOPIC_THREAD_ID
 
     return None
 
@@ -2447,40 +2491,171 @@ def _ensure_coco_control_workspace_binding(
         return None, ""
 
     changed = False
-    workspace_dir = str(binding.cwd or "").strip()
-    if not workspace_dir:
-        workspace_path = _default_coco_control_workspace(
-            user_id=user_id,
-            thread_id=thread_id,
-            chat_id=chat_id,
-        )
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        workspace_dir = str(workspace_path)
+    workspace_path = _default_coco_control_workspace(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    workspace_dir = str(workspace_path)
+    if str(binding.cwd or "").strip() != workspace_dir:
         binding.cwd = workspace_dir
         changed = True
-    else:
-        try:
-            Path(workspace_dir).expanduser().mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
 
-    if not str(binding.display_name or "").strip():
+    if str(binding.display_name or "").strip() != "coco-control":
         binding.display_name = "coco-control"
         changed = True
 
     window_id = str(binding.window_id or "").strip()
     if window_id:
         state = session_manager.get_window_state(window_id)
-        if workspace_dir and not state.cwd:
+        if state.cwd != workspace_dir:
             state.cwd = workspace_dir
             changed = True
-        if binding.display_name and not state.window_name:
+        if state.window_name != binding.display_name:
             state.window_name = binding.display_name
             changed = True
 
     if changed:
         session_manager._save_state()
     return binding, workspace_dir
+
+
+def _ensure_default_coco_general_control(
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+) -> TopicBinding | None:
+    """Materialize General and enforce it as this chat's CoCo control."""
+    if thread_id != GENERAL_TOPIC_THREAD_ID or chat_id is None:
+        return None
+
+    current_control = session_manager.get_coco_control_topic()
+    binding, workspace_dir = _ensure_coco_control_workspace_binding(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
+    if binding is None:
+        return None
+
+    if (
+        current_control is not None
+        and current_control.user_id == user_id
+        and current_control.chat_id == chat_id
+        and current_control.thread_id != GENERAL_TOPIC_THREAD_ID
+    ):
+        session_manager.migrate_coco_control_to_general(
+            workspace_dir=workspace_dir,
+            general_thread_id=GENERAL_TOPIC_THREAD_ID,
+        )
+        binding = session_manager.resolve_topic_binding(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if binding is None:
+            return None
+
+    if not str(binding.window_id or "").strip():
+        window_id = session_manager.allocate_virtual_window_id()
+        state = session_manager.get_window_state(window_id)
+        state.cwd = workspace_dir
+        state.window_name = "coco-control"
+        session_manager.bind_thread(
+            user_id,
+            thread_id,
+            window_id,
+            window_name="coco-control",
+            chat_id=chat_id,
+        )
+        session_manager.mark_window_pending_session_start_reason(
+            window_id,
+            "fresh_start",
+        )
+        binding = session_manager.resolve_topic_binding(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+
+    if current_control is None:
+        binding = session_manager.set_coco_control_topic(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        logger.info(
+            "Defaulted forum General to CoCo control (user=%d chat=%d)",
+            user_id,
+            chat_id,
+        )
+    return binding
+
+
+async def _migrate_coco_control_to_general(bot: Bot) -> CocoControlMigration | None:
+    """Move a legacy named control topic to General and announce the change."""
+    current = session_manager.get_coco_control_topic()
+    if current is None or not current.chat_id:
+        return None
+    if current.thread_id == GENERAL_TOPIC_THREAD_ID:
+        _ensure_default_coco_general_control(
+            user_id=current.user_id,
+            thread_id=GENERAL_TOPIC_THREAD_ID,
+            chat_id=current.chat_id,
+        )
+        return None
+
+    workspace_path = _default_coco_control_workspace(
+        user_id=current.user_id,
+        thread_id=GENERAL_TOPIC_THREAD_ID,
+        chat_id=current.chat_id,
+    )
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    migration = session_manager.migrate_coco_control_to_general(
+        workspace_dir=str(workspace_path),
+        general_thread_id=GENERAL_TOPIC_THREAD_ID,
+    )
+    if migration is None:
+        return None
+
+    old_notice = (
+        "ℹ️ CoCo control has moved permanently to General. "
+        "Its Codex history was migrated there. This topic is no longer the "
+        "control channel."
+    )
+    general_notice = (
+        "✅ General is now the permanent CoCo control channel. "
+        "The previous control history was migrated here."
+    )
+    for thread_id, text in (
+        (migration.previous_thread_id, old_notice),
+        (migration.general_thread_id, general_notice),
+    ):
+        try:
+            await safe_send(
+                bot,
+                migration.chat_id,
+                text,
+                message_thread_id=thread_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to announce CoCo General migration "
+                "(chat=%s thread=%s): %s",
+                migration.chat_id,
+                thread_id,
+                exc,
+            )
+    emit_telemetry(
+        "coco.control.migrated_to_general",
+        user_id=migration.user_id,
+        chat_id=migration.chat_id,
+        previous_thread_id=migration.previous_thread_id,
+        moved_history=migration.moved_history,
+    )
+    return migration
 
 
 def _format_coco_topic_label(
@@ -2567,16 +2742,10 @@ def _build_coco_control_text(
 
 
 def _build_coco_control_keyboard(*, is_current: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if not is_current:
-        rows.append(
-            [
-                InlineKeyboardButton("Set As CoCo", callback_data=CB_COCO_SET),
-                InlineKeyboardButton("Cancel", callback_data=CB_COCO_CANCEL),
-            ]
-        )
-    rows.append([InlineKeyboardButton("Refresh", callback_data=CB_COCO_REFRESH)])
-    return InlineKeyboardMarkup(rows)
+    _ = is_current
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Refresh", callback_data=CB_COCO_REFRESH)]]
+    )
 
 
 def _resolve_workspace_dir_for_window(
@@ -4436,6 +4605,7 @@ async def _handle_shadow_transcript_message_for_topic(
                 thread_id=thread_id,
                 window_id=window_id,
                 chat_id=chat_id,
+                preserve_coalesced_wakeup=True,
             )
         return True
 
@@ -4480,8 +4650,80 @@ async def _dispatch_next_queued_input(
     window_id: str,
     *,
     chat_id: int | None = None,
+    active_writer_retries_remaining: int = QUEUE_ACTIVE_WRITER_MAX_RETRIES,
+    preserve_coalesced_wakeup: bool = False,
+    _drain_owned: bool = False,
 ) -> None:
     """Send one queued /q message after current run completion."""
+    if not _drain_owned:
+        drain_key = _queued_topic_drain_key(user_id, thread_id, chat_id)
+        if drain_key in _queued_topic_drains:
+            if preserve_coalesced_wakeup:
+                # Ingress may arrive after the owner observed an empty queue
+                # and while it awaits a dock edit.  Record that enqueue as a
+                # wakeup; incidental duplicate drain calls do not reset retry
+                # budgets or manufacture additional work.
+                _queued_topic_drain_wakeups[drain_key] = (
+                    bot,
+                    window_id,
+                    chat_id,
+                )
+            emit_telemetry(
+                "queue.dispatch.coalesced",
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=window_id,
+            )
+            return
+        _queued_topic_drains.add(drain_key)
+        try:
+            await _dispatch_next_queued_input(
+                bot,
+                user_id,
+                thread_id,
+                window_id,
+                chat_id=chat_id,
+                active_writer_retries_remaining=active_writer_retries_remaining,
+                _drain_owned=True,
+            )
+        except BaseException as owned_error:
+            _queued_topic_drains.discard(drain_key)
+            pending_wakeup = _queued_topic_drain_wakeups.pop(drain_key, None)
+            if pending_wakeup is not None:
+                pending_bot, pending_window_id, pending_chat_id = pending_wakeup
+                followup = _dispatch_next_queued_input(
+                    pending_bot,
+                    user_id,
+                    thread_id,
+                    pending_window_id,
+                    chat_id=pending_chat_id,
+                )
+                if isinstance(owned_error, asyncio.CancelledError):
+                    asyncio.create_task(followup)
+                else:
+                    try:
+                        await followup
+                    except Exception:
+                        logger.exception(
+                            "Queued completion wakeup failed after drain error "
+                            "(user=%d thread=%d)",
+                            user_id,
+                            thread_id,
+                        )
+            raise
+        _queued_topic_drains.discard(drain_key)
+        pending_wakeup = _queued_topic_drain_wakeups.pop(drain_key, None)
+        if pending_wakeup is not None:
+            pending_bot, pending_window_id, pending_chat_id = pending_wakeup
+            await _dispatch_next_queued_input(
+                pending_bot,
+                user_id,
+                thread_id,
+                pending_window_id,
+                chat_id=pending_chat_id,
+            )
+        return
+
     if await _is_window_in_progress(
         user_id, thread_id, window_id, chat_id=chat_id
     ):
@@ -4500,8 +4742,12 @@ async def _dispatch_next_queued_input(
         )
         return
 
-    queued = pop_queued_topic_input(user_id, thread_id, chat_id)
-    if not queued:
+    queued_item = pop_queued_topic_input_with_ownership(
+        user_id,
+        thread_id,
+        chat_id,
+    )
+    if queued_item is None:
         await sync_queued_topic_dock(
             bot,
             user_id,
@@ -4511,47 +4757,180 @@ async def _dispatch_next_queued_input(
         )
         return
 
-    queued_text, src_chat_id, src_message_id = queued
-    await sync_queued_topic_dock(
-        bot,
+    queued_text = queued_item.text
+    src_chat_id = queued_item.source_chat_id
+    src_message_id = queued_item.source_message_id
+    if queued_item.topic_ownership is None or not is_topic_ownership_current(
         user_id,
         thread_id,
-        window_id=window_id,
-        chat_id=chat_id,
-    )
-    emit_telemetry(
-        "queue.dispatch.start",
-        user_id=user_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        text_len=len(queued_text),
-    )
-
-    queue = get_message_queue(user_id)
-    if queue:
-        try:
-            await asyncio.wait_for(queue.join(), timeout=5.0)
-        except TimeoutError:
-            logger.debug(
-                "Timed out waiting for message queue before dispatching queued /q (user=%d thread=%d)",
+        chat_id,
+        queued_item.topic_ownership,
+    ):
+        await sync_queued_topic_dock(
+            bot,
+            user_id,
+            thread_id,
+            window_id=window_id,
+            chat_id=chat_id,
+        )
+        emit_telemetry(
+            "queue.dispatch.stale_binding_dropped",
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text_len=len(queued_text),
+        )
+        await safe_send(
+            bot,
+            session_manager.resolve_chat_id(
                 user_id,
                 thread_id,
-            )
-            emit_telemetry(
-                "queue.dispatch.queue_wait_timeout",
-                user_id=user_id,
-                thread_id=thread_id,
-                window_id=window_id,
-            )
+                chat_id=chat_id,
+            ),
+            "⚠️ A queued request was not sent because this topic's canonical "
+            "Codex binding changed after it was queued.",
+            message_thread_id=thread_id,
+        )
+        await _dispatch_next_queued_input(
+            bot,
+            user_id,
+            thread_id,
+            window_id,
+            chat_id=chat_id,
+            active_writer_retries_remaining=active_writer_retries_remaining,
+            _drain_owned=True,
+        )
+        return
 
-    success, send_msg = await session_manager.send_topic_text_to_window(
-        user_id=user_id,
-        thread_id=thread_id,
-        chat_id=chat_id,
-        window_id=window_id,
-        text=queued_text,
-        force_new_turn=True,
-    )
+    try:
+        await sync_queued_topic_dock(
+            bot,
+            user_id,
+            thread_id,
+            window_id=window_id,
+            chat_id=chat_id,
+        )
+        emit_telemetry(
+            "queue.dispatch.start",
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text_len=len(queued_text),
+        )
+
+        queue = get_message_queue(user_id)
+        if queue:
+            try:
+                await asyncio.wait_for(queue.join(), timeout=5.0)
+            except TimeoutError:
+                logger.debug(
+                    "Timed out waiting for message queue before dispatching queued /q (user=%d thread=%d)",
+                    user_id,
+                    thread_id,
+                )
+                emit_telemetry(
+                    "queue.dispatch.queue_wait_timeout",
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    window_id=window_id,
+                )
+    except BaseException:
+        prepend_queued_topic_input(
+            user_id,
+            thread_id,
+            queued_text,
+            src_chat_id,
+            src_message_id,
+            topic_ownership=queued_item.topic_ownership,
+        )
+        raise
+
+    # Dock synchronization and queue.join() are await points.  An explicit
+    # lifecycle action may have rebound the topic while the item was outside
+    # the FIFO, so fence it again immediately before transport dispatch.
+    if queued_item.topic_ownership is None or not is_topic_ownership_current(
+        user_id,
+        thread_id,
+        chat_id,
+        queued_item.topic_ownership,
+    ):
+        emit_telemetry(
+            "queue.dispatch.stale_binding_dropped",
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text_len=len(queued_text),
+            stage="before_transport_dispatch",
+        )
+        await safe_send(
+            bot,
+            session_manager.resolve_chat_id(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+            ),
+            "⚠️ A queued request was not sent because this topic's canonical "
+            "Codex binding changed after it was queued.",
+            message_thread_id=thread_id,
+        )
+        await _dispatch_next_queued_input(
+            bot,
+            user_id,
+            thread_id,
+            window_id,
+            chat_id=chat_id,
+            active_writer_retries_remaining=active_writer_retries_remaining,
+            _drain_owned=True,
+        )
+        return
+
+    dispatch_state = TopicSendDispatchState()
+    try:
+        success, send_msg = await session_manager.send_topic_text_to_window(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            window_id=window_id,
+            text=queued_text,
+            force_new_turn=True,
+            dispatch_state=dispatch_state,
+        )
+    except BaseException as exc:
+        active_writer_exception = session_manager.is_codex_active_writer_error(exc)
+        if (
+            not dispatch_state.transport_dispatch_started
+            and not active_writer_exception
+        ):
+            prepend_queued_topic_input(
+                user_id,
+                thread_id,
+                queued_text,
+                src_chat_id,
+                src_message_id,
+                topic_ownership=queued_item.topic_ownership,
+            )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if not active_writer_exception:
+            raise
+        logger.warning(
+            "Queued /q dispatch found an active writer "
+            "(user=%d thread=%d window=%s): %s",
+            user_id,
+            thread_id,
+            window_id,
+            exc,
+        )
+        success = False
+        send_msg = str(exc) or type(exc).__name__
+        emit_telemetry(
+            "queue.dispatch.send_exception",
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            error=send_msg,
+            text_len=len(queued_text),
+        )
     emit_telemetry(
         "queue.dispatch.send_result",
         user_id=user_id,
@@ -4562,13 +4941,22 @@ async def _dispatch_next_queued_input(
         text_len=len(queued_text),
     )
     if not success:
-        prepend_queued_topic_input(
-            user_id,
-            thread_id,
-            queued_text,
-            src_chat_id,
-            src_message_id,
+        uncertain_send = (
+            dispatch_state.transport_dispatch_started
+            or session_manager.is_codex_uncertain_send_result(send_msg)
         )
+        active_writer_conflict = session_manager.is_codex_active_writer_error(
+            send_msg
+        )
+        if active_writer_conflict or not uncertain_send:
+            prepend_queued_topic_input(
+                user_id,
+                thread_id,
+                queued_text,
+                src_chat_id,
+                src_message_id,
+                topic_ownership=queued_item.topic_ownership,
+            )
         await sync_queued_topic_dock(
             bot,
             user_id,
@@ -4576,6 +4964,28 @@ async def _dispatch_next_queued_input(
             window_id=window_id,
             chat_id=chat_id,
         )
+        if active_writer_conflict and active_writer_retries_remaining > 0:
+            emit_telemetry(
+                "queue.dispatch.active_writer_retry_scheduled",
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                retries_remaining=active_writer_retries_remaining,
+                delay_seconds=QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS,
+            )
+            await asyncio.sleep(QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS)
+            await _dispatch_next_queued_input(
+                bot,
+                user_id,
+                thread_id,
+                window_id,
+                chat_id=chat_id,
+                active_writer_retries_remaining=(
+                    active_writer_retries_remaining - 1
+                ),
+                _drain_owned=True,
+            )
+            return
         await safe_send(
             bot,
             session_manager.resolve_chat_id(
@@ -8057,7 +8467,6 @@ async def forward_command_handler(
             "❌ Session binding is incomplete. Send a normal message to reinitialize.",
         )
         return
-
     display = session_manager.get_display_name(wid)
     logger.info(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
@@ -8443,13 +8852,29 @@ async def _submit_image_to_codex_session(
     *,
     user_id: int,
     thread_id: int,
+    chat_id: int | None,
     window_id: str,
     image_path: Path,
     prompt: str,
+    topic_ownership: TopicOwnership,
 ) -> tuple[bool, str]:
     """Submit an image prompt into the existing Codex session."""
     if config.session_provider != "codex":
         return False, "Image bridge is only available in Codex provider mode."
+
+    def _topic_ownership_is_current() -> bool:
+        return is_topic_ownership_current(
+            user_id,
+            thread_id,
+            chat_id,
+            topic_ownership,
+        )
+
+    if (
+        topic_ownership.window_id != window_id
+        or not _topic_ownership_is_current()
+    ):
+        return False, "The topic binding changed before the image could be sent."
 
     # Try app-server image input first whenever app-server transport is preferred.
     if _codex_app_server_preferred():
@@ -8466,6 +8891,8 @@ async def _submit_image_to_codex_session(
             window_id,
             inputs,
             steer=steer,
+            dispatch_cwd=topic_ownership.cwd,
+            ownership_validator=_topic_ownership_is_current,
         )
         if ok:
             session_manager.mark_topic_telegram_live(
@@ -8499,6 +8926,9 @@ async def _submit_image_to_codex_session(
         image_path,
         prompt,
     )
+
+    if not _topic_ownership_is_current():
+        return False, "The topic binding changed before the image could be sent."
 
     logger.info(
         "Submitting image via Codex resume (user=%d thread=%d window=%s session=%s image=%s)",
@@ -8545,6 +8975,7 @@ async def _run_photo_bridge_task(
     window_id: str,
     image_path: Path,
     prompt: str,
+    topic_ownership: TopicOwnership,
 ) -> None:
     """Run one photo bridge submission; serialize per topic."""
     lock = _get_photo_resume_lock(user_id, thread_id)
@@ -8553,9 +8984,11 @@ async def _run_photo_bridge_task(
             ok, err = await _submit_image_to_codex_session(
                 user_id=user_id,
                 thread_id=thread_id,
+                chat_id=chat_id,
                 window_id=window_id,
                 image_path=image_path,
                 prompt=prompt,
+                topic_ownership=topic_ownership,
             )
             if ok:
                 return
@@ -8573,6 +9006,7 @@ async def _run_photo_bridge_task(
                 chat_id=chat_id,
                 window_id=window_id,
                 text=fallback_text,
+                topic_ownership=topic_ownership,
             )
             if not send_ok:
                 await safe_send(
@@ -8643,6 +9077,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    _ensure_default_coco_general_control(
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
+
     wid = session_manager.get_window_for_thread(
         user.id,
         thread_id,
@@ -8664,6 +9104,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(
             update.message,
             "❌ Session binding is incomplete. Send a normal message to reinitialize.",
+        )
+        return
+    topic_ownership = capture_topic_ownership(user.id, thread_id, chat_id)
+    if topic_ownership is None:
+        await safe_reply(
+            update.message,
+            "❌ The topic binding changed before this image could be accepted. Retry it.",
         )
         return
 
@@ -8691,6 +9138,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 window_id=wid,
                 image_path=file_path,
                 prompt=prompt,
+                topic_ownership=topic_ownership,
             )
         )
         await _set_eyes_reaction(update.message)
@@ -8704,6 +9152,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         chat_id=chat_id,
         window_id=wid,
         text=text_to_send,
+        topic_ownership=topic_ownership,
     )
     if not success:
         await safe_reply(update.message, f"❌ {message}")
@@ -8896,6 +9345,12 @@ async def _forward_topic_text_message(
         )
         return
 
+    _ensure_default_coco_general_control(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
+
     wid = session_manager.get_window_for_thread(
         user_id,
         thread_id,
@@ -8966,6 +9421,14 @@ async def _forward_topic_text_message(
         )
         return
 
+    topic_ownership = capture_topic_ownership(user_id, thread_id, chat_id)
+    if topic_ownership is None:
+        await safe_reply(
+            message,
+            "❌ The topic binding changed before this request could be accepted. Retry it.",
+        )
+        return
+
     if persist_response_mode:
         session_manager.set_topic_response_mode(
             user_id,
@@ -9001,6 +9464,18 @@ async def _forward_topic_text_message(
                     f"❌ Topic `{target_label}` is not bound to a session yet.",
                 )
                 return
+            target_ownership = capture_topic_ownership(
+                user_id,
+                target_thread_id,
+                chat_id,
+            )
+            if target_ownership is None:
+                await safe_reply(
+                    message,
+                    "❌ The target topic binding changed before this request "
+                    "could be accepted. Retry it.",
+                )
+                return
             if action == "queue":
                 source_chat_id = getattr(message, "chat_id", None)
                 chat = getattr(message, "chat", None)
@@ -9012,6 +9487,7 @@ async def _forward_topic_text_message(
                     payload_text,
                     source_chat_id,
                     message.message_id,
+                    topic_ownership=target_ownership,
                 )
                 await _set_hourglass_reaction(message)
                 await sync_queued_topic_dock(
@@ -9031,6 +9507,7 @@ async def _forward_topic_text_message(
                 window_id=target_wid,
                 text=payload_text,
                 steer=True,
+                topic_ownership=target_ownership,
             )
             if not success:
                 await safe_reply(message, f"❌ {send_msg}")
@@ -9081,7 +9558,11 @@ async def _forward_topic_text_message(
         )
         return
 
-    if session_manager.is_window_external_turn_active(wid):
+    queued_work_exists = bool(
+        queued_topic_input_count(user_id, thread_id, chat_id) > 0
+        or _is_queued_topic_drain_active(user_id, thread_id, chat_id)
+    )
+    if session_manager.is_window_external_turn_active(wid) or queued_work_exists:
         source_chat_id = getattr(message, "chat_id", None)
         chat = getattr(message, "chat", None)
         if source_chat_id is None and chat is not None:
@@ -9092,6 +9573,7 @@ async def _forward_topic_text_message(
             text,
             source_chat_id,
             message.message_id,
+            topic_ownership=topic_ownership,
         )
         await _set_hourglass_reaction(message)
         await sync_queued_topic_dock(
@@ -9101,6 +9583,17 @@ async def _forward_topic_text_message(
             window_id=wid,
             chat_id=chat_id,
         )
+        if queued_work_exists and not session_manager.is_window_external_turn_active(
+            wid
+        ):
+            await _dispatch_next_queued_input(
+                context.bot,
+                user_id,
+                thread_id,
+                wid,
+                chat_id=chat_id,
+                preserve_coalesced_wakeup=True,
+            )
         return
 
     is_steer_message = await _is_window_in_progress(
@@ -9133,9 +9626,58 @@ async def _forward_topic_text_message(
         chat_id=chat_id,
         window_id=wid,
         text=text,
+        topic_ownership=topic_ownership,
     )
     if not success:
         await asyncio.gather(*ack_tasks, return_exceptions=True)
+        if session_manager.is_codex_uncertain_send_result(send_msg):
+            await safe_reply(message, f"❌ {send_msg}")
+            return
+        active_writer_conflict = session_manager.is_codex_active_writer_error(
+            send_msg
+        )
+        if (
+            session_manager.is_window_external_turn_active(wid)
+            or active_writer_conflict
+        ):
+            source_chat_id = getattr(message, "chat_id", None)
+            chat = getattr(message, "chat", None)
+            if source_chat_id is None and chat is not None:
+                source_chat_id = getattr(chat, "id", None)
+            enqueue_queued_topic_input(
+                user_id,
+                thread_id,
+                text,
+                source_chat_id,
+                message.message_id,
+                topic_ownership=topic_ownership,
+            )
+            await _set_hourglass_reaction(message)
+            await sync_queued_topic_dock(
+                context.bot,
+                user_id,
+                thread_id,
+                window_id=wid,
+                chat_id=chat_id,
+            )
+            emit_telemetry(
+                "queue.host_follow_resume_deferred",
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=wid,
+                error=send_msg,
+                text_len=len(text),
+            )
+            if active_writer_conflict:
+                await _dispatch_next_queued_input(
+                    context.bot,
+                    user_id,
+                    thread_id,
+                    wid,
+                    chat_id=chat_id,
+                    preserve_coalesced_wakeup=True,
+                )
+            return
         await safe_reply(message, f"❌ {send_msg}")
         return
     if is_steer_message:
@@ -9254,6 +9796,12 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = _group_chat_id(chat)
     if chat_id is not None and thread_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+    if thread_id is not None:
+        _ensure_default_coco_general_control(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
     selected_profile = get_default_transcription_profile()
 
     tg_file = await media.get_file()
@@ -9856,7 +10404,7 @@ async def inbound_update_probe(
         kind=kind,
         text=incoming_text,
         chat_id=msg.chat_id if msg.chat_id is not None else None,
-        thread_id=getattr(msg, "message_thread_id", None),
+        thread_id=_get_thread_id(update),
         message_id=getattr(msg, "message_id", None),
         from_user_id=msg.from_user.id if msg.from_user else None,
         sender_chat_id=msg.sender_chat.id if msg.sender_chat else None,
@@ -9904,12 +10452,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif data in {CB_COCO_SET, CB_COCO_CANCEL, CB_COCO_REFRESH}:
         if cb_thread_id is None:
-            await query.answer("Use this inside a named topic.", show_alert=True)
+            await query.answer("Open CoCo from General.", show_alert=True)
+            return
+        if cb_thread_id != GENERAL_TOPIC_THREAD_ID:
+            await safe_edit(
+                query,
+                "ℹ️ CoCo control is permanently assigned to General. Use `/coco` there.",
+                reply_markup=None,
+            )
+            await query.answer("CoCo is fixed to General.", show_alert=True)
             return
         if data == CB_COCO_CANCEL:
             await safe_edit(query, "CoCo control-topic assignment canceled.", reply_markup=None)
             await query.answer("Canceled")
             return
+
+        _ensure_default_coco_general_control(
+            user_id=user.id,
+            thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
+        )
 
         binding, suggested_workspace = _ensure_coco_control_workspace_binding(
             user_id=user.id,
@@ -13193,6 +13755,27 @@ async def _retry_failed_turn_after_transient_app_server_error(
             )
             continue
 
+        topic_ownership = capture_topic_ownership(
+            user_id,
+            bound_thread_id,
+            bound_chat_id,
+        )
+        if (
+            topic_ownership is None
+            or topic_ownership.window_id != wid
+            or topic_ownership.codex_thread_id != codex_thread_id
+        ):
+            emit_telemetry(
+                "transport.app_server.turn_failed_auto_retry_skipped",
+                codex_thread_id=codex_thread_id,
+                window_id=wid,
+                thread_id=bound_thread_id,
+                user_id=user_id,
+                status=status,
+                reason="stale_topic_ownership",
+                error=error_message,
+            )
+            continue
         retry_count, retry_limit = note_auto_retry_attempt(
             user_id=user_id,
             thread_id=bound_thread_id,
@@ -13210,6 +13793,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
             chat_id=bound_chat_id,
             window_id=wid,
             text=candidate.resend_text,
+            topic_ownership=topic_ownership,
         )
         note_auto_retry_result(
             user_id=user_id,
@@ -14379,6 +14963,16 @@ async def _handle_codex_app_server_notification(
             thread_id,
             source_machine_id=normalized_source_machine_id,
         ):
+            topic_ownership = capture_topic_ownership(
+                user_id,
+                bound_thread_id,
+                bound_chat_id,
+            )
+            if (
+                topic_ownership is None
+                or topic_ownership.codex_thread_id != thread_id
+            ):
+                continue
             if (user_id, bound_thread_id) in suppressed_topics:
                 continue
             note_run_completed(
@@ -14408,6 +15002,13 @@ async def _handle_codex_app_server_notification(
                     # separate message.
                     compact=True,
                 )
+                if not is_topic_ownership_current(
+                    user_id,
+                    bound_thread_id,
+                    bound_chat_id,
+                    topic_ownership,
+                ):
+                    continue
                 if missing_final_text:
                     fallback_note = ""
                     fallback_final_text = get_progress_text(
@@ -14443,6 +15044,7 @@ async def _handle_codex_app_server_notification(
                         thread_id=bound_thread_id,
                         chat_id=bound_chat_id,
                         response_mode_override=response_mode_override,
+                        topic_ownership=topic_ownership,
                     )
             should_dispatch = (
                 queued_topic_input_count(
@@ -14457,6 +15059,7 @@ async def _handle_codex_app_server_notification(
                     thread_id=bound_thread_id,
                     window_id=wid,
                     chat_id=bound_chat_id,
+                    preserve_coalesced_wakeup=True,
                 )
         return
 
@@ -14595,6 +15198,16 @@ async def handle_new_message(
         return
 
     for user_id, chat_id, wid, thread_id in active_users:
+        topic_ownership = capture_topic_ownership(
+            user_id,
+            thread_id,
+            chat_id,
+        )
+        if (
+            topic_ownership is None
+            or topic_ownership.codex_thread_id != msg.session_id
+        ):
+            continue
         if await _handle_shadow_transcript_message_for_topic(
             msg=msg,
             bot=bot,
@@ -14602,6 +15215,13 @@ async def handle_new_message(
             chat_id=chat_id,
             window_id=wid,
             thread_id=thread_id,
+        ):
+            continue
+        if not is_topic_ownership_current(
+            user_id,
+            thread_id,
+            chat_id,
+            topic_ownership,
         ):
             continue
 
@@ -14639,6 +15259,13 @@ async def handle_new_message(
                 workspace_dir=workspace_dir,
                 window_id=wid,
             )
+            if not is_topic_ownership_current(
+                user_id,
+                thread_id,
+                chat_id,
+                topic_ownership,
+            ):
+                continue
 
         combined_image_data: list[tuple[str, bytes]] | None = None
         if msg.image_data or attachment_image_data:
@@ -14749,6 +15376,7 @@ async def handle_new_message(
                     document_data=document_data,
                     video_data=video_data,
                     response_mode_override=response_mode_override,
+                    topic_ownership=topic_ownership,
                 )
                 if looper_completed_state is not None:
                     await safe_send(
@@ -15107,7 +15735,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("status", "Show current Codex status panel"),
         BotCommand("model", "Show Codex model options/reasoning levels"),
-        BotCommand("coco", "Designate this topic as the CoCo control topic"),
+        BotCommand("coco", "Open the permanent General control channel"),
         BotCommand("voice", "Show/change voice reply mode for this topic"),
         BotCommand("transcription", "Show/change server transcription mode"),
         BotCommand("update", "Check CoCo/Codex updates and trigger safe upgrade"),
@@ -15117,6 +15745,8 @@ async def post_init(application: Application) -> None:
         bot_commands.append(BotCommand(cmd_name, desc))
 
     await application.bot.set_my_commands(bot_commands)
+
+    await _migrate_coco_control_to_general(application.bot)
 
     notice_target = _pop_restart_notice_target()
     notice_targets = _startup_notice_targets(notice_target)

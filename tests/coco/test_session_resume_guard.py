@@ -160,6 +160,109 @@ async def test_explicit_resume_under_size_limit_calls_app_server(
 
 
 @pytest.mark.asyncio
+async def test_exact_resume_rejects_different_returned_thread_without_rebinding(
+    mgr: SessionManager,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_root = tmp_path / "sessions"
+    rollout = _write_rollout(
+        sessions_root,
+        thread_id="thread-canonical",
+        cwd=workspace,
+    )
+    monkeypatch.setattr(session_mod.config, "sessions_path", sessions_root)
+    monkeypatch.setattr(
+        session_mod.config,
+        "codex_max_resume_bytes",
+        rollout.stat().st_size + 1,
+        raising=False,
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-canonical",
+        window_id="@1",
+        cwd=str(workspace),
+        display_name="workspace",
+    )
+
+    async def _thread_resume(*, thread_id: str):
+        assert thread_id == "thread-canonical"
+        return {"thread": {"id": "thread-unrelated"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_resume",
+        _thread_resume,
+    )
+
+    with pytest.raises(CodexAppServerError, match="different thread"):
+        await mgr.resume_codex_session_for_window(
+            window_id="@1",
+            cwd=str(workspace),
+            thread_id="thread-canonical",
+        )
+
+    assert mgr.get_window_codex_thread_id("@1") == "thread-canonical"
+    binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-canonical"
+
+
+@pytest.mark.asyncio
+async def test_exact_resume_rejects_missing_returned_thread_id(
+    mgr: SessionManager,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_root = tmp_path / "sessions"
+    rollout = _write_rollout(
+        sessions_root,
+        thread_id="thread-canonical",
+        cwd=workspace,
+    )
+    monkeypatch.setattr(session_mod.config, "sessions_path", sessions_root)
+    monkeypatch.setattr(
+        session_mod.config,
+        "codex_max_resume_bytes",
+        rollout.stat().st_size + 1,
+        raising=False,
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-canonical",
+        window_id="@1",
+        cwd=str(workspace),
+    )
+
+    async def _thread_resume(*, thread_id: str):
+        assert thread_id == "thread-canonical"
+        return {}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_resume",
+        _thread_resume,
+    )
+
+    with pytest.raises(CodexAppServerError, match="did not return a thread id"):
+        await mgr.resume_codex_session_for_window(
+            window_id="@1",
+            cwd=str(workspace),
+            thread_id="thread-canonical",
+        )
+
+    assert mgr.get_window_codex_thread_id("@1") == "thread-canonical"
+
+
+@pytest.mark.asyncio
 async def test_explicit_resume_rejects_aggregate_history_over_transport_budget(
     mgr: SessionManager,
     monkeypatch,
@@ -1004,7 +1107,7 @@ async def test_automatic_latest_resume_rolls_over_when_aggregate_budget_is_full(
 
 
 @pytest.mark.asyncio
-async def test_binding_validation_rolls_over_oversized_thread_without_server_read(
+async def test_binding_validation_preserves_oversized_thread_without_server_read(
     mgr: SessionManager,
     monkeypatch,
     tmp_path: Path,
@@ -1046,9 +1149,9 @@ async def test_binding_validation_rolls_over_oversized_thread_without_server_rea
 
     summary = await mgr.validate_codex_topic_bindings()
 
-    assert summary == {"checked": 1, "invalid": 1, "repaired": 1}
-    assert mgr.get_window_codex_thread_id("@1") == ""
-    assert (
-        mgr.consume_window_pending_session_start_reason("@1")
-        == "oversized_rollover"
-    )
+    assert summary == {"checked": 1, "invalid": 0, "repaired": 0}
+    assert mgr.get_window_codex_thread_id("@1") == "thread-large"
+    assert mgr.consume_window_pending_session_start_reason("@1") == ""
+    binding = mgr.resolve_topic_binding(10, 7)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-large"

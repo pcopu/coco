@@ -5,6 +5,15 @@ import pytest
 import coco.handlers.message_queue as mq
 
 
+@pytest.fixture(autouse=True)
+def _current_topic_owner(monkeypatch):
+    monkeypatch.setattr(
+        mq,
+        "is_topic_ownership_current",
+        lambda *_args, **_kwargs: True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_process_content_task_sends_voice_note_when_topic_prefers_voice(monkeypatch):
     text_sends: list[tuple[int, str, dict[str, object]]] = []
@@ -47,6 +56,7 @@ async def test_process_content_task_sends_voice_note_when_topic_prefers_voice(mo
         text="Spoken reply",
         content_type="text",
         thread_id=77,
+        topic_ownership=mq.TopicOwnership("@1", "thread-77", "machine", "/tmp"),
     )
 
     await mq._process_content_task(object(), 1, task)
@@ -106,6 +116,7 @@ async def test_process_content_task_uses_topic_response_mode_instead_of_window_m
         text="Topic-scoped voice reply",
         content_type="text",
         thread_id=77,
+        topic_ownership=mq.TopicOwnership("@1", "thread-77", "machine", "/tmp"),
     )
 
     await mq._process_content_task(object(), 1, task)
@@ -159,6 +170,7 @@ async def test_process_content_task_honors_one_shot_response_mode_override(monke
         content_type="text",
         thread_id=77,
         response_mode_override="voice",
+        topic_ownership=mq.TopicOwnership("@1", "thread-77", "machine", "/tmp"),
     )
 
     await mq._process_content_task(object(), 1, task)

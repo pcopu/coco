@@ -1596,6 +1596,7 @@ class CodexAppServerClient:
         payload: dict[str, Any],
         *,
         expected_stop_sequence: int | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> None:
         # Codex CLI app-server currently expects JSONL over stdio.
         # Reader remains dual-format to tolerate framed responses.
@@ -1614,6 +1615,8 @@ class CodexAppServerClient:
             if not proc or not proc.stdin:
                 raise CodexAppServerError("codex app-server is not running")
             proc.stdin.write(frame)
+            if on_dispatch is not None:
+                on_dispatch()
             self._mark_mutation_request_dispatched(payload.get("method"))
             await proc.stdin.drain()
 
@@ -1637,6 +1640,7 @@ class CodexAppServerClient:
         *,
         timeout: float = 60.0,
         expected_stop_sequence: int | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         if not self._proc or self._proc.returncode is not None:
             raise CodexAppServerError("codex app-server is not running")
@@ -1658,6 +1662,7 @@ class CodexAppServerClient:
             await self._write_jsonrpc(
                 payload,
                 expected_stop_sequence=expected_stop_sequence,
+                on_dispatch=on_dispatch,
             )
             try:
                 return await asyncio.wait_for(fut, timeout=timeout)
@@ -1706,13 +1711,18 @@ class CodexAppServerClient:
         *,
         timeout: float = 60.0,
         retry_safe_timeout: bool = True,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
         if method in SAFE_TIMEOUT_RECYCLE_METHODS:
             return await self._request_with_timeout_recovery(
                 method,
                 params,
                 timeout=timeout,
                 retry_safe_timeout=retry_safe_timeout,
+                **dispatch_kwargs,
             )
 
         mutation_task = await self._begin_mutation_request(method)
@@ -1724,6 +1734,7 @@ class CodexAppServerClient:
                     params,
                     timeout=timeout,
                     retry_safe_timeout=retry_safe_timeout,
+                    **dispatch_kwargs,
                 )
             except asyncio.CancelledError:
                 outcome_uncertain = True
@@ -1744,7 +1755,11 @@ class CodexAppServerClient:
         *,
         timeout: float = 60.0,
         retry_safe_timeout: bool = True,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
         stop_sequence = self._stop_sequence
         await self.ensure_started()
         generation = self._transport_generation
@@ -1755,6 +1770,7 @@ class CodexAppServerClient:
                 params,
                 timeout=timeout,
                 expected_stop_sequence=stop_sequence,
+                **dispatch_kwargs,
             )
             self._validate_response_transport_state(
                 method=method,
@@ -1822,6 +1838,7 @@ class CodexAppServerClient:
                     params,
                     timeout=timeout,
                     expected_stop_sequence=stop_sequence,
+                    **dispatch_kwargs,
                 )
                 self._validate_response_transport_state(
                     method=method,
@@ -2127,6 +2144,7 @@ class CodexAppServerClient:
         effort: str | None = None,
         service_tier: str | None = None,
         timeout: float = APP_SERVER_MUTATION_TIMEOUT_SECONDS,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
@@ -2140,7 +2158,15 @@ class CodexAppServerClient:
             params["effort"] = effort
         if service_tier:
             params["serviceTier"] = service_tier
-        result = await self.request("turn/start", params, timeout=timeout)
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
+        result = await self.request(
+            "turn/start",
+            params,
+            timeout=timeout,
+            **dispatch_kwargs,
+        )
         if isinstance(result, dict):
             turn = result.get("turn")
             if isinstance(turn, dict):
@@ -2157,13 +2183,22 @@ class CodexAppServerClient:
         expected_turn_id: str,
         inputs: list[dict[str, Any]],
         timeout: float = APP_SERVER_MUTATION_TIMEOUT_SECONDS,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
             "expectedTurnId": expected_turn_id,
             "input": inputs,
         }
-        result = await self.request("turn/steer", params, timeout=timeout)
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
+        result = await self.request(
+            "turn/steer",
+            params,
+            timeout=timeout,
+            **dispatch_kwargs,
+        )
         if isinstance(result, dict):
             turn_id = result.get("turnId")
             if isinstance(turn_id, str) and turn_id:

@@ -1,5 +1,6 @@
 """Tests for SessionManager pure dict operations."""
 
+import asyncio
 import json
 import os
 from datetime import datetime, timezone
@@ -631,7 +632,421 @@ class TestCodexSessionSummaries:
 
 class TestHostFollowTakeover:
     @pytest.mark.asyncio
-    async def test_send_topic_text_to_window_resumes_latest_before_telegram_takeover(
+    async def test_host_follow_local_resumes_bound_codex_thread_not_latest(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        canonical_thread_id = "thread-topic-canonical"
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id=canonical_thread_id,
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+        exact_resumes: list[tuple[str, str, str]] = []
+        latest_resumes: list[tuple[str, str]] = []
+
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+            exact_resumes.append((window_id, cwd, thread_id))
+            return thread_id
+
+        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+            latest_resumes.append((window_id, cwd))
+            return "thread-unrelated-latest"
+
+        async def _send_to_window(
+            window_id: str,
+            text: str,
+            *,
+            steer: bool = False,
+            force_new_turn: bool = False,
+            **_kwargs,
+        ) -> tuple[bool, str]:
+            _ = window_id, text, steer, force_new_turn
+            return True, "ok"
+
+        monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+        monkeypatch.setattr(
+            mgr,
+            "resume_latest_codex_session_for_window",
+            _resume_latest,
+        )
+        monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="continue this topic",
+        )
+
+        assert ok is True
+        assert message == "ok"
+        assert exact_resumes == [("@1", "/tmp/proj", canonical_thread_id)]
+        assert latest_resumes == []
+
+    @pytest.mark.asyncio
+    async def test_host_follow_remote_resumes_bound_codex_thread_not_latest(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        canonical_thread_id = "thread-topic-remote-canonical"
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id=canonical_thread_id,
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+        exact_resumes: list[tuple[str, dict[str, object]]] = []
+        latest_resumes: list[tuple[str, dict[str, object]]] = []
+        sends: list[tuple[str, dict[str, object]]] = []
+
+        async def _resume_thread(machine_id: str, **kwargs: object):
+            exact_resumes.append((machine_id, kwargs))
+            return {
+                "thread_id": canonical_thread_id,
+                "turn_id": "turn-topic-remote",
+                "model_slug": "",
+                "reasoning_effort": "",
+            }
+
+        async def _resume_latest(machine_id: str, **kwargs: object):
+            latest_resumes.append((machine_id, kwargs))
+            return {"thread_id": "thread-unrelated-latest"}
+
+        async def _send_inputs(machine_id: str, **kwargs: object):
+            sends.append((machine_id, kwargs))
+            return {
+                "ok": True,
+                "message": "ok",
+                "thread_id": canonical_thread_id,
+                "turn_id": "turn-topic-remote",
+                "transport_epoch": "agent-epoch-1",
+                "transport_epoch_started_at": 100.0,
+                "transport_generation": 1,
+            }
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "resume_thread",
+            _resume_thread,
+        )
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "resume_latest",
+            _resume_latest,
+        )
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "send_inputs",
+            _send_inputs,
+        )
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="continue this remote topic",
+        )
+
+        assert ok is True
+        assert message == "ok"
+        assert len(exact_resumes) == 1
+        assert exact_resumes[0][0] == "remote-node"
+        assert exact_resumes[0][1]["window_id"] == "@1"
+        assert exact_resumes[0][1]["cwd"] == "/tmp/proj"
+        assert exact_resumes[0][1]["thread_id"] == canonical_thread_id
+        assert latest_resumes == []
+        assert len(sends) == 1
+        assert sends[0][1]["thread_id"] == canonical_thread_id
+
+    @pytest.mark.asyncio
+    async def test_host_follow_remote_resume_drops_stale_result_after_explicit_rebind(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-a",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-a",
+            machine_display_name="Remote A",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+
+        resume_started = asyncio.Event()
+        release_resume = asyncio.Event()
+        sends: list[tuple[str, dict[str, object]]] = []
+
+        async def _resume_thread(machine_id: str, **kwargs: object):
+            assert machine_id == "remote-a"
+            assert kwargs["thread_id"] == "thread-a"
+            resume_started.set()
+            await release_resume.wait()
+            return {
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+            }
+
+        async def _send_inputs(machine_id: str, **kwargs: object):
+            sends.append((machine_id, kwargs))
+            return {
+                "ok": True,
+                "message": "stale request dispatched",
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+            }
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "resume_thread",
+            _resume_thread,
+        )
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "send_inputs",
+            _send_inputs,
+        )
+
+        task = asyncio.create_task(
+            mgr.send_topic_text_to_window(
+                user_id=100,
+                thread_id=1,
+                window_id="@1",
+                text="continue this topic",
+            )
+        )
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-b",
+            window_id="@1",
+            cwd="/tmp/proj-b",
+            display_name="proj-b",
+            machine_id="remote-b",
+            machine_display_name="Remote B",
+        )
+        release_resume.set()
+        ok, message = await task
+
+        assert ok is False
+        assert message
+        assert sends == []
+        binding = mgr._get_persisted_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-b"
+        assert binding.window_id == "@1"
+        assert binding.machine_id == "remote-b"
+        assert mgr.get_window_codex_thread_id("@1") == "thread-b"
+
+    @pytest.mark.asyncio
+    async def test_host_follow_local_resume_drops_stale_result_after_explicit_rebind(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-a",
+            window_id="@900060",
+            cwd="/tmp/proj-a",
+            display_name="proj-a",
+            machine_id="local-node",
+            machine_display_name="Local",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+
+        resume_started = asyncio.Event()
+        release_resume = asyncio.Event()
+        sends: list[tuple[str, str]] = []
+
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+            assert (window_id, cwd, thread_id) == (
+                "@900060",
+                "/tmp/proj-a",
+                "thread-a",
+            )
+            resume_started.set()
+            await release_resume.wait()
+            return thread_id
+
+        async def _send_to_window(
+            window_id: str,
+            text: str,
+            *,
+            steer: bool = False,
+            force_new_turn: bool = False,
+            **_kwargs: object,
+        ) -> tuple[bool, str]:
+            _ = steer, force_new_turn
+            sends.append((window_id, text))
+            return True, "stale request dispatched"
+
+        monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+        monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+        task = asyncio.create_task(
+            mgr.send_topic_text_to_window(
+                user_id=100,
+                thread_id=1,
+                window_id="@900060",
+                text="continue this local topic",
+            )
+        )
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-b",
+            window_id="@900061",
+            cwd="/tmp/proj-b",
+            display_name="proj-b",
+            machine_id="local-node",
+            machine_display_name="Local",
+        )
+        release_resume.set()
+        ok, message = await task
+
+        assert ok is False
+        assert message
+        assert sends == []
+        binding = mgr._get_persisted_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-b"
+        assert binding.window_id == "@900061"
+        assert binding.cwd == "/tmp/proj-b"
+        assert binding.machine_id == "local-node"
+        assert mgr.get_window_codex_thread_id("@900060") == "thread-a"
+        assert mgr.get_window_codex_thread_id("@900061") == "thread-b"
+
+    @pytest.mark.asyncio
+    async def test_non_active_writer_resume_error_still_propagates(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+            assert (window_id, cwd, thread_id) == ("@1", "/tmp/proj", "thread-old")
+            raise session_mod.CodexAppServerError("app-server connection failed")
+
+        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
+
+        monkeypatch.setattr(
+            mgr,
+            "resume_codex_session_for_window",
+            _resume_exact,
+        )
+        monkeypatch.setattr(
+            mgr,
+            "resume_latest_codex_session_for_window",
+            _resume_latest,
+        )
+
+        with pytest.raises(
+            session_mod.CodexAppServerError,
+            match="app-server connection failed",
+        ):
+            await mgr.send_topic_text_to_window(
+                user_id=100,
+                thread_id=1,
+                window_id="@1",
+                text="do not mask this error",
+            )
+
+    @pytest.mark.asyncio
+    async def test_active_writer_resume_defers_telegram_takeover(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+            assert window_id == "@1"
+            assert cwd == "/tmp/proj"
+            assert thread_id == "thread-old"
+            raise session_mod.CodexAppServerError(
+                "thread thread-live already has an active writer"
+            )
+
+        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
+
+        async def _unexpected_send(*_args, **_kwargs):
+            raise AssertionError("takeover must wait for the external writer")
+
+        monkeypatch.setattr(
+            mgr,
+            "resume_codex_session_for_window",
+            _resume_exact,
+        )
+        monkeypatch.setattr(
+            mgr,
+            "resume_latest_codex_session_for_window",
+            _resume_latest,
+        )
+        monkeypatch.setattr(mgr, "send_to_window", _unexpected_send)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="preserve this request",
+        )
+
+        assert ok is False
+        assert "active writer" in message
+        assert mgr.get_topic_sync_mode(100, 1) == TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL
+        assert mgr.is_window_external_turn_active("@1") is False
+
+    @pytest.mark.asyncio
+    async def test_send_topic_text_to_window_resumes_bound_thread_before_telegram_takeover(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
         mgr.bind_topic_to_codex_thread(
@@ -646,12 +1061,18 @@ class TestHostFollowTakeover:
         mgr.set_window_external_turn_active("@1", True)
         mgr.get_window_state("@1").cwd = "/tmp/proj"
 
-        resumed: list[tuple[str, str]] = []
+        exact_resumes: list[tuple[str, str, str]] = []
+        latest_resumes: list[tuple[str, str]] = []
         sent: list[tuple[str, str, bool]] = []
 
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+            exact_resumes.append((window_id, cwd, thread_id))
+            assert thread_id == "thread-old"
+            return thread_id
+
         async def _resume_latest(*, window_id: str, cwd: str) -> str:
-            resumed.append((window_id, cwd))
-            return "thread-new"
+            latest_resumes.append((window_id, cwd))
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
 
         async def _send_to_window(
             window_id: str,
@@ -659,11 +1080,17 @@ class TestHostFollowTakeover:
             *,
             steer: bool = False,
             force_new_turn: bool = False,
+            **_kwargs: object,
         ):
             _ = force_new_turn
             sent.append((window_id, text, steer))
             return True, "ok"
 
+        monkeypatch.setattr(
+            mgr,
+            "resume_codex_session_for_window",
+            _resume_exact,
+        )
         monkeypatch.setattr(
             mgr,
             "resume_latest_codex_session_for_window",
@@ -680,13 +1107,14 @@ class TestHostFollowTakeover:
 
         assert ok is True
         assert msg == "ok"
-        assert resumed == [("@1", "/tmp/proj")]
+        assert exact_resumes == [("@1", "/tmp/proj", "thread-old")]
+        assert latest_resumes == []
         assert sent == [("@1", "take over from telegram", False)]
         assert mgr.get_topic_sync_mode(100, 1) == TOPIC_SYNC_MODE_TELEGRAM_LIVE
         assert mgr.is_window_external_turn_active("@1") is False
 
     @pytest.mark.asyncio
-    async def test_oversized_resume_rollover_starts_fresh_thread_and_preserves_prompt(
+    async def test_oversized_bound_resume_fails_without_rebinding_topic(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
         mgr.bind_topic_to_codex_thread(
@@ -700,89 +1128,41 @@ class TestHostFollowTakeover:
         mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
         mgr.get_window_state("@1").cwd = "/tmp/proj"
 
-        started_in: list[str | None] = []
-        captured_inputs: list[dict[str, object]] = []
+        exact_resumes: list[tuple[str, str, str]] = []
+        latest_resumes: list[tuple[str, str]] = []
+
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+            exact_resumes.append((window_id, cwd, thread_id))
+            raise session_mod.CodexAppServerError(
+                "Codex transcript exceeds resume limit (999 > 100 bytes): "
+                "thread-oversized"
+            )
 
         async def _resume_latest(*, window_id: str, cwd: str) -> str:
-            assert window_id == "@1"
-            assert cwd == "/tmp/proj"
-            mgr.set_window_codex_thread_id(window_id, "")
-            mgr.mark_window_pending_session_start_reason(
-                window_id,
-                "oversized_rollover",
-            )
-            return ""
+            latest_resumes.append((window_id, cwd))
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
 
-        async def _thread_start(
-            *,
-            cwd: str | None = None,
-            approval_policy: str | None = None,
-            model: str | None = None,
-            effort: str | None = None,
-            service_tier: str | None = None,
-        ) -> dict[str, object]:
-            _ = approval_policy, model, effort, service_tier
-            started_in.append(cwd)
-            return {"thread": {"id": "thread-fresh"}}
+        monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+        monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest)
 
-        async def _turn_start(
-            *,
-            thread_id: str,
-            inputs: list[dict[str, object]],
-            approval_policy: str | None = None,
-            service_tier: str | None = None,
-            timeout: float = 90.0,
-        ) -> dict[str, object]:
-            _ = approval_policy, service_tier, timeout
-            assert thread_id == "thread-fresh"
-            captured_inputs.extend(inputs)
-            return {"turn": {"id": "turn-fresh"}}
-
-        monkeypatch.setattr(
-            mgr,
-            "resume_latest_codex_session_for_window",
-            _resume_latest,
-        )
-        monkeypatch.setattr(
-            session_mod.codex_app_server_client,
-            "thread_start",
-            _thread_start,
-        )
-        monkeypatch.setattr(
-            session_mod.codex_app_server_client,
-            "turn_start",
-            _turn_start,
-        )
-        monkeypatch.setattr(
-            session_mod.codex_app_server_client,
-            "get_active_turn_id",
-            lambda _thread_id: None,
-        )
-        monkeypatch.setattr(
-            SessionManager,
-            "_runtime_write_state",
-            staticmethod(lambda _cwd: ("/tmp/proj", True)),
-        )
-
-        ok, msg = await mgr.send_topic_text_to_window(
+        ok, message = await mgr.send_topic_text_to_window(
             user_id=100,
             thread_id=1,
             window_id="@1",
             text="keep this exact request",
         )
 
-        assert ok is True
-        assert msg == "Sent via app-server to proj"
-        assert started_in == ["/tmp/proj"]
-        assert {"type": "text", "text": "keep this exact request"} in captured_inputs
-        assert "Session start reason: oversized_rollover" in str(
-            captured_inputs[0]["text"]
-        )
-        assert mgr.get_window_codex_thread_id("@1") == "thread-fresh"
-        assert mgr.peek_window_pending_session_start_reason("@1") == ""
+        assert ok is False
+        assert "too large to resume automatically" in message
+        assert exact_resumes == [("@1", "/tmp/proj", "thread-oversized")]
+        assert latest_resumes == []
+        assert mgr.get_window_codex_thread_id("@1") == "thread-oversized"
+        binding = mgr.resolve_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-oversized"
 
     @pytest.mark.asyncio
-    async def test_host_follow_refreshes_goal_after_resuming_latest_thread(
+    async def test_host_follow_refreshes_goal_after_resuming_bound_thread(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
         mgr.bind_topic_to_codex_thread(
@@ -796,15 +1176,23 @@ class TestHostFollowTakeover:
         mgr.set_topic_sync_mode(100, 1, TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL)
         mgr.get_window_state("@1").cwd = "/tmp/proj"
         resumed = False
+        exact_resumes: list[tuple[str, str, str]] = []
+        latest_resumes: list[tuple[str, str]] = []
         sent: list[list[dict[str, object]]] = []
 
-        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
             nonlocal resumed
             assert window_id == "@1"
             assert cwd == "/tmp/proj"
+            assert thread_id == "thread-old"
+            exact_resumes.append((window_id, cwd, thread_id))
             resumed = True
-            mgr.set_window_codex_thread_id("@1", "thread-new")
-            return "thread-new"
+            mgr.set_window_codex_thread_id("@1", thread_id)
+            return thread_id
+
+        async def _resume_latest(*, window_id: str, cwd: str) -> str:
+            latest_resumes.append((window_id, cwd))
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
 
         async def _get_topic_goal(**_kwargs):
             assert resumed is True
@@ -816,11 +1204,13 @@ class TestHostFollowTakeover:
             *,
             steer: bool = False,
             force_new_turn: bool = False,
+            **_kwargs: object,
         ):
             _ = window_id, steer, force_new_turn
             sent.append(inputs)
             return True, "ok"
 
+        monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
         monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest)
         monkeypatch.setattr(mgr, "get_topic_goal", _get_topic_goal)
         monkeypatch.setattr(mgr, "send_inputs_to_window", _send_inputs_to_window)
@@ -835,6 +1225,8 @@ class TestHostFollowTakeover:
         assert ok is True
         assert len(sent) == 1
         assert "Current native goal objective: New thread goal" in str(sent[0])
+        assert exact_resumes == [("@1", "/tmp/proj", "thread-old")]
+        assert latest_resumes == []
 
     @pytest.mark.asyncio
     async def test_remote_host_follow_inherits_resumed_model_before_send(
@@ -864,20 +1256,29 @@ class TestHostFollowTakeover:
         mgr.get_window_state("@1").cwd = "/tmp/proj"
         sent: list[tuple[str, str]] = []
 
-        async def _resume_latest(_machine_id: str, **_kwargs):
+        exact_resumes: list[tuple[str, dict[str, object]]] = []
+        latest_resumes: list[tuple[str, dict[str, object]]] = []
+
+        async def _resume_thread(_machine_id: str, **kwargs):
+            exact_resumes.append((_machine_id, kwargs))
+            assert kwargs["thread_id"] == "thread-old"
             return {
-                "thread_id": "thread-new",
+                "thread_id": "thread-old",
                 "turn_id": "",
                 "model_slug": "gpt-5.6-sol",
                 "reasoning_effort": "ultra",
             }
+
+        async def _resume_latest(_machine_id: str, **kwargs):
+            latest_resumes.append((_machine_id, kwargs))
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
 
         async def _send_inputs(_machine_id: str, **kwargs):
             sent.append((kwargs["model_slug"], kwargs["reasoning_effort"]))
             return {
                 "ok": True,
                 "message": "ok",
-                "thread_id": "thread-new",
+                "thread_id": "thread-old",
                 "turn_id": "turn-new",
                 "transport_epoch": "agent-epoch-1",
                 "transport_epoch_started_at": 100.0,
@@ -887,6 +1288,7 @@ class TestHostFollowTakeover:
                 "transport_last_reset_reason": "",
             }
 
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_thread", _resume_thread)
         monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
         monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
 
@@ -900,9 +1302,22 @@ class TestHostFollowTakeover:
         assert ok is True
         assert message == "ok"
         assert sent == [("gpt-5.6-sol", "ultra")]
+        assert exact_resumes == [
+            (
+                "remote-node",
+                {
+                    "window_id": "@1",
+                    "cwd": "/tmp/proj",
+                    "thread_id": "thread-old",
+                    "window_name": "proj",
+                    "approval_mode": "",
+                },
+            )
+        ]
+        assert latest_resumes == []
 
     @pytest.mark.asyncio
-    async def test_remote_oversized_resume_rollover_starts_fresh_thread_and_preserves_prompt(
+    async def test_remote_oversized_resume_requires_explicit_rebind(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
         monkeypatch.setattr(
@@ -924,7 +1339,12 @@ class TestHostFollowTakeover:
         mgr.get_window_state("@1").cwd = "/tmp/proj"
         sent: list[dict[str, object]] = []
 
-        async def _resume_latest(_machine_id: str, **_kwargs):
+        exact_resumes: list[tuple[str, dict[str, object]]] = []
+        latest_resumes: list[tuple[str, dict[str, object]]] = []
+
+        async def _resume_thread(_machine_id: str, **kwargs):
+            exact_resumes.append((_machine_id, kwargs))
+            assert kwargs["thread_id"] == "thread-oversized"
             return {
                 "thread_id": "",
                 "turn_id": "",
@@ -933,6 +1353,10 @@ class TestHostFollowTakeover:
                 "session_start_reason": "oversized_rollover",
                 "transport_lifecycle_noop": True,
             }
+
+        async def _resume_latest(_machine_id: str, **kwargs):
+            latest_resumes.append((_machine_id, kwargs))
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
 
         async def _send_inputs(_machine_id: str, **kwargs):
             sent.append(kwargs)
@@ -951,6 +1375,11 @@ class TestHostFollowTakeover:
 
         monkeypatch.setattr(
             agent_rpc_mod.agent_rpc_client,
+            "resume_thread",
+            _resume_thread,
+        )
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
             "resume_latest",
             _resume_latest,
         )
@@ -967,14 +1396,390 @@ class TestHostFollowTakeover:
             text="keep this exact request",
         )
 
+        assert ok is False
+        assert "explicit /resume" in message
+        assert sent == []
+        assert mgr.get_window_codex_thread_id("@1") == "thread-oversized"
+        assert exact_resumes == [
+            (
+                "remote-node",
+                {
+                    "window_id": "@1",
+                    "cwd": "/tmp/proj",
+                    "thread_id": "thread-oversized",
+                    "window_name": "proj",
+                    "approval_mode": "",
+                },
+            )
+        ]
+        assert latest_resumes == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_goal_context", [False, True])
+    @pytest.mark.parametrize("returned_thread_id", ["", "thread-unrelated"])
+    async def test_remote_send_rejects_mismatched_thread_without_rebinding(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+        with_goal_context: bool,
+        returned_thread_id: str,
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+        if with_goal_context:
+            async def _goal_context(**_kwargs):
+                return "Current native goal objective: keep canonical"
+
+            monkeypatch.setattr(mgr, "_build_live_goal_context", _goal_context)
+
+        async def _send_inputs(_machine_id: str, **kwargs):
+            assert kwargs["thread_id"] == "thread-canonical"
+            return {
+                "ok": True,
+                "message": "delivered elsewhere",
+                "thread_id": returned_thread_id,
+                "turn_id": "turn-unrelated",
+                "transport_epoch": "agent-epoch-1",
+                "transport_epoch_started_at": 100.0,
+                "transport_generation": 4,
+                "transport_reset_sequence": 0,
+                "transport_last_reset_generation": 0,
+                "transport_last_reset_reason": "",
+            }
+
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="keep this topic canonical",
+        )
+
+        assert ok is False
+        assert "will not be replayed automatically" in message
+        assert mgr.get_window_codex_thread_id("@1") == "thread-canonical"
+        binding = mgr.resolve_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-canonical"
+
+    @pytest.mark.asyncio
+    async def test_remote_send_rejects_window_cache_disagreement_before_dispatch(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        state = mgr.get_window_state("@1")
+        state.codex_thread_id = "thread-stale-cache"
+
+        async def _unexpected_send_inputs(*_args, **_kwargs):
+            raise AssertionError("cache disagreement must be rejected before dispatch")
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "send_inputs",
+            _unexpected_send_inputs,
+        )
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="do not follow stale cache",
+        )
+
+        assert ok is False
+        assert "binding and window cache disagree" in message
+        binding = mgr.resolve_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-canonical"
+        assert state.codex_thread_id == "thread-stale-cache"
+
+    @pytest.mark.asyncio
+    async def test_remote_send_does_not_overwrite_explicit_rebind_during_rpc(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-before",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+
+        async def _send_inputs(_machine_id: str, **kwargs):
+            assert kwargs["thread_id"] == "thread-before"
+            mgr.bind_topic_to_codex_thread(
+                user_id=100,
+                thread_id=1,
+                codex_thread_id="thread-explicit-new",
+                window_id="@1",
+                cwd="/tmp/proj",
+                display_name="proj",
+                machine_id="remote-node",
+                machine_display_name="Remote",
+            )
+            return {
+                "ok": True,
+                "message": "old request acknowledged",
+                "thread_id": "thread-before",
+                "turn_id": "turn-before",
+                "transport_epoch": "agent-epoch-1",
+                "transport_epoch_started_at": 100.0,
+                "transport_generation": 4,
+                "transport_reset_sequence": 0,
+                "transport_last_reset_generation": 0,
+                "transport_last_reset_reason": "",
+            }
+
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="in flight",
+        )
+
+        assert ok is False
+        assert "changed while the request was in flight" in message
+        binding = mgr._get_persisted_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-explicit-new"
+        assert mgr.get_window_codex_thread_id("@1") == "thread-explicit-new"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_goal_context", [False, True])
+    async def test_remote_topic_send_revalidates_ownership_after_goal_context(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+        with_goal_context: bool,
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-a",
+            window_id="@1",
+            cwd="/tmp/proj-a",
+            display_name="proj-a",
+            machine_id="remote-a",
+            machine_display_name="Remote A",
+        )
+
+        context_started = asyncio.Event()
+        release_context = asyncio.Event()
+        sends: list[tuple[str, dict[str, object]]] = []
+
+        async def _build_live_goal_context(**_kwargs: object) -> str:
+            context_started.set()
+            await release_context.wait()
+            return "[coco goal context] live" if with_goal_context else ""
+
+        async def _send_inputs(machine_id: str, **kwargs: object):
+            sends.append((machine_id, kwargs))
+            return {
+                "ok": True,
+                "message": "stale request dispatched",
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+            }
+
+        monkeypatch.setattr(mgr, "_build_live_goal_context", _build_live_goal_context)
+        monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+        task = asyncio.create_task(
+            mgr.send_topic_text_to_window(
+                user_id=100,
+                thread_id=1,
+                window_id="@1",
+                text="what is my goal?" if with_goal_context else "continue this topic",
+            )
+        )
+        await asyncio.wait_for(context_started.wait(), timeout=1)
+
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-b",
+            window_id="@1",
+            cwd="/tmp/proj-b",
+            display_name="proj-b",
+            machine_id="remote-b",
+            machine_display_name="Remote B",
+        )
+        release_context.set()
+        ok, message = await task
+
+        assert ok is False
+        assert message
+        assert sends == []
+        binding = mgr._get_persisted_topic_binding(100, 1)
+        assert binding is not None
+        assert binding.codex_thread_id == "thread-b"
+        assert binding.machine_id == "remote-b"
+        assert binding.cwd == "/tmp/proj-b"
+        assert mgr.get_window_codex_thread_id("@1") == "thread-b"
+
+    @pytest.mark.asyncio
+    async def test_remote_send_does_not_treat_cache_as_missing_topic_authority(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            mgr,
+            "_local_machine_identity",
+            lambda: ("local-node", "Local"),
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="placeholder",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+            machine_id="remote-node",
+            machine_display_name="Remote",
+        )
+        raw_binding = mgr.topic_bindings_v2[100]["1"]
+        raw_binding.codex_thread_id = ""
+        state = mgr.get_window_state("@1")
+        state.codex_thread_id = "thread-stale-cache"
+
+        async def _unexpected_send_inputs(*_args, **_kwargs):
+            raise AssertionError("an unbound topic must not trust the window cache")
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "send_inputs",
+            _unexpected_send_inputs,
+        )
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="do not adopt the stale cache",
+        )
+
+        assert ok is False
+        assert "No canonical Codex thread is persisted" in message
+        assert raw_binding.codex_thread_id == ""
+        assert state.codex_thread_id == "thread-stale-cache"
+
+    @pytest.mark.asyncio
+    async def test_topic_send_requires_raw_persisted_binding(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old-cache",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        del mgr.topic_bindings_v2[100]["1"]
+
+        async def _unexpected_send(*_args, **_kwargs):
+            raise AssertionError("missing raw binding must be rejected")
+
+        monkeypatch.setattr(mgr, "send_to_window", _unexpected_send)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="do not use orphaned cache",
+        )
+
+        assert ok is False
+        assert "No persisted topic binding" in message
+        assert mgr.get_window_codex_thread_id("@1") == "thread-old-cache"
+
+    @pytest.mark.asyncio
+    async def test_empty_window_cache_repair_does_not_bind_other_topics(
+        self,
+        mgr: SessionManager,
+        monkeypatch,
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+            display_name="proj",
+        )
+        mgr.bind_thread(100, 2, "@1")
+        other_binding = mgr.topic_bindings_v2[100]["2"]
+        other_binding.codex_thread_id = ""
+        mgr.get_window_state("@1").codex_thread_id = ""
+
+        async def _send_to_window(*_args, **_kwargs):
+            return True, "ok"
+
+        monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+        ok, message = await mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=1,
+            window_id="@1",
+            text="repair only my cache",
+        )
+
         assert ok is True
         assert message == "ok"
-        assert len(sent) == 1
-        assert sent[0]["thread_id"] == ""
-        assert sent[0]["inputs"] == [
-            {"type": "text", "text": "keep this exact request"}
-        ]
-        assert mgr.get_window_codex_thread_id("@1") == "thread-fresh"
+        assert mgr.get_window_codex_thread_id("@1") == "thread-canonical"
+        assert other_binding.codex_thread_id == ""
 
     @pytest.mark.asyncio
     async def test_remote_host_follow_deferred_resume_returns_clean_failure(
@@ -1004,12 +1809,26 @@ class TestHostFollowTakeover:
             lambda window_ids, reason: uncertainty_calls.append((window_ids, reason))
         )
 
-        async def _resume_latest(_machine_id: str, **_kwargs):
+        exact_resumes: list[tuple[str, dict[str, object]]] = []
+        latest_resumes: list[tuple[str, dict[str, object]]] = []
+
+        async def _resume_thread(_machine_id: str, **kwargs):
+            exact_resumes.append((_machine_id, kwargs))
+            assert kwargs["thread_id"] == "thread-old"
             raise agent_rpc_mod.RemoteCodexMutationDeferredError(
-                "Remote Codex resume latest was not dispatched because "
+                "Remote Codex exact resume was not dispatched because "
                 "transport replacement confirmation is pending"
             )
 
+        async def _resume_latest(_machine_id: str, **kwargs):
+            latest_resumes.append((_machine_id, kwargs))
+            raise AssertionError("implicit host-follow must not resume latest by cwd")
+
+        monkeypatch.setattr(
+            agent_rpc_mod.agent_rpc_client,
+            "resume_thread",
+            _resume_thread,
+        )
         monkeypatch.setattr(
             agent_rpc_mod.agent_rpc_client,
             "resume_latest",
@@ -1025,9 +1844,91 @@ class TestHostFollowTakeover:
 
         assert ok is False
         assert "was not dispatched" in message
+        assert exact_resumes == [
+            (
+                "remote-node",
+                {
+                    "window_id": "@1",
+                    "cwd": "/tmp/proj",
+                    "thread_id": "thread-old",
+                    "window_name": "proj",
+                    "approval_mode": "",
+                },
+            )
+        ]
+        assert latest_resumes == []
         assert uncertainty_calls == []
         assert mgr.get_window_codex_active_turn_id("@1") == "turn-old"
         assert mgr.get_topic_sync_mode(100, 1) == TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL
+
+
+@pytest.mark.asyncio
+async def test_missing_thread_recovery_resumes_stale_bound_thread_not_latest(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    canonical_thread_id = "thread-stale-canonical"
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id=canonical_thread_id,
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    mgr.get_window_state("@1").cwd = "/tmp/proj"
+
+    exact_resumes: list[tuple[str, str, str]] = []
+    latest_resumes: list[tuple[str, str]] = []
+    send_thread_ids: list[str] = []
+
+    async def _send_inputs_via_codex_app_server(
+        *,
+        window_id: str,
+        inputs: list[dict[str, object]],
+        steer: bool,
+        window_name: str,
+        cwd: str,
+        **_kwargs: object,
+    ) -> tuple[bool, str]:
+        _ = inputs, steer, window_name, cwd
+        send_thread_ids.append(mgr.get_window_codex_thread_id(window_id))
+        if len(send_thread_ids) == 1:
+            raise session_mod.CodexAppServerError("thread not found")
+        return True, "recovered"
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resumes.append((window_id, cwd, thread_id))
+        mgr.set_window_codex_thread_id(window_id, thread_id)
+        return thread_id
+
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        latest_resumes.append((window_id, cwd))
+        mgr.set_window_codex_thread_id(window_id, "thread-unrelated-latest")
+        return "thread-unrelated-latest"
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    monkeypatch.setattr(
+        mgr,
+        "resume_latest_codex_session_for_window",
+        _resume_latest,
+    )
+
+    ok, message = await mgr.send_inputs_to_window(
+        "@1",
+        [{"type": "text", "text": "retry this request"}],
+    )
+
+    assert ok is True
+    assert message == "recovered"
+    assert exact_resumes == [("@1", "/tmp/proj", canonical_thread_id)]
+    assert latest_resumes == []
+    assert send_thread_ids == [canonical_thread_id, canonical_thread_id]
 
 
 @pytest.mark.asyncio
@@ -1244,6 +2145,7 @@ async def test_local_topic_send_forwards_originating_topic_model_selection(
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        **_kwargs: object,
     ):
         _ = window_id, text, steer, force_new_turn, service_tier
         captured.append((model_slug, reasoning_effort))
@@ -1503,19 +2405,33 @@ async def test_set_topic_goal_creates_thread_for_window_when_missing(
 ) -> None:
     mgr.bind_thread(100, 1, "@1", window_name="proj")
     mgr.get_window_state("@1").cwd = "/tmp/proj"
+    raw_binding = mgr._get_persisted_topic_binding(100, 1)
+    assert raw_binding is not None
+    raw_binding.cwd = "/tmp/proj"
     ensure_calls: list[tuple[str, str]] = []
     set_calls: list[tuple[str, str]] = []
+    latest_resume_calls: list[tuple[str, str]] = []
 
     async def _ensure_codex_thread_for_window(*, window_id: str, cwd: str, **_kwargs):
         ensure_calls.append((window_id, cwd))
-        mgr.set_window_codex_thread_id(window_id, "thread-new")
+        assert _kwargs["sync_topic_bindings"] is False
+        mgr._set_window_codex_thread_cache(window_id, "thread-new")
         return "thread-new", "on-request"
 
     async def _thread_goal_set(*, thread_id: str, goal: str):
         set_calls.append((thread_id, goal))
         return {"goal": {"objective": goal, "status": "active"}}
 
+    async def _resume_latest_codex_session_for_window(*, window_id: str, cwd: str):
+        latest_resume_calls.append((window_id, cwd))
+        return ""
+
     monkeypatch.setattr(mgr, "_ensure_codex_thread_for_window", _ensure_codex_thread_for_window)
+    monkeypatch.setattr(
+        mgr,
+        "resume_latest_codex_session_for_window",
+        _resume_latest_codex_session_for_window,
+    )
     monkeypatch.setattr(session_mod.codex_app_server_client, "thread_goal_set", _thread_goal_set)
 
     ok, payload, message = await mgr.set_topic_goal(
@@ -1529,6 +2445,129 @@ async def test_set_topic_goal_creates_thread_for_window_when_missing(
     assert message == ""
     assert ensure_calls == [("@1", "/tmp/proj")]
     assert set_calls == [("thread-new", "Ship the goal feature")]
+    assert latest_resume_calls == []
+
+
+@pytest.mark.asyncio
+async def test_goal_resolution_does_not_trust_unbound_window_cache(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="placeholder",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    raw_binding = mgr.topic_bindings_v2[100]["1"]
+    raw_binding.codex_thread_id = ""
+    mgr.get_window_state("@1").codex_thread_id = "thread-stale-cache"
+
+    async def _unexpected(*_args, **_kwargs):
+        raise AssertionError("goal resolution must not trust the window cache")
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _unexpected)
+    monkeypatch.setattr(mgr, "_ensure_codex_thread_for_window", _unexpected)
+
+    thread_id, error = await mgr.resolve_goal_thread_for_topic(
+        user_id=100,
+        thread_id=1,
+        create=True,
+    )
+
+    assert thread_id == ""
+    assert "No canonical Codex thread is persisted" in error
+    assert raw_binding.codex_thread_id == ""
+    assert mgr.get_window_codex_thread_id("@1") == "thread-stale-cache"
+
+
+@pytest.mark.asyncio
+async def test_goal_resolution_does_not_use_stale_window_cwd_for_empty_binding(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    """Implicit goal recovery must not create a thread in a cached workspace."""
+    window_id = "@920010"
+    state = mgr.get_window_state(window_id)
+    state.cwd = "/workspace/stale-cache"
+    state.window_name = "demo"
+    mgr.bind_thread(100, 1, window_id, window_name="demo")
+    raw_binding = mgr._get_persisted_topic_binding(100, 1)
+    assert raw_binding is not None
+    assert raw_binding.codex_thread_id == ""
+    raw_binding.cwd = ""
+
+    ensure_calls: list[tuple[str, str]] = []
+    resume_calls: list[tuple[str, str, str]] = []
+
+    async def _ensure_codex_thread_for_window(**kwargs: object) -> tuple[str, str]:
+        ensure_calls.append((str(kwargs["window_id"]), str(kwargs["cwd"])))
+        return "thread-created-in-stale-cache", "on-request"
+
+    async def _resume_codex_session_for_window(
+        *, window_id: str, cwd: str, thread_id: str
+    ) -> str:
+        resume_calls.append((window_id, cwd, thread_id))
+        return thread_id
+
+    monkeypatch.setattr(
+        mgr,
+        "_ensure_codex_thread_for_window",
+        _ensure_codex_thread_for_window,
+    )
+    monkeypatch.setattr(
+        mgr,
+        "resume_codex_session_for_window",
+        _resume_codex_session_for_window,
+    )
+
+    thread_id, error = await mgr.resolve_goal_thread_for_topic(
+        user_id=100,
+        thread_id=1,
+        create=True,
+    )
+
+    assert thread_id == ""
+    assert "No workspace is bound to this topic" in error
+    assert ensure_calls == []
+    assert resume_calls == []
+    binding = mgr._get_persisted_topic_binding(100, 1)
+    assert binding is not None
+    assert binding.cwd == ""
+    assert binding.codex_thread_id == ""
+    assert state.cwd == "/workspace/stale-cache"
+    assert state.codex_thread_id == ""
+
+
+@pytest.mark.asyncio
+async def test_goal_resolution_requires_raw_persisted_binding(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-old-cache",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    resolved_fallback = mgr.resolve_topic_binding(100, 1)
+    assert resolved_fallback is not None
+    del mgr.topic_bindings_v2[100]["1"]
+    monkeypatch.setattr(
+        mgr,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: resolved_fallback,
+    )
+
+    thread_id, error = await mgr.resolve_goal_thread_for_topic(
+        user_id=100,
+        thread_id=1,
+        create=True,
+    )
+
+    assert thread_id == ""
+    assert "No persisted topic binding" in error
 
 
 @pytest.mark.asyncio
@@ -1548,26 +2587,31 @@ async def test_set_topic_goal_retries_after_missing_goal_error_on_stale_thread(
     mgr.get_window_state("@1").cwd = "/tmp/proj"
     mgr.set_window_codex_thread_id("@1", "thread-stale")
     set_calls: list[tuple[str, str]] = []
-    resume_calls: list[tuple[str, str]] = []
+    exact_resume_calls: list[tuple[str, str, str]] = []
+    latest_resume_calls: list[tuple[str, str]] = []
+
+    async def _resume_codex_session_for_window(
+        *, window_id: str, cwd: str, thread_id: str
+    ):
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        assert thread_id == "thread-stale"
+        mgr.set_window_codex_thread_id(window_id, thread_id)
+        return thread_id
 
     async def _resume_latest_codex_session_for_window(*, window_id: str, cwd: str):
-        resume_calls.append((window_id, cwd))
-        mgr.set_window_codex_thread_id(window_id, "thread-fresh")
-        return "thread-fresh"
+        latest_resume_calls.append((window_id, cwd))
+        raise AssertionError("goal refresh must not resume latest by cwd")
 
     async def _thread_goal_set(*, thread_id: str, goal: str):
         set_calls.append((thread_id, goal))
-        if thread_id == "thread-stale":
+        if len(set_calls) == 1:
             raise session_mod.CodexAppServerError(
                 f"cannot update goal for thread {thread_id}: no goal exists"
             )
         return {"goal": {"objective": goal, "status": "active"}}
 
-    monkeypatch.setattr(
-        mgr,
-        "resume_latest_codex_session_for_window",
-        _resume_latest_codex_session_for_window,
-    )
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_codex_session_for_window)
+    monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest_codex_session_for_window)
     monkeypatch.setattr(session_mod.codex_app_server_client, "thread_goal_set", _thread_goal_set)
 
     ok, payload, message = await mgr.set_topic_goal(
@@ -1582,12 +2626,13 @@ async def test_set_topic_goal_retries_after_missing_goal_error_on_stale_thread(
     assert message == ""
     assert set_calls == [
         ("thread-stale", "Ship the goal feature"),
-        ("thread-fresh", "Ship the goal feature"),
+        ("thread-stale", "Ship the goal feature"),
     ]
-    assert resume_calls == [("@1", "/tmp/proj")]
+    assert exact_resume_calls == [("@1", "/tmp/proj", "thread-stale")]
+    assert latest_resume_calls == []
     binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
     assert binding is not None
-    assert binding.codex_thread_id == "thread-fresh"
+    assert binding.codex_thread_id == "thread-stale"
 
 
 @pytest.mark.asyncio
@@ -1646,6 +2691,7 @@ async def test_set_topic_goal_creates_remote_thread_when_missing(
     assert binding is not None
     binding.codex_thread_id = ""
     mgr.set_window_codex_thread_id("@1", "")
+    latest_resume_calls: list[tuple[str, dict[str, object]]] = []
 
     async def _resume_latest(
         machine_id: str,
@@ -1655,10 +2701,12 @@ async def test_set_topic_goal_creates_remote_thread_when_missing(
         window_name: str = "",
         approval_mode: str = "",
     ):
-        assert machine_id == "remote-node"
-        assert window_id == "@1"
-        assert cwd == "/tmp/proj"
-        _ = window_name, approval_mode
+        latest_resume_calls.append((machine_id, {
+            "window_id": window_id,
+            "cwd": cwd,
+            "window_name": window_name,
+            "approval_mode": approval_mode,
+        }))
         return {"thread_id": ""}
 
     async def _ensure_thread(
@@ -1701,6 +2749,7 @@ async def test_set_topic_goal_creates_remote_thread_when_missing(
     binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
     assert binding is not None
     assert binding.codex_thread_id == "remote-thread-1"
+    assert latest_resume_calls == []
 
 
 @pytest.mark.asyncio
@@ -1725,13 +2774,23 @@ async def test_remote_goal_refresh_inherits_resumed_model_selection(
         reasoning_effort="medium",
     )
 
-    async def _resume_latest(_machine_id: str, **_kwargs):
+    exact_resume_calls: list[tuple[str, dict[str, object]]] = []
+    latest_resume_calls: list[tuple[str, dict[str, object]]] = []
+
+    async def _resume_thread(_machine_id: str, **kwargs):
+        exact_resume_calls.append((_machine_id, kwargs))
+        assert kwargs["thread_id"] == "thread-old"
         return {
-            "thread_id": "thread-new",
+            "thread_id": "thread-old",
             "model_slug": "gpt-5.6-sol",
             "reasoning_effort": "ultra",
         }
 
+    async def _resume_latest(_machine_id: str, **_kwargs):
+        latest_resume_calls.append((_machine_id, _kwargs))
+        raise AssertionError("remote goal refresh must not resume latest by cwd")
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_thread", _resume_thread)
     monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_latest", _resume_latest)
 
     thread_id, error = await mgr.resolve_goal_thread_for_topic(
@@ -1744,10 +2803,435 @@ async def test_remote_goal_refresh_inherits_resumed_model_selection(
 
     binding = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
     assert error == ""
-    assert thread_id == "thread-new"
+    assert thread_id == "thread-old"
     assert binding is not None
+    assert exact_resume_calls == [
+        (
+            "remote-node",
+            {
+                "window_id": "@1",
+                "cwd": "/tmp/proj",
+                "thread_id": "thread-old",
+                "window_name": "proj",
+                "approval_mode": "",
+            },
+        )
+    ]
+    assert latest_resume_calls == []
+    assert binding.codex_thread_id == "thread-old"
     assert binding.model_slug == "gpt-5.6-sol"
     assert binding.reasoning_effort == "ultra"
+
+
+@pytest.mark.asyncio
+async def test_remote_goal_exact_resume_drops_stale_result_after_explicit_rebind(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-a",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-a",
+        machine_display_name="Remote A",
+    )
+
+    resume_started = asyncio.Event()
+    release_resume = asyncio.Event()
+
+    async def _resume_thread(machine_id: str, **kwargs: object):
+        assert machine_id == "remote-a"
+        assert kwargs["thread_id"] == "thread-a"
+        resume_started.set()
+        await release_resume.wait()
+        return {"thread_id": "thread-a"}
+
+    monkeypatch.setattr(
+        agent_rpc_mod.agent_rpc_client,
+        "resume_thread",
+        _resume_thread,
+    )
+
+    task = asyncio.create_task(
+        mgr.resolve_goal_thread_for_topic(
+            user_id=100,
+            thread_id=1,
+            create=True,
+            force_refresh=True,
+        )
+    )
+    await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-b",
+        window_id="@1",
+        cwd="/tmp/proj-b",
+        display_name="proj-b",
+        machine_id="remote-b",
+        machine_display_name="Remote B",
+    )
+    release_resume.set()
+    thread_id, error = await task
+
+    assert thread_id == ""
+    assert error
+    binding = mgr._get_persisted_topic_binding(100, 1)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-b"
+    assert binding.machine_id == "remote-b"
+    assert mgr.get_window_codex_thread_id("@1") == "thread-b"
+
+
+@pytest.mark.asyncio
+async def test_remote_goal_ensure_drops_stale_result_after_explicit_rebind(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="placeholder",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+        machine_id="remote-a",
+        machine_display_name="Remote A",
+    )
+    raw_binding = mgr._get_persisted_topic_binding(100, 1)
+    assert raw_binding is not None
+    raw_binding.codex_thread_id = ""
+    mgr.set_window_codex_thread_id("@1", "")
+
+    ensure_started = asyncio.Event()
+    release_ensure = asyncio.Event()
+
+    async def _ensure_thread(machine_id: str, **kwargs: object):
+        assert machine_id == "remote-a"
+        assert kwargs["window_id"] == "@1"
+        ensure_started.set()
+        await release_ensure.wait()
+        return {"thread_id": "thread-a"}
+
+    monkeypatch.setattr(
+        agent_rpc_mod.agent_rpc_client,
+        "ensure_thread",
+        _ensure_thread,
+    )
+
+    task = asyncio.create_task(
+        mgr.resolve_goal_thread_for_topic(
+            user_id=100,
+            thread_id=1,
+            create=True,
+        )
+    )
+    await asyncio.wait_for(ensure_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-b",
+        window_id="@1",
+        cwd="/tmp/proj-b",
+        display_name="proj-b",
+        machine_id="remote-b",
+        machine_display_name="Remote B",
+    )
+    release_ensure.set()
+    thread_id, error = await task
+
+    assert thread_id == ""
+    assert error
+    binding = mgr._get_persisted_topic_binding(100, 1)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-b"
+    assert binding.machine_id == "remote-b"
+    assert mgr.get_window_codex_thread_id("@1") == "thread-b"
+
+
+@pytest.mark.asyncio
+async def test_local_goal_creation_revalidates_empty_raw_binding_before_goal_mutation(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_thread(100, 1, "@1", window_name="proj-a")
+    mgr.get_window_state("@1").cwd = "/tmp/proj-a"
+    raw_binding = mgr._get_persisted_topic_binding(100, 1)
+    assert raw_binding is not None
+    raw_binding.cwd = "/tmp/proj-a"
+    assert raw_binding.codex_thread_id == ""
+    assert mgr.get_window_codex_thread_id("@1") == ""
+
+    thread_start_started = asyncio.Event()
+    release_thread_start = asyncio.Event()
+    goal_calls: list[tuple[str, str]] = []
+
+    async def _thread_start(**_kwargs: object):
+        thread_start_started.set()
+        await release_thread_start.wait()
+        return {"thread": {"id": "thread-a"}}
+
+    async def _thread_goal_set(*, thread_id: str, goal: str):
+        goal_calls.append((thread_id, goal))
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_start", _thread_start)
+    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_goal_set", _thread_goal_set)
+
+    task = asyncio.create_task(
+        mgr.set_topic_goal(
+            user_id=100,
+            thread_id=1,
+            goal_text="Ship topic B",
+        )
+    )
+    await asyncio.wait_for(thread_start_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-b",
+        window_id="@1",
+        cwd="/tmp/proj-b",
+        display_name="proj-b",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    release_thread_start.set()
+    ok, payload, message = await task
+
+    assert ok is False
+    assert payload is None
+    assert message
+    assert goal_calls == []
+    binding = mgr._get_persisted_topic_binding(100, 1)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-b"
+    assert binding.cwd == "/tmp/proj-b"
+    assert mgr.get_window_codex_thread_id("@1") == "thread-b"
+
+
+@pytest.mark.asyncio
+async def test_local_goal_refresh_drops_stale_result_after_explicit_rebind(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-a",
+        window_id="@900070",
+        cwd="/tmp/proj-a",
+        display_name="proj-a",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+
+    resume_started = asyncio.Event()
+    release_resume = asyncio.Event()
+    goal_calls: list[tuple[str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        assert (window_id, cwd, thread_id) == (
+            "@900070",
+            "/tmp/proj-a",
+            "thread-a",
+        )
+        resume_started.set()
+        await release_resume.wait()
+        return thread_id
+
+    async def _thread_goal_set(*, thread_id: str, goal: str):
+        goal_calls.append((thread_id, goal))
+        if len(goal_calls) == 1:
+            raise session_mod.CodexAppServerError(
+                f"cannot update goal for thread {thread_id}: no goal exists"
+            )
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_goal_set",
+        _thread_goal_set,
+    )
+
+    task = asyncio.create_task(
+        mgr.set_topic_goal(
+            user_id=100,
+            thread_id=1,
+            goal_text="Ship topic B",
+        )
+    )
+    await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        codex_thread_id="thread-b",
+        window_id="@900071",
+        cwd="/tmp/proj-b",
+        display_name="proj-b",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    release_resume.set()
+    ok, payload, message = await task
+
+    assert ok is False
+    assert payload is None
+    assert message
+    assert goal_calls == [("thread-a", "Ship topic B")]
+    binding = mgr._get_persisted_topic_binding(100, 1)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-b"
+    assert binding.window_id == "@900071"
+    assert binding.cwd == "/tmp/proj-b"
+    assert binding.machine_id == "local-node"
+    assert mgr.get_window_codex_thread_id("@900070") == "thread-a"
+    assert mgr.get_window_codex_thread_id("@900071") == "thread-b"
+
+
+@pytest.mark.asyncio
+async def test_set_topic_goal_retry_revalidates_binding_after_lifecycle_rebind(
+    mgr: SessionManager, monkeypatch
+) -> None:
+    """A goal retry must not reuse the first transport's machine closure."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-topic",
+        window_id="@machine-a",
+        cwd="/tmp/proj-a",
+        display_name="proj-a",
+        machine_id="machine-a",
+        machine_display_name="Machine A",
+    )
+
+    first_goal_attempt = asyncio.Event()
+    release_first_goal = asyncio.Event()
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+    goal_calls: list[tuple[str, str, str]] = []
+    refresh_calls: list[tuple[str, dict[str, object]]] = []
+
+    async def _thread_goal_set(
+        machine_id: str, *, thread_id: str, goal: str
+    ) -> dict[str, object]:
+        goal_calls.append((machine_id, thread_id, goal))
+        if len(goal_calls) == 1:
+            first_goal_attempt.set()
+            await release_first_goal.wait()
+            raise session_mod.CodexAppServerError(
+                f"cannot update goal for thread {thread_id}: no goal exists"
+            )
+        return {"goal": {"objective": goal, "status": "active"}}
+
+    async def _resume_thread(machine_id: str, **kwargs: object) -> dict[str, str]:
+        refresh_calls.append((machine_id, kwargs))
+        refresh_started.set()
+        await release_refresh.wait()
+        return {"thread_id": "thread-topic"}
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "thread_goal_set", _thread_goal_set)
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "resume_thread", _resume_thread)
+
+    task = asyncio.create_task(
+        mgr.set_topic_goal(
+            user_id=100,
+            thread_id=1,
+            chat_id=-100123,
+            goal_text="Ship the topic goal",
+        )
+    )
+    await asyncio.wait_for(first_goal_attempt.wait(), timeout=1)
+
+    # The lifecycle rebind happens while the first mutation is still in flight;
+    # force-refresh must use this complete binding on every subsequent await.
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        codex_thread_id="thread-topic",
+        window_id="@machine-b",
+        cwd="/tmp/proj-b",
+        display_name="proj-b",
+        machine_id="machine-b",
+        machine_display_name="Machine B",
+    )
+    release_first_goal.set()
+    await asyncio.wait_for(refresh_started.wait(), timeout=1)
+    assert refresh_calls == [
+        (
+            "machine-b",
+            {
+                "window_id": "@machine-b",
+                "cwd": "/tmp/proj-b",
+                "thread_id": "thread-topic",
+                "window_name": "proj-b",
+                "approval_mode": "",
+            },
+        )
+    ]
+    release_refresh.set()
+
+    ok, payload, message = await task
+
+    # A valid implementation may retry through B or abort after noticing the
+    # ownership transition, but it must never issue a second mutation to A.
+    assert goal_calls[0] == ("machine-a", "thread-topic", "Ship the topic goal")
+    assert all(machine_id != "machine-a" for machine_id, _thread_id, _goal in goal_calls[1:])
+    if ok:
+        assert goal_calls == [
+            ("machine-a", "thread-topic", "Ship the topic goal"),
+            ("machine-b", "thread-topic", "Ship the topic goal"),
+        ]
+        assert payload == {
+            "goal": {"objective": "Ship the topic goal", "status": "active"}
+        }
+        assert message == ""
+    else:
+        assert payload is None
+        assert message
+
+    binding = mgr._get_persisted_topic_binding(100, 1, chat_id=-100123)
+    assert binding is not None
+    assert binding.transport == session_mod.TOPIC_BINDING_TRANSPORT_CODEX_THREAD
+    assert binding.chat_id == -100123
+    assert binding.thread_id == 1
+    assert binding.codex_thread_id == "thread-topic"
+    assert binding.window_id == "@machine-b"
+    assert binding.cwd == "/tmp/proj-b"
+    assert binding.display_name == "proj-b"
+    assert binding.machine_id == "machine-b"
+    assert binding.machine_display_name == "Machine B"
 
 
 class TestRuntimeCapabilityHint:
@@ -1885,17 +3369,29 @@ class TestWindowState:
 
 class TestCocoControlTopic:
     def test_set_and_get_coco_control_topic_roundtrip(self, mgr: SessionManager) -> None:
-        mgr.ensure_topic_binding(100, 7, chat_id=-100123)
+        mgr.ensure_topic_binding(100, 1, chat_id=-100123)
 
-        binding = mgr.set_coco_control_topic(100, 7, chat_id=-100123)
+        binding = mgr.set_coco_control_topic(100, 1, chat_id=-100123)
 
         assert binding is not None
-        assert mgr.is_coco_control_topic(100, 7, chat_id=-100123) is True
+        assert mgr.is_coco_control_topic(100, 1, chat_id=-100123) is True
         control_topic = mgr.get_coco_control_topic()
         assert control_topic is not None
         assert control_topic.user_id == 100
         assert control_topic.chat_id == -100123
-        assert control_topic.thread_id == 7
+        assert control_topic.thread_id == 1
+
+    def test_named_topic_cannot_replace_general_control(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+
+        binding = mgr.set_coco_control_topic(100, 77, chat_id=-100123)
+
+        assert binding is None
+        assert mgr.is_coco_control_topic(100, 1, chat_id=-100123)
+        assert not mgr.is_coco_control_topic(100, 77, chat_id=-100123)
 
     def test_coco_control_topic_persists_across_save_and_load(
         self, tmp_path: Path, monkeypatch
@@ -1907,8 +3403,8 @@ class TestCocoControlTopic:
         monkeypatch.setattr(session_mod.node_registry, "get_node", lambda _mid: None)
 
         mgr = SessionManager()
-        mgr.ensure_topic_binding(100, 9, chat_id=-100123)
-        mgr.set_coco_control_topic(100, 9, chat_id=-100123)
+        mgr.ensure_topic_binding(100, 1, chat_id=-100123)
+        mgr.set_coco_control_topic(100, 1, chat_id=-100123)
 
         reloaded = SessionManager()
         control_topic = reloaded.get_coco_control_topic()
@@ -1916,7 +3412,74 @@ class TestCocoControlTopic:
         assert control_topic is not None
         assert control_topic.user_id == 100
         assert control_topic.chat_id == -100123
-        assert control_topic.thread_id == 9
+        assert control_topic.thread_id == 1
+
+    def test_migrate_coco_control_to_general_moves_history_and_topic_settings(
+        self,
+        mgr: SessionManager,
+        tmp_path: Path,
+    ) -> None:
+        chat_id = -100123
+        user_id = 100
+        old_thread_id = 77
+        old_window_id = "@42"
+        neutral_workspace = tmp_path / "_coco" / "chat-100123-thread-1"
+
+        state = mgr.get_window_state(old_window_id)
+        state.cwd = "/projects/old-control"
+        state.window_name = "old-control"
+        state.codex_thread_id = "codex-history-123"
+        mgr.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=old_thread_id,
+            chat_id=chat_id,
+            codex_thread_id="codex-history-123",
+            cwd=state.cwd,
+            display_name=state.window_name,
+            window_id=old_window_id,
+        )
+        mgr.set_thread_skills(user_id, old_thread_id, ["ops"], chat_id=chat_id)
+        mgr.set_thread_codex_skills(
+            user_id,
+            old_thread_id,
+            ["reviewer"],
+            chat_id=chat_id,
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(
+            user_id=user_id,
+            thread_id=old_thread_id,
+            chat_id=chat_id,
+        )
+        mgr._save_state()
+
+        migration = mgr.migrate_coco_control_to_general(
+            workspace_dir=str(neutral_workspace),
+            general_thread_id=1,
+        )
+
+        assert migration is not None
+        assert migration.user_id == user_id
+        assert migration.chat_id == chat_id
+        assert migration.previous_thread_id == old_thread_id
+        assert migration.general_thread_id == 1
+        assert migration.moved_history is True
+        assert mgr.resolve_topic_binding(user_id, old_thread_id, chat_id=chat_id) is None
+        general = mgr.resolve_topic_binding(user_id, 1, chat_id=chat_id)
+        assert general is not None
+        assert general.window_id == old_window_id
+        assert general.codex_thread_id == "codex-history-123"
+        assert general.cwd == str(neutral_workspace)
+        assert general.display_name == "coco-control"
+        assert mgr.get_thread_skills(user_id, 1, chat_id=chat_id) == ["ops"]
+        assert mgr.get_thread_codex_skills(user_id, 1, chat_id=chat_id) == [
+            "reviewer"
+        ]
+        assert mgr.get_thread_skills(user_id, old_thread_id, chat_id=chat_id) == []
+        migrated_state = mgr.get_window_state(old_window_id)
+        assert migrated_state.codex_thread_id == "codex-history-123"
+        assert migrated_state.cwd == str(neutral_workspace)
+        assert migrated_state.window_name == "coco-control"
+        assert mgr.is_coco_control_topic(user_id, 1, chat_id=chat_id)
 
 
 class TestResolveWindowForThread:
@@ -1996,6 +3559,107 @@ class TestDisplayNames:
 
 
 class TestAutodiscoverBoundWindows:
+    def test_current_session_map_omits_noncanonical_session(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-topic-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+        )
+        mgr.get_window_state("@1").session_id = "thread-unrelated"
+
+        assert mgr.current_window_session_map() == {}
+
+    def test_current_session_map_omits_topic_without_canonical_thread(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        state = mgr.get_window_state("@1")
+        state.cwd = "/tmp/proj"
+        state.session_id = "thread-unrelated"
+
+        assert mgr.current_window_session_map() == {}
+
+    def test_autodiscover_preserves_canonical_codex_thread_over_newer_summary(
+        self, mgr: SessionManager, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        canonical_thread_id = "thread-topic-canonical"
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id=canonical_thread_id,
+            window_id="@1",
+            cwd=str(workspace),
+            display_name="proj",
+        )
+        state = mgr.get_window_state("@1")
+        state.session_id = "stale-session-id"
+
+        summaries = [
+            CodexSessionSummary(
+                thread_id=canonical_thread_id,
+                file_path=workspace / "canonical.jsonl",
+                created_at=10.0,
+                last_active_at=10.0,
+            ),
+            CodexSessionSummary(
+                thread_id="thread-unrelated-newer",
+                file_path=workspace / "newer.jsonl",
+                created_at=20.0,
+                last_active_at=20.0,
+            ),
+        ]
+
+        assert mgr._autodiscover_session_for_window_from_summaries("@1", summaries)
+        assert state.session_id == canonical_thread_id
+
+    def test_autodiscover_resolves_canonical_thread_outside_summary_window(
+        self, mgr: SessionManager, monkeypatch, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        canonical_thread_id = "thread-topic-canonical"
+        canonical_rollout = workspace / "canonical.jsonl"
+        canonical_rollout.write_text("{}\n", encoding="utf-8")
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id=canonical_thread_id,
+            window_id="@1",
+            cwd=str(workspace),
+            display_name="proj",
+        )
+        state = mgr.get_window_state("@1")
+        state.session_id = "thread-unrelated-newer"
+
+        def _find_exact(thread_id: str, *, cwd: str = ""):
+            assert thread_id == canonical_thread_id
+            assert cwd == str(workspace)
+            return canonical_rollout
+
+        monkeypatch.setattr(mgr, "_find_codex_session_file_for_thread", _find_exact)
+        summaries = [
+            CodexSessionSummary(
+                thread_id="thread-unrelated-newer",
+                file_path=workspace / "newer.jsonl",
+                created_at=20.0,
+                last_active_at=20.0,
+            )
+        ]
+
+        assert mgr._autodiscover_session_for_window_from_summaries("@1", summaries)
+        assert state.session_id == canonical_thread_id
+
+        # A later discovery must keep the authoritative topic thread instead of
+        # replacing it with an unrelated newer transcript in the same cwd.
+        assert mgr._autodiscover_session_for_window_from_summaries("@1", summaries)
+        assert state.session_id == canonical_thread_id
+
     @pytest.mark.asyncio
     async def test_reuses_session_summary_lookup_for_windows_in_same_cwd(
         self, mgr: SessionManager, monkeypatch, tmp_path
@@ -2031,17 +3695,102 @@ class TestAutodiscoverBoundWindows:
         await mgr.autodiscover_sessions_for_bound_windows()
 
         assert calls == [str(workspace)]
-        assert mgr.get_window_state("@1").session_id == "latest-session"
-        assert mgr.get_window_state("@2").session_id == "latest-session"
+        assert mgr.get_window_state("@1").session_id == ""
+        assert mgr.get_window_state("@2").session_id == ""
 
 
 class TestFindUsersForSession:
     @pytest.mark.asyncio
+    async def test_ignores_noncanonical_window_session(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-topic-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+        )
+        mgr.get_window_state("@1").session_id = "thread-unrelated"
+
+        assert await mgr.find_users_for_session("thread-unrelated") == []
+
+    @pytest.mark.asyncio
+    async def test_uses_raw_topic_binding_when_window_cache_disagrees(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-topic-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+        )
+        state = mgr.get_window_state("@1")
+        state.codex_thread_id = "thread-unrelated"
+        state.session_id = "thread-unrelated"
+
+        assert await mgr.find_users_for_session("thread-unrelated") == []
+        assert await mgr.find_users_for_session("thread-topic-canonical") == []
+
+    def test_codex_thread_routing_does_not_use_unbound_window_cache(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="placeholder",
+            window_id="@1",
+            cwd="/tmp/proj",
+        )
+        raw_binding = mgr.topic_bindings_v2[100]["1"]
+        raw_binding.codex_thread_id = ""
+        mgr.get_window_state("@1").codex_thread_id = "thread-window-cache"
+
+        assert mgr.find_users_for_codex_thread("thread-window-cache") == []
+
+    @pytest.mark.asyncio
+    async def test_repairs_noncanonical_cache_when_canonical_session_arrives(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-topic-canonical",
+            window_id="@1",
+            cwd="/tmp/proj",
+        )
+        mgr.get_window_state("@1").session_id = "thread-unrelated"
+        calls: list[str] = []
+
+        async def _autodiscover(window_id: str) -> bool:
+            calls.append(window_id)
+            mgr.get_window_state(window_id).session_id = "thread-topic-canonical"
+            return True
+
+        monkeypatch.setattr(mgr, "autodiscover_session_for_window", _autodiscover)
+
+        assert await mgr.find_users_for_session("thread-topic-canonical") == [
+            (100, None, "@1", 1)
+        ]
+        assert calls == ["@1"]
+
+    @pytest.mark.asyncio
     async def test_uses_in_memory_session_ids(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
-        mgr.bind_thread(100, 1, "@1")
-        mgr.bind_thread(100, 2, "@2")
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="s1",
+            window_id="@1",
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=2,
+            codex_thread_id="s2",
+            window_id="@2",
+        )
         mgr.get_window_state("@1").session_id = "s1"
         mgr.get_window_state("@2").session_id = "s2"
 
@@ -2057,7 +3806,12 @@ class TestFindUsersForSession:
     async def test_autodiscovers_when_session_id_missing(
         self, mgr: SessionManager, monkeypatch
     ) -> None:
-        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="new-session",
+            window_id="@1",
+        )
         mgr.get_window_state("@1").session_id = ""
         called: list[str] = []
 
@@ -2690,6 +4444,7 @@ async def test_send_inputs_to_window_app_server_only_uses_cached_state_without_l
         force_new_turn: bool = False,
         window_name: str,
         cwd: str,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -2736,6 +4491,7 @@ async def test_send_inputs_to_window_hybrid_app_server_mode_skips_legacy_lookup(
         force_new_turn: bool = False,
         window_name: str,
         cwd: str,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -2799,7 +4555,7 @@ async def test_send_inputs_to_window_app_server_failure_returns_without_legacy_f
 
 
 @pytest.mark.asyncio
-async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
+async def test_send_inputs_to_window_thread_not_found_retries_bound_thread(
     mgr: SessionManager,
     monkeypatch,
 ):
@@ -2831,6 +4587,7 @@ async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
         force_new_turn: bool = False,
         window_name: str,
         cwd: str,
+        **_kwargs: object,
     ):
         _ = window_id, inputs, window_name, cwd, force_new_turn
         call_states.append(mgr.get_window_codex_thread_id("@900003"))
@@ -2838,10 +4595,22 @@ async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
             assert steer is False
             raise session_mod.CodexAppServerError("thread not found: thread-old")
         assert steer is False
-        mgr.set_window_codex_thread_id("@900003", "thread-new")
         return True, "ok"
 
+    exact_resume_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        assert thread_id == "thread-old"
+        mgr.set_window_codex_thread_id(window_id, thread_id)
+        return thread_id
+
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        raise AssertionError("missing-thread recovery must not resume latest by cwd")
+
     monkeypatch.setattr(mgr, "_send_inputs_via_codex_app_server", _send_inputs_via_codex_app_server)
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest)
 
     telemetry_events: list[tuple[str, dict[str, object]]] = []
 
@@ -2858,11 +4627,12 @@ async def test_send_inputs_to_window_thread_not_found_retries_with_fresh_thread(
 
     assert ok is True
     assert msg == "ok"
-    assert call_states == ["thread-old", ""]
-    assert mgr.get_window_codex_thread_id("@900003") == "thread-new"
+    assert call_states == ["thread-old", "thread-old"]
+    assert exact_resume_calls == [("@900003", "/tmp/demo", "thread-old")]
+    assert mgr.get_window_codex_thread_id("@900003") == "thread-old"
     binding = mgr.resolve_topic_binding(100, 7)
     assert binding is not None
-    assert binding.codex_thread_id == "thread-new"
+    assert binding.codex_thread_id == "thread-old"
     event_names = [event for event, _payload in telemetry_events]
     assert "transport.app_server.thread_missing_retry" in event_names
     assert "transport.app_server.thread_missing_recovered" in event_names
@@ -2927,14 +4697,6 @@ async def test_send_inputs_to_window_thread_not_found_skips_subagent_session(
     monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
     monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
 
-    resume_calls: list[str] = []
-
-    async def _thread_resume(*, thread_id: str):
-        resume_calls.append(thread_id)
-        return {"thread": {"id": thread_id}}
-
-    monkeypatch.setattr(session_mod.codex_app_server_client, "thread_resume", _thread_resume)
-
     call_states: list[str] = []
 
     async def _send_inputs_via_codex_app_server(
@@ -2945,6 +4707,7 @@ async def test_send_inputs_to_window_thread_not_found_skips_subagent_session(
         force_new_turn: bool = False,
         window_name: str,
         cwd: str,
+        **_kwargs: object,
     ):
         _ = window_id, inputs, window_name, cwd, force_new_turn
         thread_id = mgr.get_window_codex_thread_id("@900009")
@@ -2952,15 +4715,23 @@ async def test_send_inputs_to_window_thread_not_found_skips_subagent_session(
         if len(call_states) == 1:
             assert steer is False
             raise session_mod.CodexAppServerError("thread not found: thread-subagent")
-        if thread_id == "thread-subagent":
-            raise session_mod.CodexAppServerError(
-                "direct app-server input is not allowed for multi-agent v2 sub-agents"
-            )
         assert steer is False
-        mgr.set_window_codex_thread_id("@900009", "thread-new-root")
         return True, "ok"
 
+    exact_resume_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        assert thread_id == "thread-subagent"
+        mgr.set_window_codex_thread_id(window_id, thread_id)
+        return thread_id
+
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        raise AssertionError("missing-thread recovery must not resume latest by cwd")
+
     monkeypatch.setattr(mgr, "_send_inputs_via_codex_app_server", _send_inputs_via_codex_app_server)
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest)
 
     ok, msg = await mgr.send_inputs_to_window(
         "@900009",
@@ -2970,16 +4741,16 @@ async def test_send_inputs_to_window_thread_not_found_skips_subagent_session(
 
     assert ok is True
     assert msg == "ok"
-    assert resume_calls == []
-    assert call_states == ["thread-subagent", ""]
-    assert mgr.get_window_codex_thread_id("@900009") == "thread-new-root"
+    assert exact_resume_calls == [("@900009", str(workspace), "thread-subagent")]
+    assert call_states == ["thread-subagent", "thread-subagent"]
+    assert mgr.get_window_codex_thread_id("@900009") == "thread-subagent"
     binding = mgr.resolve_topic_binding(100, 7)
     assert binding is not None
-    assert binding.codex_thread_id == "thread-new-root"
+    assert binding.codex_thread_id == "thread-subagent"
 
 
 @pytest.mark.asyncio
-async def test_send_inputs_to_window_thread_not_found_prefers_latest_cwd_resume(
+async def test_send_inputs_to_window_thread_not_found_resumes_bound_thread(
     mgr: SessionManager,
     monkeypatch,
 ):
@@ -3001,18 +4772,31 @@ async def test_send_inputs_to_window_thread_not_found_prefers_latest_cwd_resume(
     monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
     monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
 
-    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+    exact_resume_calls: list[tuple[str, str, str]] = []
+    latest_resume_calls: list[tuple[str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
         assert window_id == "@900007"
         assert cwd == "/tmp/demo"
-        mgr.set_window_codex_thread_id("@900007", "thread-resumed")
+        assert thread_id == "thread-old"
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        mgr.set_window_codex_thread_id("@900007", thread_id)
         mgr.set_window_codex_active_turn_id("@900007", "turn-resumed")
-        return "thread-resumed"
+        return thread_id
 
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        latest_resume_calls.append((window_id, cwd))
+        raise AssertionError("missing-thread recovery must not resume latest by cwd")
+
+    monkeypatch.setattr(
+        mgr,
+        "resume_codex_session_for_window",
+        _resume_exact,
+    )
     monkeypatch.setattr(
         mgr,
         "resume_latest_codex_session_for_window",
         _resume_latest,
-        raising=False,
     )
 
     call_states: list[str] = []
@@ -3025,6 +4809,7 @@ async def test_send_inputs_to_window_thread_not_found_prefers_latest_cwd_resume(
         force_new_turn: bool = False,
         window_name: str,
         cwd: str,
+        **_kwargs: object,
     ):
         _ = window_id, inputs, window_name, cwd, force_new_turn
         call_states.append(mgr.get_window_codex_thread_id("@900007"))
@@ -3051,15 +4836,120 @@ async def test_send_inputs_to_window_thread_not_found_prefers_latest_cwd_resume(
 
     assert ok is True
     assert msg == "ok"
-    assert call_states == ["thread-old", "thread-resumed"]
-    assert mgr.get_window_codex_thread_id("@900007") == "thread-resumed"
+    assert call_states == ["thread-old", "thread-old"]
+    assert exact_resume_calls == [("@900007", "/tmp/demo", "thread-old")]
+    assert latest_resume_calls == []
+    assert mgr.get_window_codex_thread_id("@900007") == "thread-old"
     binding = mgr.resolve_topic_binding(100, 7)
     assert binding is not None
-    assert binding.codex_thread_id == "thread-resumed"
+    assert binding.codex_thread_id == "thread-old"
     event_names = [event for event, _payload in telemetry_events]
     assert "transport.app_server.thread_missing_retry" in event_names
     assert "transport.app_server.thread_missing_recovered" in event_names
     assert "transport.app_server.send_failed" not in event_names
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_to_window_thread_not_found_drops_retry_after_explicit_rebind(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    state = mgr.get_window_state("@900080")
+    state.cwd = "/tmp/proj-a"
+    state.window_name = "proj-a"
+    state.codex_thread_id = "thread-a"
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=7,
+        codex_thread_id="thread-a",
+        cwd="/tmp/proj-a",
+        display_name="proj-a",
+        window_id="@900080",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+
+    send_attempts: list[tuple[str, list[dict[str, object]]]] = []
+    retry_dispatches: list[tuple[str, list[dict[str, object]]]] = []
+    resume_started = asyncio.Event()
+    release_resume = asyncio.Event()
+
+    async def _send_inputs_via_codex_app_server(
+        *,
+        window_id: str,
+        inputs: list[dict[str, object]],
+        steer: bool,
+        force_new_turn: bool = False,
+        window_name: str,
+        cwd: str,
+        **_kwargs: object,
+    ) -> tuple[bool, str]:
+        _ = steer, force_new_turn, window_name, cwd
+        send_attempts.append((window_id, inputs))
+        if len(send_attempts) == 1:
+            raise session_mod.CodexAppServerError("thread not found: thread-a")
+        retry_dispatches.append((window_id, inputs))
+        return True, "stale request dispatched"
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        assert (window_id, cwd, thread_id) == (
+            "@900080",
+            "/tmp/proj-a",
+            "thread-a",
+        )
+        resume_started.set()
+        await release_resume.wait()
+        mgr._set_window_codex_thread_cache(window_id, thread_id)
+        return thread_id
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+
+    task = asyncio.create_task(
+        mgr.send_inputs_to_window(
+            "@900080",
+            [{"type": "text", "text": "original prompt"}],
+            steer=False,
+        )
+    )
+    await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=7,
+        codex_thread_id="thread-b",
+        cwd="/tmp/proj-b",
+        display_name="proj-b",
+        window_id="@900081",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    release_resume.set()
+    ok, message = await task
+
+    assert ok is False
+    assert message
+    assert send_attempts == [
+        ("@900080", [{"type": "text", "text": "original prompt"}])
+    ]
+    assert retry_dispatches == []
+    binding = mgr._get_persisted_topic_binding(100, 7)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-b"
+    assert binding.window_id == "@900081"
+    assert binding.cwd == "/tmp/proj-b"
+    assert binding.machine_id == "local-node"
+    assert mgr.get_window_codex_thread_id("@900080") == "thread-a"
+    assert mgr.get_window_codex_thread_id("@900081") == "thread-b"
 
 
 @pytest.mark.asyncio
@@ -3075,6 +4965,20 @@ async def test_send_inputs_to_window_thread_not_found_retry_failure_returns_comb
     monkeypatch.setattr(session_mod.config, "session_provider", "codex")
     monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
     monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    exact_resume_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        assert thread_id == "thread-old"
+        mgr.set_window_codex_thread_id(window_id, thread_id)
+        return thread_id
+
+    async def _resume_latest(*, window_id: str, cwd: str) -> str:
+        raise AssertionError("missing-thread recovery must not resume latest by cwd")
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    monkeypatch.setattr(mgr, "resume_latest_codex_session_for_window", _resume_latest)
 
     attempts = 0
 
@@ -3103,7 +5007,8 @@ async def test_send_inputs_to_window_thread_not_found_retry_failure_returns_comb
     assert ok is False
     assert "thread not found: thread-old" in msg
     assert "retry with new thread failed: retry exploded" in msg
-    assert mgr.get_window_codex_thread_id("@900004") == ""
+    assert exact_resume_calls == [("@900004", "/tmp/demo", "thread-old")]
+    assert mgr.get_window_codex_thread_id("@900004") == "thread-old"
     assert telemetry_events
     event, payload = telemetry_events[-1]
     assert event == "transport.app_server.send_failed"
@@ -3129,9 +5034,18 @@ async def test_send_inputs_to_window_thread_not_found_retry_timeout_recovers_tra
     attempts = 0
     recovery_calls: list[tuple[str, str, str]] = []
 
+    exact_resume_calls: list[tuple[str, str, str]] = []
+    latest_resume_calls: list[tuple[str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        assert thread_id == "thread-old"
+        mgr.set_window_codex_thread_id(window_id, thread_id)
+        return thread_id
+
     async def _resume_latest(*, window_id: str, cwd: str) -> str:
-        _ = window_id, cwd
-        return ""
+        latest_resume_calls.append((window_id, cwd))
+        raise AssertionError("missing-thread recovery must not resume latest by cwd")
 
     async def _send_inputs_via_codex_app_server(**_kwargs):
         nonlocal attempts
@@ -3139,7 +5053,6 @@ async def test_send_inputs_to_window_thread_not_found_retry_timeout_recovers_tra
         if attempts == 1:
             raise session_mod.CodexAppServerError("thread not found: thread-old")
         if retry_method == "turn/steer":
-            mgr.set_window_codex_thread_id("@900010", "thread-retry")
             mgr.set_window_codex_active_turn_id("@900010", "turn-retry")
         raise session_mod.CodexAppServerError(
             f"Timed out waiting for app-server response: {retry_method}"
@@ -3151,6 +5064,11 @@ async def test_send_inputs_to_window_thread_not_found_retry_timeout_recovers_tra
         recovery_calls.append((method, thread_id, turn_id))
         return True
 
+    monkeypatch.setattr(
+        mgr,
+        "resume_codex_session_for_window",
+        _resume_exact,
+    )
     monkeypatch.setattr(
         mgr,
         "resume_latest_codex_session_for_window",
@@ -3175,8 +5093,10 @@ async def test_send_inputs_to_window_thread_not_found_retry_timeout_recovers_tra
 
     assert ok is False
     assert attempts == 2
+    assert exact_resume_calls == [("@900010", "/tmp/demo", "thread-old")]
+    assert latest_resume_calls == []
     expected_recovery = (
-        ("turn/steer", "thread-retry", "turn-retry")
+        ("turn/steer", "thread-old", "turn-retry")
         if retry_method == "turn/steer"
         else ("turn/start", "", "")
     )
@@ -3740,7 +5660,7 @@ async def test_send_inputs_to_window_force_new_turn_ignores_cached_active_turn(
 
 
 @pytest.mark.asyncio
-async def test_validate_codex_topic_bindings_clears_invalid_thread_ids(
+async def test_validate_codex_topic_bindings_preserves_invalid_thread_ids(
     mgr: SessionManager,
     monkeypatch,
 ):
@@ -3771,12 +5691,12 @@ async def test_validate_codex_topic_bindings_clears_invalid_thread_ids(
 
     summary = await mgr.validate_codex_topic_bindings()
 
-    assert summary == {"checked": 1, "invalid": 1, "repaired": 1}
+    assert summary == {"checked": 1, "invalid": 1, "repaired": 0}
     binding = mgr.resolve_topic_binding(100, 7)
     assert binding is not None
-    assert binding.codex_thread_id == ""
-    assert mgr.get_window_state("@900000").codex_thread_id == ""
-    assert mgr.get_window_state("@900000").codex_active_turn_id == ""
+    assert binding.codex_thread_id == "thread-dead"
+    assert mgr.get_window_state("@900000").codex_thread_id == "thread-dead"
+    assert mgr.get_window_state("@900000").codex_active_turn_id == "turn-1"
 
 
 @pytest.mark.asyncio
@@ -3822,6 +5742,18 @@ def test_normalize_app_server_inputs_splits_large_text(mgr: SessionManager):
     assert "".join(str(item.get("text", "")) for item in normalized) == text
 
 
+def _bind_test_codex_thread(mgr: SessionManager) -> None:
+    """Give context-injection fixtures a realistic pre-existing thread."""
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=5,
+        codex_thread_id="thread-5",
+        window_id="@1",
+        cwd="/tmp/project",
+        display_name="project",
+    )
+
+
 def test_thread_skills_roundtrip_and_unbind_cleanup(mgr: SessionManager):
     mgr.bind_thread(100, 5, "@1")
     mgr.set_thread_skills(100, 5, ["demo", "Demo", "", "ops"])
@@ -3851,6 +5783,7 @@ async def test_send_topic_text_to_window_injects_app_context_for_app_server(
     monkeypatch.setattr(session_mod.config, "apps_paths", [app_root])
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
     mgr.bind_thread(100, 5, "@1")
+    _bind_test_codex_thread(mgr)
     mgr.set_thread_skills(100, 5, ["demo"])
 
     captured: dict[str, object] = {}
@@ -3861,6 +5794,7 @@ async def test_send_topic_text_to_window_injects_app_context_for_app_server(
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -3895,6 +5829,7 @@ async def test_send_topic_text_to_window_injects_live_goal_context_for_plain_goa
 ):
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
     mgr.bind_thread(100, 5, "@1")
+    _bind_test_codex_thread(mgr)
 
     captured: dict[str, object] = {}
 
@@ -3907,6 +5842,7 @@ async def test_send_topic_text_to_window_injects_live_goal_context_for_plain_goa
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -3966,6 +5902,7 @@ async def test_send_topic_text_to_window_uses_codex_skill_inputs_for_app_server(
     monkeypatch.setattr(session_mod.config, "codex_skills_paths", [codex_root])
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
     mgr.bind_thread(100, 5, "@1")
+    _bind_test_codex_thread(mgr)
     mgr.set_thread_codex_skills(100, 5, ["reviewer"])
 
     captured: dict[str, object] = {}
@@ -3976,6 +5913,7 @@ async def test_send_topic_text_to_window_uses_codex_skill_inputs_for_app_server(
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -4020,6 +5958,7 @@ async def test_send_topic_text_to_window_injects_live_goal_context_into_app_serv
     monkeypatch.setattr(session_mod.config, "codex_skills_paths", [codex_root])
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
     mgr.bind_thread(100, 5, "@1")
+    _bind_test_codex_thread(mgr)
     mgr.set_thread_codex_skills(100, 5, ["reviewer"])
 
     captured: dict[str, object] = {}
@@ -4033,6 +5972,7 @@ async def test_send_topic_text_to_window_injects_live_goal_context_into_app_serv
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -4089,6 +6029,7 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
     monkeypatch.setattr(session_mod.config, "codex_skills_paths", [codex_root])
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: False)
     mgr.bind_thread(100, 5, "@1")
+    _bind_test_codex_thread(mgr)
     mgr.set_thread_skills(100, 5, ["demo"])
     mgr.set_thread_codex_skills(100, 5, ["reviewer"])
 
@@ -4100,6 +6041,7 @@ async def test_send_topic_text_to_window_injects_legacy_skill_context(
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["text"] = text
@@ -4155,16 +6097,16 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_app_s
         ],
     )
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
-    mgr.bind_thread(100, 5, "@1")
+    mgr.bind_thread(100, 1, "@1")
     mgr.bind_thread(100, 8, "@8")
     mgr.bind_thread(100, 9, "@9")
     mgr.bind_topic_to_codex_thread(
         user_id=100,
-        thread_id=5,
+        thread_id=1,
         chat_id=-100123,
-        codex_thread_id="thread-5",
+        codex_thread_id="thread-1",
         window_id="@1",
-        cwd="/env/_coco/chat-100123-thread-5",
+        cwd="/env/_coco/chat-100123-thread-1",
         display_name="coco-control",
     )
     mgr.bind_topic_to_codex_thread(
@@ -4187,7 +6129,7 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_app_s
         cwd="/env/bottleshot",
         display_name="bottleshot",
     )
-    mgr.set_coco_control_topic(100, 5, chat_id=-100123)
+    mgr.set_coco_control_topic(100, 1, chat_id=-100123)
     mgr.set_topic_sync_mode(100, 8, session_mod.TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL, chat_id=-100123)
     mgr.set_topic_response_mode(100, 8, chat_id=-100123, response_mode="voice")
     mgr.set_window_codex_active_turn_id("@8", "turn-8")
@@ -4200,6 +6142,7 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_app_s
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -4211,7 +6154,7 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_app_s
 
     ok, _msg = await mgr.send_topic_text_to_window(
         user_id=100,
-        thread_id=5,
+        thread_id=1,
         chat_id=-100123,
         window_id="@1",
         text="What is happening right now?",
@@ -4262,15 +6205,15 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_legac
         ],
     )
     monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: False)
-    mgr.bind_thread(100, 5, "@1")
+    mgr.bind_thread(100, 1, "@1")
     mgr.bind_thread(100, 8, "@8")
     mgr.bind_topic_to_codex_thread(
         user_id=100,
-        thread_id=5,
+        thread_id=1,
         chat_id=-100123,
-        codex_thread_id="thread-5",
+        codex_thread_id="thread-1",
         window_id="@1",
-        cwd="/env/_coco/chat-100123-thread-5",
+        cwd="/env/_coco/chat-100123-thread-1",
         display_name="coco-control",
     )
     mgr.bind_topic_to_codex_thread(
@@ -4282,7 +6225,7 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_legac
         cwd="/env/fmwblog",
         display_name="fmwblog",
     )
-    mgr.set_coco_control_topic(100, 5, chat_id=-100123)
+    mgr.set_coco_control_topic(100, 1, chat_id=-100123)
     mgr.set_topic_response_mode(100, 8, chat_id=-100123, response_mode="voice")
 
     captured: dict[str, object] = {}
@@ -4293,6 +6236,7 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_legac
         *,
         steer: bool = False,
         force_new_turn: bool = False,
+        **_kwargs: object,
     ):
         _ = steer
         _ = force_new_turn
@@ -4304,7 +6248,7 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_legac
 
     ok, _msg = await mgr.send_topic_text_to_window(
         user_id=100,
-        thread_id=5,
+        thread_id=1,
         chat_id=-100123,
         window_id="@1",
         text="Summarize the active topics.",
@@ -4319,3 +6263,530 @@ async def test_send_topic_text_to_window_injects_coco_operator_context_for_legac
     assert "Recent visible activity:" in injected
     assert "fmwblog: User: The PDF flow is still broken | CoCo: I’m tracing the document handler now." in injected
     assert injected.endswith("Summarize the active topics.")
+
+
+@pytest.mark.asyncio
+async def test_send_topic_text_to_window_uses_persisted_cwd_for_empty_canonical_thread(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A new-thread send must not create a session in a stale window cwd."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    window_id = "@920001"
+    state = mgr.get_window_state(window_id)
+    state.cwd = "/workspace/canonical"
+    state.window_name = "demo"
+    mgr.bind_thread(100, 1, window_id, window_name="demo")
+    binding = mgr._get_persisted_topic_binding(100, 1)
+    assert binding is not None
+    assert binding.codex_thread_id == ""
+    assert binding.cwd == "/workspace/canonical"
+
+    # Simulate a stale cache after the topic's canonical binding was persisted.
+    state.cwd = "/workspace/stale-cache"
+    dispatched_cwds: list[str] = []
+
+    async def _send_inputs_via_codex_app_server(
+        *,
+        window_id: str,
+        inputs: list[dict[str, object]],
+        steer: bool,
+        force_new_turn: bool,
+        window_name: str,
+        cwd: str,
+        **_kwargs: object,
+    ) -> tuple[bool, str]:
+        _ = window_id, inputs, steer, force_new_turn, window_name
+        dispatched_cwds.append(cwd)
+        return True, "stale-cwd dispatch"
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+
+    ok, _message = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=1,
+        window_id=window_id,
+        text="start this topic",
+    )
+
+    # A safe implementation either refuses the contradictory cache or sends
+    # with the persisted cwd; it must never dispatch in the stale directory.
+    assert not dispatched_cwds or dispatched_cwds == ["/workspace/canonical"]
+    assert ok is False or dispatched_cwds == ["/workspace/canonical"]
+
+
+@pytest.mark.asyncio
+async def test_local_topic_send_commits_new_thread_before_first_turn_dispatch(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A first prompt may create its canonical thread and still dispatch."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "",
+    )
+
+    window_id = "@920007"
+    state = mgr.get_window_state(window_id)
+    state.cwd = "/workspace/canonical"
+    state.window_name = "demo"
+    mgr.bind_thread(100, 7, window_id, window_name="demo")
+    binding = mgr._get_persisted_topic_binding(100, 7)
+    assert binding is not None
+    assert binding.codex_thread_id == ""
+    assert binding.cwd == "/workspace/canonical"
+
+    # The raw topic binding is authoritative even if the mutable window cache
+    # has since drifted to another workspace.
+    state.cwd = "/workspace/stale-cache"
+    thread_start_calls: list[dict[str, object]] = []
+    turn_start_calls: list[dict[str, object]] = []
+
+    async def _thread_start(**kwargs: object) -> dict[str, object]:
+        thread_start_calls.append(kwargs)
+        return {"thread": {"id": "thread-920007"}}
+
+    async def _turn_start(**kwargs: object) -> dict[str, object]:
+        turn_start_calls.append(kwargs)
+        return {"turn": {"id": "turn-920007"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_start",
+        _thread_start,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=100,
+        thread_id=7,
+        window_id=window_id,
+        text="start this topic",
+    )
+
+    assert ok is True, message
+    assert [call["cwd"] for call in thread_start_calls] == [
+        "/workspace/canonical"
+    ]
+    assert [call["thread_id"] for call in turn_start_calls] == ["thread-920007"]
+    assert mgr.get_window_codex_thread_id(window_id) == "thread-920007"
+    binding = mgr._get_persisted_topic_binding(100, 7)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-920007"
+    assert mgr.get_window_state(window_id).cwd == "/workspace/canonical"
+
+
+@pytest.mark.asyncio
+async def test_local_topic_send_drops_stale_thread_after_rebind_during_thread_start(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A stale first-thread result cannot overwrite an explicit rebind."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    old_window_id = "@920008"
+    old_state = mgr.get_window_state(old_window_id)
+    old_state.cwd = "/workspace/old"
+    old_state.window_name = "old"
+    mgr.bind_thread(100, 8, old_window_id, window_name="old")
+    old_binding = mgr._get_persisted_topic_binding(100, 8)
+    assert old_binding is not None
+    assert old_binding.codex_thread_id == ""
+    assert old_binding.cwd == "/workspace/old"
+
+    thread_start_started = asyncio.Event()
+    release_thread_start = asyncio.Event()
+    turn_start_calls: list[dict[str, object]] = []
+
+    async def _thread_start(**_kwargs: object) -> dict[str, object]:
+        thread_start_started.set()
+        await release_thread_start.wait()
+        return {"thread": {"id": "stale-thread-920008"}}
+
+    async def _turn_start(**kwargs: object) -> dict[str, object]:
+        turn_start_calls.append(kwargs)
+        return {"turn": {"id": "unexpected-turn"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_start",
+        _thread_start,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+
+    task = asyncio.create_task(
+        mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=8,
+            window_id=old_window_id,
+            text="start this topic",
+        )
+    )
+    await asyncio.wait_for(thread_start_started.wait(), timeout=1)
+
+    # /folder or /resume may explicitly move the topic while the implicit
+    # first-thread request is waiting on app-server thread/start.
+    new_window_id = "@920009"
+    new_state = mgr.get_window_state(new_window_id)
+    new_state.cwd = "/workspace/new"
+    new_state.window_name = "new"
+    mgr.bind_thread(100, 8, new_window_id, window_name="new")
+
+    release_thread_start.set()
+    ok, message = await task
+
+    assert ok is False
+    assert message
+    assert turn_start_calls == []
+    binding = mgr._get_persisted_topic_binding(100, 8)
+    assert binding is not None
+    assert binding.window_id == new_window_id
+    assert binding.cwd == "/workspace/new"
+    assert binding.codex_thread_id == ""
+    assert mgr.get_window_codex_thread_id(old_window_id) == ""
+    assert mgr.get_window_codex_thread_id(new_window_id) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("steer", [False, True])
+async def test_local_topic_send_drops_success_after_rebind_during_turn_dispatch(
+    mgr: SessionManager,
+    monkeypatch,
+    steer: bool,
+) -> None:
+    """A local turn result cannot be applied after the topic moves ownership."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    old_window_id = "@920002"
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=2,
+        codex_thread_id="thread-a",
+        window_id=old_window_id,
+        cwd="/workspace/a",
+        display_name="a",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    if steer:
+        mgr.set_window_codex_active_turn_id(old_window_id, "turn-before")
+
+    async def _ensure_codex_thread_for_window(**_kwargs: object) -> tuple[str, str]:
+        return "thread-a", "on-request"
+
+    monkeypatch.setattr(
+        mgr,
+        "_ensure_codex_thread_for_window",
+        _ensure_codex_thread_for_window,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/workspace/a", True)),
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "",
+    )
+
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+
+    if steer:
+
+        async def _turn_steer(**kwargs: object) -> dict[str, object]:
+            assert kwargs["thread_id"] == "thread-a"
+            assert kwargs["expected_turn_id"] == "turn-before"
+            dispatch_started.set()
+            await release_dispatch.wait()
+            return {"turnId": "turn-a-after-rebind"}
+
+        monkeypatch.setattr(
+            session_mod.codex_app_server_client,
+            "turn_steer",
+            _turn_steer,
+        )
+    else:
+
+        async def _turn_start(**kwargs: object) -> dict[str, object]:
+            assert kwargs["thread_id"] == "thread-a"
+            dispatch_started.set()
+            await release_dispatch.wait()
+            return {"turn": {"id": "turn-a-after-rebind"}}
+
+        monkeypatch.setattr(
+            session_mod.codex_app_server_client,
+            "turn_start",
+            _turn_start,
+        )
+
+    marked_live: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        mgr,
+        "mark_topic_telegram_live",
+        lambda **kwargs: marked_live.append(kwargs),
+    )
+
+    task = asyncio.create_task(
+        mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=2,
+            window_id=old_window_id,
+            text="continue topic",
+            steer=steer,
+        )
+    )
+    await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=2,
+        codex_thread_id="thread-b",
+        window_id="@920003",
+        cwd="/workspace/b",
+        display_name="b",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    release_dispatch.set()
+    ok, message = await task
+
+    assert ok is False
+    assert message
+    assert marked_live == []
+    assert mgr.get_window_codex_active_turn_id(old_window_id) != "turn-a-after-rebind"
+    binding = mgr._get_persisted_topic_binding(100, 2)
+    assert binding is not None
+    assert (binding.window_id, binding.codex_thread_id, binding.cwd) == (
+        "@920003",
+        "thread-b",
+        "/workspace/b",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_goal_context", [False, True])
+async def test_remote_topic_send_rejects_ack_after_full_binding_rebind(
+    mgr: SessionManager,
+    monkeypatch,
+    with_goal_context: bool,
+) -> None:
+    """Remote ACKs must still belong to the same window/machine/cwd binding."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=3,
+        codex_thread_id="thread-shared",
+        window_id="@920004",
+        cwd="/workspace/a",
+        display_name="a",
+        machine_id="remote-a",
+        machine_display_name="Remote A",
+    )
+
+    if with_goal_context:
+
+        async def _build_live_goal_context(**_kwargs: object) -> str:
+            return "[coco goal context] live"
+
+        monkeypatch.setattr(mgr, "_build_live_goal_context", _build_live_goal_context)
+
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def _send_inputs(machine_id: str, **kwargs: object) -> dict[str, object]:
+        assert machine_id == "remote-a"
+        assert kwargs["window_id"] == "@920004"
+        assert kwargs["thread_id"] == "thread-shared"
+        send_started.set()
+        await release_send.wait()
+        return {
+            "ok": True,
+            "message": "stale remote acknowledgement",
+            "thread_id": "thread-shared",
+            "turn_id": "turn-a",
+            "transport_epoch": "agent-epoch-a",
+            "transport_epoch_started_at": 100.0,
+            "transport_generation": 1,
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+    marked_live: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        mgr,
+        "mark_topic_telegram_live",
+        lambda **kwargs: marked_live.append(kwargs),
+    )
+
+    task = asyncio.create_task(
+        mgr.send_topic_text_to_window(
+            user_id=100,
+            thread_id=3,
+            window_id="@920004",
+            text="continue remote topic",
+        )
+    )
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+
+    # Keep the same Codex thread but move every other ownership coordinate.
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=3,
+        codex_thread_id="thread-shared",
+        window_id="@920005",
+        cwd="/workspace/b",
+        display_name="b",
+        machine_id="remote-b",
+        machine_display_name="Remote B",
+    )
+    release_send.set()
+    ok, message = await task
+
+    assert ok is False
+    assert message
+    assert marked_live == []
+    assert mgr.get_window_codex_active_turn_id("@920004") == ""
+    binding = mgr._get_persisted_topic_binding(100, 3)
+    assert binding is not None
+    assert (binding.window_id, binding.codex_thread_id, binding.machine_id, binding.cwd) == (
+        "@920005",
+        "thread-shared",
+        "remote-b",
+        "/workspace/b",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_kind", ["missing", "no_active"])
+async def test_send_inputs_to_window_validates_owner_before_recovery_after_rebind(
+    mgr: SessionManager,
+    monkeypatch,
+    error_kind: str,
+) -> None:
+    """A's failure must not clear or retry B after a same-window rebind."""
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    window_id = "@920006"
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=4,
+        codex_thread_id="thread-a",
+        window_id=window_id,
+        cwd="/workspace/a",
+        display_name="a",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    mgr.set_window_codex_active_turn_id(window_id, "turn-a")
+
+    dispatch_started = asyncio.Event()
+    release_failure = asyncio.Event()
+    attempts = 0
+
+    async def _send_inputs_via_codex_app_server(**_kwargs: object) -> tuple[bool, str]:
+        nonlocal attempts
+        attempts += 1
+        dispatch_started.set()
+        await release_failure.wait()
+        if error_kind == "missing":
+            raise session_mod.CodexAppServerError("thread not found: thread-a")
+        raise session_mod.CodexAppServerError("no active turn to steer")
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+
+    resume_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        resume_calls.append((window_id, cwd, thread_id))
+        return thread_id
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    clear_calls: list[str] = []
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "clear_active_turn",
+        lambda thread_id: clear_calls.append(thread_id),
+    )
+
+    task = asyncio.create_task(
+        mgr.send_inputs_to_window(
+            window_id,
+            [{"type": "text", "text": "continue"}],
+            steer=error_kind == "no_active",
+        )
+    )
+    await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+
+    mgr.bind_topic_to_codex_thread(
+        user_id=100,
+        thread_id=4,
+        codex_thread_id="thread-b",
+        window_id=window_id,
+        cwd="/workspace/b",
+        display_name="b",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    mgr.set_window_codex_active_turn_id(window_id, "turn-b")
+    release_failure.set()
+    ok, message = await task
+
+    assert ok is False
+    assert message
+    assert attempts == 1
+    assert resume_calls == []
+    assert clear_calls == []
+    state = mgr.get_window_state(window_id)
+    assert (state.codex_thread_id, state.cwd, state.codex_active_turn_id) == (
+        "thread-b",
+        "/workspace/b",
+        "turn-b",
+    )

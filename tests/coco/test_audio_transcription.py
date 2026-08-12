@@ -210,6 +210,67 @@ async def test_audio_handler_coco_control_voice_skips_transcript_echo_and_inject
 
 
 @pytest.mark.asyncio
+async def test_audio_handler_activates_general_control_before_classifying_voice(
+    monkeypatch,
+    tmp_path,
+):
+    update, tg_file = _make_voice_update()
+    update.message.message_thread_id = None
+    update.effective_chat.is_forum = True
+    context = SimpleNamespace(bot=object(), user_data={})
+    activated = False
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot,
+        "begin_transcription_bootstrap",
+        lambda profile="": None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot,
+        "transcribe_audio_file",
+        lambda _path, *, profile="": "control status",
+        raising=False,
+    )
+
+    def _activate(**_kwargs):
+        nonlocal activated
+        activated = True
+
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", _activate)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda _uid, tid, *, chat_id=None: (
+            activated and tid == 1 and chat_id == -100123
+        ),
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward)
+
+    await bot.audio_handler(update, context)
+
+    assert len(tg_file.paths) == 1
+    assert activated is True
+    assert replies == []
+    assert forwarded[0]["thread_id"] == 1
+    assert forwarded[0]["persist_response_mode"] is False
+    assert "[coco voice note]" in str(forwarded[0]["text"])
+
+
+@pytest.mark.asyncio
 async def test_audio_handler_replies_when_transcription_fails(monkeypatch, tmp_path):
     update, tg_file = _make_voice_update()
     context = SimpleNamespace(bot=object(), user_data={})

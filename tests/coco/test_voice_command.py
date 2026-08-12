@@ -7,8 +7,14 @@ import pytest
 import coco.bot as bot
 
 
-def _make_update(text: str, *, thread_id: int = 77, user_id: int = 1147817421):
-    chat = SimpleNamespace(type="supergroup", id=-100123)
+def _make_update(
+    text: str,
+    *,
+    thread_id: int = 77,
+    user_id: int = 1147817421,
+    is_forum: bool = False,
+):
+    chat = SimpleNamespace(type="supergroup", id=-100123, is_forum=is_forum)
     message = SimpleNamespace(
         text=text,
         message_thread_id=thread_id,
@@ -73,6 +79,47 @@ async def test_voice_command_turns_voice_on(monkeypatch):
     assert replies == [
         "✅ Voice replies are now `ON` for this topic.\nCurrent default voice: `F2`\nCurrent default speed: `1.4`"
     ]
+
+
+@pytest.mark.asyncio
+async def test_voice_command_uses_forum_general_topic(monkeypatch):
+    update = _make_update("/voice on", thread_id=None, is_forum=True)
+    replies: list[str] = []
+    set_calls: list[tuple[int, int, int, str]] = []
+    activated: list[tuple[int, int, int | None]] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot, "get_default_tts_voice", lambda: "F2")
+    monkeypatch.setattr(bot, "get_default_tts_speed", lambda: 1.4)
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda *, user_id, thread_id, chat_id: activated.append(
+            (user_id, thread_id, chat_id)
+        ),
+    )
+
+    def _set_topic_response_mode(user_id, thread_id, *, chat_id=None, response_mode=""):
+        set_calls.append((user_id, thread_id, chat_id, response_mode))
+        return True
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        _set_topic_response_mode,
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.voice_command(update, SimpleNamespace(user_data={}))
+
+    assert activated == [(1147817421, 1, -100123)]
+    assert set_calls == [(1147817421, 1, -100123, "voice")]
+    assert replies[0].startswith("✅ Voice replies are now `ON`")
 
 
 @pytest.mark.asyncio

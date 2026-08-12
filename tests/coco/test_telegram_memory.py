@@ -136,3 +136,39 @@ async def test_inbound_update_probe_logs_visible_caption(monkeypatch):
     assert captured[0]["kind"] == "message"
     assert captured[0]["text"] == "nvidia done"
     assert captured[0]["chat_id"] == -100123
+
+
+@pytest.mark.asyncio
+async def test_inbound_update_probe_normalizes_forum_general_topic(monkeypatch):
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        bot,
+        "log_incoming_message",
+        lambda **kwargs: captured.append(kwargs),
+    )
+
+    chat = SimpleNamespace(type="supergroup", id=-100123, is_forum=True)
+    msg = SimpleNamespace(
+        text="control status",
+        caption=None,
+        chat=chat,
+        chat_id=chat.id,
+        message_thread_id=None,
+        from_user=SimpleNamespace(id=1147817421),
+        sender_chat=None,
+        message_id=1000,
+        new_chat_members=[],
+        left_chat_member=None,
+    )
+    update = SimpleNamespace(
+        effective_message=msg,
+        effective_chat=chat,
+        channel_post=None,
+        message=msg,
+        edited_channel_post=None,
+        edited_message=None,
+    )
+
+    await bot.inbound_update_probe(update, SimpleNamespace())
+
+    assert captured[0]["thread_id"] == 1

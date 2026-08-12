@@ -8,6 +8,44 @@ import coco.bot as bot
 from coco.session_monitor import NewMessage
 
 
+def _patch_current_topic_ownership(
+    monkeypatch,
+    *,
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+    window_id: str,
+    codex_thread_id: str,
+) -> None:
+    expected_chat_id = chat_id
+    binding = SimpleNamespace(
+        window_id=window_id,
+        codex_thread_id=codex_thread_id,
+        machine_id="test-machine",
+        cwd="/tmp/test-workspace",
+    )
+
+    def _get_persisted_topic_binding(
+        requested_user_id: int,
+        requested_thread_id: int,
+        *,
+        chat_id: int | None = None,
+    ):
+        if (requested_user_id, requested_thread_id, chat_id) == (
+            user_id,
+            thread_id,
+            expected_chat_id,
+        ):
+            return binding
+        return None
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "_get_persisted_topic_binding",
+        _get_persisted_topic_binding,
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_new_message_stops_looper_on_completion_keyword(monkeypatch):
     events: list[str] = []
@@ -21,6 +59,14 @@ async def test_handle_new_message_stops_looper_on_completion_keyword(monkeypatch
     )
 
     monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    _patch_current_topic_ownership(
+        monkeypatch,
+        user_id=1,
+        thread_id=10,
+        chat_id=None,
+        window_id="@1",
+        codex_thread_id="session-1",
+    )
 
     async def _find_users_for_session(_session_id: str):
         return [(1, None, "@1", 10)]
@@ -88,6 +134,14 @@ async def test_handle_new_message_progress_skips_read_offset_updates(monkeypatch
     )
 
     monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: False)
+    _patch_current_topic_ownership(
+        monkeypatch,
+        user_id=1,
+        thread_id=20,
+        chat_id=None,
+        window_id="@2",
+        codex_thread_id="session-2",
+    )
 
     async def _find_users_for_session(_session_id: str):
         return [(1, None, "@2", 20)]

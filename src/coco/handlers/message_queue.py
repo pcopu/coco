@@ -29,7 +29,7 @@ from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
 from ..markdown_v2 import convert_markdown
-from ..session import session_manager
+from ..session import TopicOwnership, session_manager
 from ..telegram_memory import log_outgoing_edit
 from ..transcript_parser import TranscriptParser
 from .message_sender import (
@@ -76,8 +76,25 @@ class MessageTask:
     # Snapshot of the topic delivery generation at first enqueue. Cancellation
     # advances the generation so already-dequeued/retried work becomes stale.
     delivery_generation: int | None = None
+    # Canonical raw topic ownership captured when source output was enqueued.
+    # A later explicit lifecycle rebind invalidates this task even when the
+    # Telegram topic ID itself is unchanged.
+    topic_ownership: "TopicOwnership | None" = None
     # For progress_finalize tasks: "full" keeps accumulated body, "compact" keeps marker only.
     finalize_mode: str = "full"
+
+
+@dataclass(frozen=True)
+class QueuedTopicInput:
+    """One queued user input plus the topic owner that accepted it."""
+
+    text: str
+    source_chat_id: int
+    source_message_id: int
+    topic_ownership: TopicOwnership | None = None
+
+    def legacy_tuple(self) -> tuple[str, int, int]:
+        return (self.text, self.source_chat_id, self.source_message_id)
 
 
 # Per-user message queues and worker tasks
@@ -117,6 +134,12 @@ def _put_queued_task(
     task: MessageTask,
 ) -> None:
     """Put a new semantic task in the queue and update the topic index."""
+    if task.thread_id is not None and task.topic_ownership is None:
+        task.topic_ownership = capture_topic_ownership(
+            user_id,
+            task.thread_id,
+            task.chat_id,
+        )
     if task.delivery_generation is None:
         topic_key = (user_id, task.chat_id or 0, task.thread_id or 0)
         task.delivery_generation = _topic_delivery_generations.get(topic_key, 0)
@@ -128,7 +151,60 @@ def is_task_delivery_current(user_id: int, task: MessageTask) -> bool:
     """Return whether a queued/dequeued task predates topic cancellation."""
     topic_key = (user_id, task.chat_id or 0, task.thread_id or 0)
     current = _topic_delivery_generations.get(topic_key, 0)
-    return task.delivery_generation is None or task.delivery_generation == current
+    generation_is_current = (
+        task.delivery_generation is None or task.delivery_generation == current
+    )
+    return generation_is_current and is_topic_ownership_current(
+        user_id,
+        task.thread_id,
+        task.chat_id,
+        task.topic_ownership,
+    )
+
+
+def capture_topic_ownership(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> TopicOwnership | None:
+    """Snapshot raw persisted ownership for later queue/delivery fencing."""
+    if thread_id is None:
+        return None
+    binding = session_manager._get_persisted_topic_binding(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    if binding is None:
+        return None
+    return TopicOwnership(
+        window_id=binding.window_id.strip(),
+        codex_thread_id=binding.codex_thread_id.strip(),
+        machine_id=binding.machine_id.strip(),
+        cwd=binding.cwd.strip(),
+    )
+
+
+def is_topic_ownership_current(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    ownership: TopicOwnership | None,
+) -> bool:
+    """Return whether a queued item still belongs to its captured topic owner."""
+    if ownership is None:
+        return thread_id is None
+    if thread_id is None:
+        return False
+    return session_manager._topic_binding_ownership_matches(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+        window_id=ownership.window_id,
+        codex_thread_id=ownership.codex_thread_id,
+        machine_id=ownership.machine_id,
+        cwd=ownership.cwd,
+    )
 
 
 def _resolve_task_chat_id(user_id: int, task: MessageTask) -> int:
@@ -155,8 +231,8 @@ _progress_msg_info: dict[tuple[int, int, int], tuple[int, str, str]] = {}
 _progress_text_cache: dict[tuple[int, int, int], tuple[str, str]] = {}
 
 # Queued user inputs for /q:
-# (user_id, thread_id_or_0) -> [(text, source_chat_id, source_message_id), ...]
-_queued_topic_inputs: dict[tuple[int, int, int], list[tuple[str, int, int]]] = {}
+# (user_id, chat_id_or_0, thread_id_or_0) -> queued user inputs
+_queued_topic_inputs: dict[tuple[int, int, int], list[QueuedTopicInput]] = {}
 # Queue dock tracking: (user_id, thread_id_or_0) -> (message_id, last_text)
 _queue_dock_msg_info: dict[tuple[int, int, int], tuple[int, str]] = {}
 
@@ -264,7 +340,7 @@ def _queue_item_preview(text: str, *, limit: int = QUEUE_DOCK_PREVIEW_LIMIT) -> 
 
 
 def _build_queue_dock_text(
-    pending_items: list[tuple[str, int, int]],
+    pending_items: list[QueuedTopicInput | tuple[str, int, int]],
     *,
     window_id: str | None = None,
 ) -> str:
@@ -273,11 +349,12 @@ def _build_queue_dock_text(
     heading = "⏳ Queue" if count <= 1 else f"⏳ Queue ({count})"
     lines = [heading]
 
-    for idx, (text, _chat_id, _message_id) in enumerate(
+    for idx, item in enumerate(
         pending_items[:QUEUE_DOCK_MAX_VISIBLE_ITEMS],
         start=1,
     ):
-        lines.append(f"{idx}. {_queue_item_preview(text)}")
+        item_text = item.text if isinstance(item, QueuedTopicInput) else item[0]
+        lines.append(f"{idx}. {_queue_item_preview(item_text)}")
 
     remaining = count - QUEUE_DOCK_MAX_VISIBLE_ITEMS
     if remaining > 0:
@@ -545,6 +622,8 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
     if base.delivery_generation != candidate.delivery_generation:
         return False
+    if base.topic_ownership != candidate.topic_ownership:
+        return False
     if (base.chat_id or 0) != (candidate.chat_id or 0):
         return False
     if base.window_id != candidate.window_id:
@@ -637,6 +716,7 @@ async def _merge_content_tasks(
             video_data=first.video_data,
             response_mode_override=first.response_mode_override,
             delivery_generation=first.delivery_generation,
+            topic_ownership=first.topic_ownership,
         ),
         merge_count,
     )
@@ -958,6 +1038,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             await _do_clear_status_message(
                 bot, user_id, tid, chat_id=task.chat_id
             )
+            if not is_task_delivery_current(user_id, task):
+                return
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
             try:
@@ -968,6 +1050,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     parse_mode="MarkdownV2",
                     link_preview_options=NO_LINK_PREVIEW,
                 )
+                if not is_task_delivery_current(user_id, task):
+                    return
                 log_outgoing_edit(
                     text=full_text,
                     chat_id=chat_id,
@@ -1006,6 +1090,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         text=plain_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
+                    if not is_task_delivery_current(user_id, task):
+                        return
                     log_outgoing_edit(
                         text=plain_text,
                         chat_id=chat_id,
@@ -1030,6 +1116,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     raise
                 except Exception:
                     logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
+                    if not is_task_delivery_current(user_id, task):
+                        return
                     # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
@@ -1095,6 +1183,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 part,
                 chat_id=task.chat_id,
             )
+            if not is_task_delivery_current(user_id, task):
+                return
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
                 continue
@@ -1700,6 +1790,7 @@ async def enqueue_content_message(
     document_data: list[tuple[str, bytes]] | None = None,
     video_data: list[tuple[str, bytes]] | None = None,
     response_mode_override: str = "",
+    topic_ownership: TopicOwnership | None = None,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -1723,6 +1814,11 @@ async def enqueue_content_message(
         document_data=document_data,
         video_data=video_data,
         response_mode_override=response_mode_override,
+        topic_ownership=(
+            topic_ownership
+            if topic_ownership is not None
+            else capture_topic_ownership(user_id, thread_id, chat_id)
+        ),
     )
     _put_queued_task(user_id, queue, task)
 
@@ -1756,6 +1852,7 @@ async def enqueue_status_update(
             return
 
     queue = get_or_create_queue(bot, user_id)
+    topic_ownership = capture_topic_ownership(user_id, thread_id, chat_id)
 
     if status_text:
         task = MessageTask(
@@ -1764,6 +1861,7 @@ async def enqueue_status_update(
             window_id=window_id,
             thread_id=thread_id,
             chat_id=chat_id,
+            topic_ownership=topic_ownership,
         )
     else:
         task = MessageTask(
@@ -1771,6 +1869,7 @@ async def enqueue_status_update(
             window_id=window_id,
             thread_id=thread_id,
             chat_id=chat_id,
+            topic_ownership=topic_ownership,
         )
 
     _put_queued_task(user_id, queue, task)
@@ -1801,12 +1900,14 @@ async def enqueue_progress_update(
     )
     queue = get_or_create_queue(bot, user_id)
     lock = _queue_locks[user_id]
+    topic_ownership = capture_topic_ownership(user_id, thread_id, chat_id)
     task = MessageTask(
         task_type="progress_update",
         text=progress_text,
         window_id=window_id,
         thread_id=thread_id,
         chat_id=chat_id,
+        topic_ownership=topic_ownership,
     )
     await _enqueue_progress_update_coalesced(queue, lock, user_id=user_id, task=task)
 
@@ -1829,6 +1930,7 @@ async def enqueue_progress_start(
         window_id=window_id,
         thread_id=thread_id,
         chat_id=chat_id,
+        topic_ownership=capture_topic_ownership(user_id, thread_id, chat_id),
     )
     _put_queued_task(user_id, queue, task)
 
@@ -1843,7 +1945,10 @@ async def enqueue_progress_clear(
     _clear_progress_text_cache(user_id, thread_id, chat_id)
     queue = get_or_create_queue(bot, user_id)
     task = MessageTask(
-        task_type="progress_clear", thread_id=thread_id, chat_id=chat_id
+        task_type="progress_clear",
+        thread_id=thread_id,
+        chat_id=chat_id,
+        topic_ownership=capture_topic_ownership(user_id, thread_id, chat_id),
     )
     _put_queued_task(user_id, queue, task)
 
@@ -1865,6 +1970,7 @@ async def enqueue_progress_finalize(
         thread_id=thread_id,
         chat_id=chat_id,
         finalize_mode="compact" if compact else "full",
+        topic_ownership=capture_topic_ownership(user_id, thread_id, chat_id),
     )
     _put_queued_task(user_id, queue, task)
 
@@ -1922,6 +2028,8 @@ def enqueue_queued_topic_input(
     text: str,
     source_chat_id: int,
     source_message_id: int,
+    *,
+    topic_ownership: TopicOwnership | None = None,
 ) -> int:
     """Queue a /q input for dispatch after the current run completes.
 
@@ -1929,7 +2037,18 @@ def enqueue_queued_topic_input(
     """
     skey = _topic_key(user_id, thread_id, source_chat_id)
     bucket = _queued_topic_inputs.setdefault(skey, [])
-    bucket.append((text, source_chat_id, source_message_id))
+    bucket.append(
+        QueuedTopicInput(
+            text=text,
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            topic_ownership=(
+                topic_ownership
+                if topic_ownership is not None
+                else capture_topic_ownership(user_id, thread_id, source_chat_id)
+            ),
+        )
+    )
     return len(bucket)
 
 
@@ -1939,6 +2058,8 @@ def prepend_queued_topic_input(
     text: str,
     source_chat_id: int,
     source_message_id: int,
+    *,
+    topic_ownership: TopicOwnership | None = None,
 ) -> int:
     """Put one /q item back at the front of the topic queue.
 
@@ -1946,7 +2067,19 @@ def prepend_queued_topic_input(
     """
     skey = _topic_key(user_id, thread_id, source_chat_id)
     bucket = _queued_topic_inputs.setdefault(skey, [])
-    bucket.insert(0, (text, source_chat_id, source_message_id))
+    bucket.insert(
+        0,
+        QueuedTopicInput(
+            text=text,
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            topic_ownership=(
+                topic_ownership
+                if topic_ownership is not None
+                else capture_topic_ownership(user_id, thread_id, source_chat_id)
+            ),
+        ),
+    )
     return len(bucket)
 
 
@@ -1957,7 +2090,29 @@ def get_queued_topic_input_snapshot(
 ) -> list[tuple[str, int, int]]:
     """Return a shallow copy of queued /q items for a topic."""
     skey = _topic_key(user_id, thread_id, chat_id)
-    return list(_queued_topic_inputs.get(skey, []))
+    return [
+        item.legacy_tuple() if isinstance(item, QueuedTopicInput) else item
+        for item in _queued_topic_inputs.get(skey, [])
+    ]
+
+
+def pop_queued_topic_input_with_ownership(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> QueuedTopicInput | None:
+    """Pop the next queued input while preserving its ownership snapshot."""
+    skey = _topic_key(user_id, thread_id, chat_id)
+    bucket = _queued_topic_inputs.get(skey)
+    if not bucket:
+        return None
+    item = bucket.pop(0)
+    if not bucket:
+        _queued_topic_inputs.pop(skey, None)
+    if isinstance(item, QueuedTopicInput):
+        return item
+    text, source_chat_id, source_message_id = item
+    return QueuedTopicInput(text, source_chat_id, source_message_id)
 
 
 def pop_queued_topic_input(
@@ -1966,14 +2121,8 @@ def pop_queued_topic_input(
     chat_id: int | None = None,
 ) -> tuple[str, int, int] | None:
     """Pop the next queued /q input for a topic (FIFO)."""
-    skey = _topic_key(user_id, thread_id, chat_id)
-    bucket = _queued_topic_inputs.get(skey)
-    if not bucket:
-        return None
-    item = bucket.pop(0)
-    if not bucket:
-        _queued_topic_inputs.pop(skey, None)
-    return item
+    item = pop_queued_topic_input_with_ownership(user_id, thread_id, chat_id)
+    return item.legacy_tuple() if item is not None else None
 
 
 def queued_topic_input_count(

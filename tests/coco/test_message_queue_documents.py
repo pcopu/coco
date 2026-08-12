@@ -5,6 +5,15 @@ import pytest
 import coco.handlers.message_queue as mq
 
 
+@pytest.fixture(autouse=True)
+def _current_topic_owner(monkeypatch):
+    monkeypatch.setattr(
+        mq,
+        "is_topic_ownership_current",
+        lambda *_args, **_kwargs: True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_process_content_task_sends_document_attachments(monkeypatch):
     text_sends: list[tuple[int, str, dict[str, object]]] = []
@@ -36,6 +45,7 @@ async def test_process_content_task_sends_document_attachments(monkeypatch):
         parts=["Report attached"],
         content_type="text",
         thread_id=77,
+        topic_ownership=mq.TopicOwnership("@1", "thread-77", "machine", "/tmp"),
         document_data=[("report.pdf", b"%PDF-1.7")],
     )
 
@@ -78,6 +88,7 @@ async def test_process_content_task_sends_video_attachments(monkeypatch):
         parts=["Video attached"],
         content_type="text",
         thread_id=77,
+        topic_ownership=mq.TopicOwnership("@1", "thread-77", "machine", "/tmp"),
         video_data=[("video/mp4", b"MP4DATA")],
     )
 

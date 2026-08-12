@@ -148,6 +148,7 @@ class ClusterRpcClient:
         port: int,
         method: str,
         params: dict[str, Any],
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         reader: asyncio.StreamReader
         writer: asyncio.StreamWriter
@@ -168,6 +169,8 @@ class ClusterRpcClient:
         }
         try:
             writer.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+            if on_dispatch is not None:
+                on_dispatch()
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     await writer.drain()

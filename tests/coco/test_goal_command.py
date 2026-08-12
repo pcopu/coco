@@ -150,6 +150,16 @@ async def test_forward_topic_text_message_sets_goal_directly_for_plain_language_
         lambda *_args, **_kwargs: SimpleNamespace(codex_thread_id="thread-77", cwd="/tmp/proj"),
     )
     monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            window_id="@77",
+            codex_thread_id="thread-77",
+            machine_id="local",
+            cwd="/tmp/proj",
+        ),
+    )
+    monkeypatch.setattr(
         bot.session_manager,
         "set_topic_response_mode",
         lambda *_args, **_kwargs: None,

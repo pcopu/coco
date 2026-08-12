@@ -37,6 +37,50 @@ async def test_send_with_fallback_logs_outgoing_send(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_safe_send_omits_general_topic_id_but_logs_internal_topic(monkeypatch):
+    sent_kwargs: list[dict[str, object]] = []
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        message_sender,
+        "log_outgoing_send",
+        lambda **kwargs: captured.append(kwargs),
+    )
+
+    class _Bot:
+        async def send_message(self, **kwargs):
+            sent_kwargs.append(kwargs)
+            return SimpleNamespace(message_id=322)
+
+    await message_sender.safe_send(
+        _Bot(),
+        chat_id=-1009,
+        text="general status",
+        message_thread_id=1,
+    )
+
+    assert "message_thread_id" not in sent_kwargs[0]
+    assert captured[0]["thread_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_send_photo_omits_general_topic_id():
+    sent_kwargs: list[dict[str, object]] = []
+
+    class _Bot:
+        async def send_photo(self, **kwargs):
+            sent_kwargs.append(kwargs)
+
+    await message_sender.send_photo(
+        _Bot(),
+        chat_id=-1009,
+        image_data=[("image/png", b"PNG")],
+        message_thread_id=1,
+    )
+
+    assert "message_thread_id" not in sent_kwargs[0]
+
+
+@pytest.mark.asyncio
 async def test_send_with_fallback_raises_when_markdown_and_plain_send_fail():
     attempts = 0
 

@@ -26,10 +26,11 @@ import os
 import re
 import shlex
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
 
 import aiofiles
@@ -47,6 +48,8 @@ from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json, env_alias
 
 logger = logging.getLogger(__name__)
+
+GENERAL_TOPIC_THREAD_ID = 1
 
 
 class _CodexAggregateResumeLimitError(CodexAppServerError):
@@ -70,8 +73,45 @@ class _CodexTurnTimeoutError(CodexAppServerError):
         self.turn_id = turn_id.strip()
 
 
+@dataclass
+class TopicSendDispatchState:
+    """Mutable stage marker used to make queued-input replay decisions.
+
+    Once transport dispatch begins, a caller must assume the request may have
+    crossed the write boundary even when the eventual error text is generic.
+    """
+
+    transport_dispatch_started: bool = False
+
+    def mark_transport_dispatch_started(self) -> None:
+        self.transport_dispatch_started = True
+
+
+@dataclass(frozen=True)
+class TopicOwnership:
+    """Immutable identity of one persisted Telegram topic binding."""
+
+    window_id: str
+    codex_thread_id: str
+    machine_id: str
+    cwd: str
+
+
 APP_SERVER_MAX_TEXT_CHARS_PER_INPUT = 3000
 APP_SERVER_TURN_START_TIMEOUT_SECONDS = 20.0
+APP_SERVER_ACTIVE_WRITER_RE = re.compile(
+    r"\b(?:already )?has an active writer\b",
+    re.IGNORECASE,
+)
+APP_SERVER_UNCERTAIN_SEND_RE = re.compile(
+    r"(?:request will not be replayed automatically|"
+    r"uncertain request was not replayed|outcome is uncertain)",
+    re.IGNORECASE,
+)
+APP_SERVER_RESUME_LIMIT_RE = re.compile(
+    r"\btranscripts? exceeds? (?:aggregate )?resume limit\b",
+    re.IGNORECASE,
+)
 APP_SERVER_THREAD_NOT_FOUND_RE = re.compile(r"\bthread not found\b", re.IGNORECASE)
 APP_SERVER_TURN_STEER_TIMEOUT_RE = re.compile(
     r"Timed out waiting for app-server response:\s*turn/steer",
@@ -393,6 +433,17 @@ class CocoControlTopic:
         return cls(user_id=user_id, thread_id=thread_id, chat_id=chat_id)
 
 
+@dataclass(frozen=True)
+class CocoControlMigration:
+    """Persisted result of moving the singleton control topic to General."""
+
+    user_id: int
+    chat_id: int
+    previous_thread_id: int
+    general_thread_id: int
+    moved_history: bool
+
+
 @dataclass
 class SessionTranscript:
     """Information about a session transcript."""
@@ -510,6 +561,21 @@ class SessionManager:
         repr=False,
     )
 
+    @staticmethod
+    def is_codex_active_writer_error(error: object) -> bool:
+        """Return whether an app-server failure is a pre-dispatch writer conflict."""
+        return APP_SERVER_ACTIVE_WRITER_RE.search(str(error)) is not None
+
+    @staticmethod
+    def is_codex_uncertain_send_result(error: object) -> bool:
+        """Return whether replay could duplicate a request that may have dispatched."""
+        return APP_SERVER_UNCERTAIN_SEND_RE.search(str(error)) is not None
+
+    @staticmethod
+    def is_codex_resume_limit_error(error: object) -> bool:
+        """Return whether an exact resume was rejected before dispatch for size."""
+        return APP_SERVER_RESUME_LIMIT_RE.search(str(error)) is not None
+
     def __post_init__(self) -> None:
         self._load_state()
 
@@ -520,6 +586,52 @@ class SessionManager:
             lock = asyncio.Lock()
             self._window_send_locks[window_id] = lock
         return lock
+
+    @asynccontextmanager
+    async def _window_send_context(
+        self,
+        window_id: str,
+        *,
+        remote_thread_id: str | None = None,
+        remote_cwd: str = "",
+        remote_window_name: str = "",
+        remote_approval_mode: str = "",
+        result_snapshot: dict[str, str] | None = None,
+    ) -> AsyncIterator[None]:
+        """Hold the send lock while applying an optional remote dispatch config."""
+        lock = self._get_window_send_lock(window_id)
+        async with lock:
+            if remote_thread_id is not None:
+                state = self.get_window_state(window_id)
+                changed = False
+                normalized_cwd = (
+                    str(Path(remote_cwd).expanduser().resolve())
+                    if remote_cwd
+                    else ""
+                )
+                if normalized_cwd and state.cwd != normalized_cwd:
+                    state.cwd = normalized_cwd
+                    changed = True
+                if remote_window_name and state.window_name != remote_window_name:
+                    state.window_name = remote_window_name
+                    changed = True
+                if remote_approval_mode and state.approval_mode != remote_approval_mode:
+                    state.approval_mode = remote_approval_mode
+                    changed = True
+                normalized_thread_id = remote_thread_id.strip()
+                if state.codex_thread_id != normalized_thread_id:
+                    state.codex_thread_id = normalized_thread_id
+                    state.codex_active_turn_id = ""
+                    changed = True
+                if changed:
+                    self._save_state()
+            try:
+                yield
+            finally:
+                if result_snapshot is not None:
+                    state = self.get_window_state(window_id)
+                    result_snapshot["thread_id"] = state.codex_thread_id.strip()
+                    result_snapshot["turn_id"] = state.codex_active_turn_id.strip()
 
     def set_transport_uncertainty_handler(
         self,
@@ -744,6 +856,94 @@ class SessionManager:
                 thread_id,
             )
         return None
+
+    def _get_persisted_topic_binding(
+        self,
+        user_id: int,
+        thread_id: int,
+        *,
+        chat_id: int | None = None,
+    ) -> TopicBinding | None:
+        """Return the raw persisted binding without window-state fallbacks."""
+        slot_key = self._find_topic_slot_key(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if slot_key is None:
+            return None
+        return self.topic_bindings_v2.get(user_id, {}).get(slot_key)
+
+    def _topic_binding_ownership_matches(
+        self,
+        user_id: int,
+        thread_id: int,
+        *,
+        chat_id: int | None,
+        window_id: str,
+        codex_thread_id: str,
+        machine_id: str,
+        cwd: str,
+    ) -> bool:
+        """Return whether a topic still has the ownership captured before an await."""
+        binding = self._get_persisted_topic_binding(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        return bool(
+            binding is not None
+            and binding.window_id.strip() == window_id.strip()
+            and binding.codex_thread_id.strip() == codex_thread_id.strip()
+            and binding.machine_id.strip() == machine_id.strip()
+            and binding.cwd.strip() == cwd.strip()
+        )
+
+    def _window_topic_ownership_snapshot(
+        self,
+        window_id: str,
+    ) -> tuple[tuple[int, str, str, str, str], ...]:
+        """Capture raw canonical topic ownership for one window.
+
+        Window state is only a cache.  Recovery paths use this snapshot to
+        prove that no persisted topic moved to another window/thread while an
+        app-server await was in flight.
+        """
+        normalized_window_id = window_id.strip()
+        return tuple(
+            sorted(
+                (
+                    user_id,
+                    slot_key,
+                    binding.codex_thread_id.strip(),
+                    binding.machine_id.strip(),
+                    binding.cwd.strip(),
+                )
+                for user_id, bindings in self.topic_bindings_v2.items()
+                for slot_key, binding in bindings.items()
+                if binding.window_id.strip() == normalized_window_id
+                and binding.codex_thread_id.strip()
+            )
+        )
+
+    def _get_persisted_window_codex_thread_id(self, window_id: str) -> str:
+        """Return one raw canonical thread ID persisted for a window."""
+        thread_ids = {
+            binding.codex_thread_id.strip()
+            for bindings in self.topic_bindings_v2.values()
+            for binding in bindings.values()
+            if binding.window_id.strip() == window_id
+            and binding.codex_thread_id.strip()
+        }
+        if len(thread_ids) == 1:
+            return next(iter(thread_ids))
+        if len(thread_ids) > 1:
+            logger.error(
+                "Conflicting persisted Codex topic bindings for window %s: %s",
+                window_id,
+                sorted(thread_ids),
+            )
+        return ""
 
     def _is_window_id(self, key: str) -> bool:
         """Check if a key looks like a window ID (e.g. '@0', '@12')."""
@@ -1038,16 +1238,23 @@ class SessionManager:
 
     def current_window_session_map(self) -> dict[str, str]:
         """Return in-memory window_id -> session_id map for active windows."""
-        bound_window_ids = {
-            window_id for _, _, _, window_id in self.iter_topic_window_bindings()
-        }
-        return {
-            window_id: state.session_id
-            for window_id, state in self.window_states.items()
-            if self._is_window_id(window_id)
-            and state.session_id
-            and window_id in bound_window_ids
-        }
+        result: dict[str, str] = {}
+        for user_id, chat_id, thread_id, window_id in self.iter_topic_window_bindings():
+            state = self.window_states.get(window_id)
+            if state is None or not self._is_window_id(window_id) or not state.session_id:
+                continue
+            persisted = self._get_persisted_topic_binding(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+            )
+            canonical_thread_id = (
+                persisted.codex_thread_id.strip() if persisted is not None else ""
+            )
+            if not canonical_thread_id or state.session_id != canonical_thread_id:
+                continue
+            result[window_id] = state.session_id
+        return result
 
     def _extract_codex_session_meta(self, file_path: Path) -> tuple[str, str] | None:
         """Read Codex session meta (session id + cwd) from a JSONL file."""
@@ -1384,10 +1591,56 @@ class SessionManager:
         if not state.session_id and state.last_input_ts <= 0:
             return False
 
-        discovered = self._select_latest_session_summary(
-            summaries,
-            prefer_recent_since=state.last_input_ts,
-        )
+        canonical_thread_id = self._get_persisted_window_codex_thread_id(window_id)
+        if not canonical_thread_id:
+            if state.session_id:
+                state.session_id = ""
+                self._save_state()
+            return False
+        if canonical_thread_id:
+            canonical_summary = next(
+                (
+                    summary
+                    for summary in summaries
+                    if summary.thread_id == canonical_thread_id
+                ),
+                None,
+            )
+            if canonical_summary is None:
+                canonical_path = self._find_codex_session_file_for_thread(
+                    canonical_thread_id,
+                    cwd=state.cwd.strip(),
+                )
+                if canonical_path is None:
+                    if state.session_id and state.session_id != canonical_thread_id:
+                        rejected_session_id = state.session_id
+                        state.session_id = ""
+                        self._save_state()
+                        logger.warning(
+                            "Cleared noncanonical session association for %s "
+                            "(bound=%s rejected=%s)",
+                            window_id,
+                            canonical_thread_id,
+                            rejected_session_id,
+                        )
+                        emit_telemetry(
+                            "session.autodiscovery.noncanonical_cleared",
+                            window_id=window_id,
+                            bound_thread_id=canonical_thread_id,
+                            rejected_thread_id=rejected_session_id,
+                        )
+                    return False
+                discovered = (canonical_thread_id, canonical_path)
+            else:
+                discovered = (
+                    canonical_summary.thread_id,
+                    canonical_summary.file_path,
+                )
+        else:
+            discovered = self._select_latest_session_summary(
+                summaries,
+                prefer_recent_since=state.last_input_ts,
+            )
         if not discovered:
             return False
 
@@ -1808,6 +2061,20 @@ class SessionManager:
             window_id=window_id,
             thread_id=normalized,
         ):
+            changed = True
+        if changed:
+            self._save_state()
+
+    def _set_window_codex_thread_cache(self, window_id: str, thread_id: str) -> None:
+        """Update only window cache state, preserving raw topic ownership."""
+        state = self.get_window_state(window_id)
+        normalized = thread_id.strip()
+        changed = False
+        if state.codex_thread_id != normalized:
+            state.codex_thread_id = normalized
+            changed = True
+        if not normalized and state.codex_active_turn_id:
+            state.codex_active_turn_id = ""
             changed = True
         if changed:
             self._save_state()
@@ -2613,9 +2880,149 @@ class SessionManager:
         text: str,
         steer: bool = False,
         force_new_turn: bool = False,
+        dispatch_state: TopicSendDispatchState | None = None,
+        topic_ownership: TopicOwnership | None = None,
     ) -> tuple[bool, str]:
         """Send user/topic text with app/skill context applied."""
-        machine_id = self.get_window_machine_id(window_id)
+        if topic_ownership is not None and (
+            thread_id is None
+            or not self._topic_binding_ownership_matches(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=topic_ownership.window_id,
+                codex_thread_id=topic_ownership.codex_thread_id,
+                machine_id=topic_ownership.machine_id,
+                cwd=topic_ownership.cwd,
+            )
+        ):
+            return (
+                False,
+                "The topic's canonical Codex binding changed after this request "
+                "was accepted. The request was not sent; retry it explicitly.",
+            )
+        persisted_topic_binding = (
+            self._get_persisted_topic_binding(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+            )
+            if thread_id is not None
+            else None
+        )
+        canonical_topic_thread_id = (
+            persisted_topic_binding.codex_thread_id.strip()
+            if persisted_topic_binding is not None
+            else ""
+        )
+        canonical_topic_cwd = (
+            persisted_topic_binding.cwd.strip()
+            if persisted_topic_binding is not None
+            else ""
+        )
+        if thread_id is not None and persisted_topic_binding is None:
+            return (
+                False,
+                "No persisted topic binding exists for this topic. The request "
+                "was not sent; run /start or use /resume explicitly.",
+            )
+        cached_window_thread_id = self.get_window_codex_thread_id(window_id)
+        if (
+            persisted_topic_binding is not None
+            and not canonical_topic_thread_id
+            and cached_window_thread_id
+        ):
+            emit_telemetry(
+                "session.implicit_rebind_blocked",
+                window_id=window_id,
+                bound_thread_id="",
+                rejected_thread_id=cached_window_thread_id,
+                source="missing_topic_authority",
+            )
+            return (
+                False,
+                "No canonical Codex thread is persisted for this topic, but "
+                "the window cache contains a thread ID. The request was not "
+                "sent; use /resume to select the intended thread explicitly.",
+            )
+        if (
+            canonical_topic_thread_id
+            and cached_window_thread_id
+            and cached_window_thread_id != canonical_topic_thread_id
+        ):
+            emit_telemetry(
+                "session.implicit_rebind_blocked",
+                window_id=window_id,
+                bound_thread_id=canonical_topic_thread_id,
+                rejected_thread_id=cached_window_thread_id,
+                source="window_cache_disagreement",
+            )
+            return (
+                False,
+                "The topic binding and window cache disagree about the Codex "
+                "thread. The request was not sent; use /resume to select the "
+                "intended thread explicitly.",
+            )
+        if canonical_topic_thread_id and not cached_window_thread_id:
+            # The persisted topic binding is authoritative. Repair only the
+            # empty window cache; never overwrite a conflicting nonempty ID.
+            self._set_window_codex_thread_cache(
+                window_id,
+                canonical_topic_thread_id,
+            )
+        machine_id = (
+            persisted_topic_binding.machine_id.strip()
+            if persisted_topic_binding is not None
+            else self.get_window_machine_id(window_id)
+        )
+
+        def _topic_ownership_is_current() -> bool:
+            if thread_id is None:
+                return True
+            return self._topic_binding_ownership_matches(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=window_id,
+                codex_thread_id=canonical_topic_thread_id,
+                machine_id=machine_id,
+                cwd=canonical_topic_cwd,
+            )
+
+        def _commit_fresh_local_topic_thread() -> tuple[bool, str]:
+            """Commit a first local thread only after its turn was accepted."""
+            if thread_id is None or canonical_topic_thread_id:
+                return True, ""
+            if not _topic_ownership_is_current():
+                return (
+                    False,
+                    "The topic's canonical Codex binding changed before its "
+                    "new thread could be committed. The request was not sent.",
+                )
+            new_thread_id = self.get_window_codex_thread_id(window_id).strip()
+            if not new_thread_id:
+                return False, "Codex did not return a thread for this topic."
+            self.bind_topic_to_codex_thread(
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                codex_thread_id=new_thread_id,
+                cwd=canonical_topic_cwd,
+                display_name=(
+                    persisted_topic_binding.display_name.strip()
+                    if persisted_topic_binding is not None
+                    else self.get_display_name(window_id)
+                ),
+                window_id=window_id,
+                machine_id=machine_id,
+                machine_display_name=(
+                    persisted_topic_binding.machine_display_name.strip()
+                    if persisted_topic_binding is not None
+                    else ""
+                ),
+            )
+            return True, ""
+
         local_machine_id, _local_machine_name = self._local_machine_identity()
         operator_context = self._build_coco_operator_context(
             user_id=user_id,
@@ -2646,10 +3053,23 @@ class SessionManager:
             == TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL
         ):
             state = self.get_window_state(window_id)
-            cwd = state.cwd.strip()
+            binding = persisted_topic_binding
+            binding_cwd = binding.cwd.strip() if binding is not None else ""
+            cwd = binding_cwd
             oversized_rollover = False
             if not cwd:
                 return False, "No workspace bound to this topic. Run /folder first."
+            bound_thread_id = (
+                binding.codex_thread_id.strip()
+                if binding is not None
+                else state.codex_thread_id.strip()
+            )
+            if not bound_thread_id:
+                return (
+                    False,
+                    "No canonical Codex thread is bound to this topic. "
+                    "Use /resume to choose one explicitly.",
+                )
             if machine_id and machine_id != local_machine_id:
                 from .agent_rpc import (
                     RemoteCodexMutationDeferredError,
@@ -2657,23 +3077,85 @@ class SessionManager:
                 )
 
                 try:
-                    resume_result = await agent_rpc_client.resume_latest(
+                    resume_result = await agent_rpc_client.resume_thread(
                         machine_id,
                         window_id=window_id,
                         cwd=cwd,
+                        thread_id=bound_thread_id,
                         window_name=state.window_name
                         or self.get_display_name(window_id),
                         approval_mode=state.approval_mode.strip(),
                     )
                 except RemoteCodexMutationDeferredError as exc:
                     return False, str(exc)
+                except Exception as exc:
+                    if self.is_codex_resume_limit_error(exc):
+                        return (
+                            False,
+                            "This topic's bound Codex transcript is too large "
+                            "to resume automatically. Use an explicit /resume "
+                            "or /new selection; the topic binding was preserved.",
+                        )
+                    if not self.is_codex_active_writer_error(exc):
+                        raise
+                    error_text = str(exc)
+                    logger.warning(
+                        "Host-follow remote resume found an active writer for %s (%s): %s",
+                        window_id,
+                        self.get_display_name(window_id),
+                        error_text,
+                    )
+                    emit_telemetry(
+                        "transport.app_server.host_follow_resume_failed",
+                        runtime_mode=config.runtime_mode,
+                        codex_transport=config.codex_transport,
+                        window_id=window_id,
+                        display=self.get_display_name(window_id),
+                        active_writer=True,
+                        error=error_text,
+                    )
+                    return (
+                        False,
+                        "This topic's Codex run already has an active writer. "
+                        "The request was not sent.",
+                    )
                 resumed_thread_id = str(resume_result.get("thread_id", "")).strip()
                 oversized_rollover = (
                     str(resume_result.get("session_start_reason", "")).strip()
                     == "oversized_rollover"
                 )
+                if not self._topic_binding_ownership_matches(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                    window_id=window_id,
+                    codex_thread_id=bound_thread_id,
+                    machine_id=machine_id,
+                    cwd=binding_cwd,
+                ):
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed while its "
+                        "remote thread was resuming. The request was not sent.",
+                    )
                 if resumed_thread_id:
-                    self.set_window_codex_thread_id(window_id, resumed_thread_id)
+                    if resumed_thread_id != bound_thread_id:
+                        emit_telemetry(
+                            "session.implicit_rebind_blocked",
+                            window_id=window_id,
+                            bound_thread_id=bound_thread_id,
+                            rejected_thread_id=resumed_thread_id,
+                            source="host_follow_remote",
+                        )
+                        return (
+                            False,
+                            "Refused to replace this topic's bound Codex thread "
+                            "without an explicit /resume selection.",
+                        )
+                    self._set_window_codex_thread_cache(
+                        window_id,
+                        resumed_thread_id,
+                    )
                     self.set_window_codex_active_turn_id(
                         window_id,
                         str(resume_result.get("turn_id", "")).strip(),
@@ -2699,19 +3181,86 @@ class SessionManager:
                         }.items()
                         if value
                     }
-                elif oversized_rollover:
-                    self.set_window_codex_thread_id(window_id, "")
             else:
-                resumed_thread_id = await self.resume_latest_codex_session_for_window(
-                    window_id=window_id,
-                    cwd=cwd,
-                )
+                try:
+                    resumed_thread_id = (
+                        await self.resume_codex_session_for_window(
+                            window_id=window_id,
+                            cwd=cwd,
+                            thread_id=bound_thread_id,
+                        )
+                    )
+                except CodexAppServerError as exc:
+                    error_text = str(exc)
+                    if self.is_codex_resume_limit_error(exc):
+                        return (
+                            False,
+                            "This topic's bound Codex transcript is too large "
+                            "to resume automatically. Use an explicit /resume "
+                            "or /new selection; the topic binding was preserved.",
+                        )
+                    active_writer = self.is_codex_active_writer_error(exc)
+                    if not active_writer:
+                        raise
+                    logger.warning(
+                        "Host-follow resume found an active writer for %s (%s): %s",
+                        window_id,
+                        self.get_display_name(window_id),
+                        error_text,
+                    )
+                    emit_telemetry(
+                        "transport.app_server.host_follow_resume_failed",
+                        runtime_mode=config.runtime_mode,
+                        codex_transport=config.codex_transport,
+                        window_id=window_id,
+                        display=self.get_display_name(window_id),
+                        active_writer=active_writer,
+                        error=error_text,
+                    )
+                    return (
+                        False,
+                        "This topic's Codex run already has an active writer. "
+                        "The request was not sent.",
+                    )
+                if resumed_thread_id and resumed_thread_id != bound_thread_id:
+                    emit_telemetry(
+                        "session.implicit_rebind_blocked",
+                        window_id=window_id,
+                        bound_thread_id=bound_thread_id,
+                        rejected_thread_id=resumed_thread_id,
+                        source="host_follow_local",
+                    )
+                    return (
+                        False,
+                        "Refused to replace this topic's bound Codex thread "
+                        "without an explicit /resume selection.",
+                    )
+                if not _topic_ownership_is_current():
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed while its "
+                        "local thread was resuming. The request was not sent.",
+                    )
                 oversized_rollover = (
                     self.peek_window_pending_session_start_reason(window_id)
                     == "oversized_rollover"
                 )
-            if not resumed_thread_id and not oversized_rollover:
-                return False, "Failed to resume the latest Codex session for this folder."
+            if oversized_rollover:
+                emit_telemetry(
+                    "session.implicit_rebind_blocked",
+                    window_id=window_id,
+                    bound_thread_id=bound_thread_id,
+                    rejected_thread_id="",
+                    source="host_follow_oversized_rollover",
+                )
+                return (
+                    False,
+                    "This topic's bound Codex transcript is too large to resume "
+                    "automatically. Use an explicit /resume or /new selection; "
+                    "the topic binding was preserved.",
+                )
+            if not resumed_thread_id:
+                return False, "Failed to resume the Codex session bound to this topic."
 
         goal_context = await self._build_live_goal_context(
             user_id=user_id,
@@ -2732,12 +3281,30 @@ class SessionManager:
                 )
 
                 state = self.get_window_state(window_id)
-                cwd = state.cwd.strip()
+                cwd = canonical_topic_cwd
                 if not cwd:
                     return False, "No workspace bound to this topic. Run /folder first."
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
+                dispatched_thread_id = (
+                    canonical_topic_thread_id
+                    or state.codex_thread_id.strip()
+                )
+                if thread_id is not None and not self._topic_binding_ownership_matches(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                    window_id=window_id,
+                    codex_thread_id=canonical_topic_thread_id,
+                    machine_id=machine_id,
+                    cwd=canonical_topic_cwd,
+                ):
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed before "
+                        "remote dispatch. The request was not sent.",
+                    )
                 try:
                     remote_result = await agent_rpc_client.send_inputs(
                         machine_id,
@@ -2748,11 +3315,18 @@ class SessionManager:
                         inputs=[{"type": "text", "text": text}],
                         steer=steer,
                         force_new_turn=force_new_turn,
-                        thread_id=state.codex_thread_id.strip(),
+                        thread_id=dispatched_thread_id,
                         approval_mode=state.approval_mode.strip(),
                         model_slug=model_slug,
                         reasoning_effort=reasoning_effort,
                         service_tier=service_tier,
+                        **(
+                            {
+                                "on_dispatch": dispatch_state.mark_transport_dispatch_started
+                            }
+                            if dispatch_state is not None
+                            else {}
+                        ),
                     )
                 except RemoteCodexMutationDeferredError as exc:
                     return False, str(exc)
@@ -2763,6 +3337,13 @@ class SessionManager:
                     )
                     self.clear_window_codex_turn(window_id)
                     raise
+                if not _topic_ownership_is_current():
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed while the "
+                        "request was in flight; the remote outcome is uncertain "
+                        "and the request will not be replayed automatically.",
+                    )
                 if not await self._accept_remote_transport_result(
                     window_id=window_id,
                     result=remote_result,
@@ -2772,9 +3353,60 @@ class SessionManager:
                         "Remote Codex transport changed before acknowledgement; "
                         "the request will not be replayed automatically.",
                     )
+                if not _topic_ownership_is_current():
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed while the "
+                        "request was in flight; the remote outcome is uncertain "
+                        "and the request will not be replayed automatically.",
+                    )
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
-                if resolved_thread_id:
+                ok = bool(remote_result.get("ok", False))
+                if ok and (
+                    not resolved_thread_id
+                    or (
+                        dispatched_thread_id
+                        and resolved_thread_id != dispatched_thread_id
+                    )
+                ):
+                    emit_telemetry(
+                        "session.implicit_rebind_blocked",
+                        window_id=window_id,
+                        bound_thread_id=dispatched_thread_id,
+                        rejected_thread_id=resolved_thread_id or "<missing>",
+                        source="remote_send_response",
+                    )
+                    return (
+                        False,
+                        "Remote Codex did not acknowledge the request on the "
+                        "exact expected thread; the outcome is uncertain and "
+                        "the request will not be replayed automatically. The "
+                        "topic binding was preserved.",
+                    )
+                current_persisted_binding = self._get_persisted_topic_binding(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
+                current_canonical_thread_id = (
+                    current_persisted_binding.codex_thread_id.strip()
+                    if current_persisted_binding is not None
+                    else ""
+                )
+                if ok and (
+                    current_persisted_binding is None
+                    or current_canonical_thread_id != canonical_topic_thread_id
+                    or self.get_window_codex_thread_id(window_id)
+                    != dispatched_thread_id
+                ):
+                    return (
+                        False,
+                        "The topic's canonical Codex thread changed while the "
+                        "request was in flight; the response was not applied "
+                        "and the request will not be replayed automatically.",
+                    )
+                if ok and resolved_thread_id and not canonical_topic_thread_id:
                     self.bind_topic_to_codex_thread(
                         user_id=user_id,
                         thread_id=thread_id,
@@ -2785,9 +3417,11 @@ class SessionManager:
                         window_id=window_id,
                         machine_id=machine_id,
                     )
-                if resolved_turn_id or self.get_window_codex_active_turn_id(window_id):
+                if ok and (
+                    resolved_turn_id
+                    or self.get_window_codex_active_turn_id(window_id)
+                ):
                     self.set_window_codex_active_turn_id(window_id, resolved_turn_id)
-                ok = bool(remote_result.get("ok", False))
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
                 ok, msg = await self.send_to_window(
@@ -2795,8 +3429,15 @@ class SessionManager:
                     text,
                     steer=steer,
                     force_new_turn=force_new_turn,
+                    dispatch_cwd=canonical_topic_cwd,
+                    ownership_validator=_topic_ownership_is_current,
+                    dispatch_state=dispatch_state,
                     **topic_send_kwargs,
                 )
+                if ok:
+                    committed, commit_error = _commit_fresh_local_topic_thread()
+                    if not committed:
+                        return False, commit_error
             if ok:
                 self.mark_topic_telegram_live(
                     user_id=user_id,
@@ -2834,12 +3475,30 @@ class SessionManager:
                 )
 
                 state = self.get_window_state(window_id)
-                cwd = state.cwd.strip()
+                cwd = canonical_topic_cwd
                 if not cwd:
                     return False, "No workspace bound to this topic. Run /folder first."
                 node = node_registry.get_node(machine_id)
                 if node is not None and node.status == "offline":
                     return False, f"Machine offline: {node.display_name}"
+                dispatched_thread_id = (
+                    canonical_topic_thread_id
+                    or state.codex_thread_id.strip()
+                )
+                if thread_id is not None and not self._topic_binding_ownership_matches(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                    window_id=window_id,
+                    codex_thread_id=canonical_topic_thread_id,
+                    machine_id=machine_id,
+                    cwd=canonical_topic_cwd,
+                ):
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed before "
+                        "remote dispatch. The request was not sent.",
+                    )
                 try:
                     remote_result = await agent_rpc_client.send_inputs(
                         machine_id,
@@ -2850,11 +3509,18 @@ class SessionManager:
                         inputs=inputs,
                         steer=steer,
                         force_new_turn=force_new_turn,
-                        thread_id=state.codex_thread_id.strip(),
+                        thread_id=dispatched_thread_id,
                         approval_mode=state.approval_mode.strip(),
                         model_slug=model_slug,
                         reasoning_effort=reasoning_effort,
                         service_tier=service_tier,
+                        **(
+                            {
+                                "on_dispatch": dispatch_state.mark_transport_dispatch_started
+                            }
+                            if dispatch_state is not None
+                            else {}
+                        ),
                     )
                 except RemoteCodexMutationDeferredError as exc:
                     return False, str(exc)
@@ -2865,6 +3531,13 @@ class SessionManager:
                     )
                     self.clear_window_codex_turn(window_id)
                     raise
+                if not _topic_ownership_is_current():
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed while the "
+                        "request was in flight; the remote outcome is uncertain "
+                        "and the request will not be replayed automatically.",
+                    )
                 if not await self._accept_remote_transport_result(
                     window_id=window_id,
                     result=remote_result,
@@ -2874,9 +3547,60 @@ class SessionManager:
                         "Remote Codex transport changed before acknowledgement; "
                         "the request will not be replayed automatically.",
                     )
+                if not _topic_ownership_is_current():
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed while the "
+                        "request was in flight; the remote outcome is uncertain "
+                        "and the request will not be replayed automatically.",
+                    )
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
-                if resolved_thread_id:
+                ok = bool(remote_result.get("ok", False))
+                if ok and (
+                    not resolved_thread_id
+                    or (
+                        dispatched_thread_id
+                        and resolved_thread_id != dispatched_thread_id
+                    )
+                ):
+                    emit_telemetry(
+                        "session.implicit_rebind_blocked",
+                        window_id=window_id,
+                        bound_thread_id=dispatched_thread_id,
+                        rejected_thread_id=resolved_thread_id or "<missing>",
+                        source="remote_send_response_with_context",
+                    )
+                    return (
+                        False,
+                        "Remote Codex did not acknowledge the request on the "
+                        "exact expected thread; the outcome is uncertain and "
+                        "the request will not be replayed automatically. The "
+                        "topic binding was preserved.",
+                    )
+                current_persisted_binding = self._get_persisted_topic_binding(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
+                current_canonical_thread_id = (
+                    current_persisted_binding.codex_thread_id.strip()
+                    if current_persisted_binding is not None
+                    else ""
+                )
+                if ok and (
+                    current_persisted_binding is None
+                    or current_canonical_thread_id != canonical_topic_thread_id
+                    or self.get_window_codex_thread_id(window_id)
+                    != dispatched_thread_id
+                ):
+                    return (
+                        False,
+                        "The topic's canonical Codex thread changed while the "
+                        "request was in flight; the response was not applied "
+                        "and the request will not be replayed automatically.",
+                    )
+                if ok and resolved_thread_id and not canonical_topic_thread_id:
                     self.bind_topic_to_codex_thread(
                         user_id=user_id,
                         thread_id=thread_id,
@@ -2887,9 +3611,11 @@ class SessionManager:
                         window_id=window_id,
                         machine_id=machine_id,
                     )
-                if resolved_turn_id or self.get_window_codex_active_turn_id(window_id):
+                if ok and (
+                    resolved_turn_id
+                    or self.get_window_codex_active_turn_id(window_id)
+                ):
                     self.set_window_codex_active_turn_id(window_id, resolved_turn_id)
-                ok = bool(remote_result.get("ok", False))
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
                 ok, msg = await self.send_inputs_to_window(
@@ -2897,8 +3623,15 @@ class SessionManager:
                     inputs,
                     steer=steer,
                     force_new_turn=force_new_turn,
+                    dispatch_cwd=canonical_topic_cwd,
+                    ownership_validator=_topic_ownership_is_current,
+                    dispatch_state=dispatch_state,
                     **topic_send_kwargs,
                 )
+                if ok:
+                    committed, commit_error = _commit_fresh_local_topic_thread()
+                    if not committed:
+                        return False, commit_error
             if ok:
                 self.mark_topic_telegram_live(
                     user_id=user_id,
@@ -2924,7 +3657,14 @@ class SessionManager:
             injected,
             steer=steer,
             force_new_turn=force_new_turn,
+            dispatch_cwd=canonical_topic_cwd,
+            ownership_validator=_topic_ownership_is_current,
+            dispatch_state=dispatch_state,
         )
+        if ok:
+            committed, commit_error = _commit_fresh_local_topic_thread()
+            if not committed:
+                return False, commit_error
         if ok:
             self.mark_topic_telegram_live(
                 user_id=user_id,
@@ -3020,8 +3760,8 @@ class SessionManager:
         *,
         chat_id: int | None = None,
     ) -> TopicBinding | None:
-        """Persist the singleton `/coco` control-topic assignment."""
-        if thread_id is None:
+        """Persist General as the singleton `/coco` control topic."""
+        if thread_id != GENERAL_TOPIC_THREAD_ID or not int(chat_id or 0):
             return None
         binding = self.ensure_topic_binding(user_id, thread_id, chat_id=chat_id)
         if binding is None:
@@ -3033,6 +3773,108 @@ class SessionManager:
         )
         self._save_state()
         return binding
+
+    def migrate_coco_control_to_general(
+        self,
+        *,
+        workspace_dir: str,
+        general_thread_id: int = GENERAL_TOPIC_THREAD_ID,
+    ) -> CocoControlMigration | None:
+        """Move the existing control binding and its history to General once."""
+        current = self.coco_control_topic
+        raw_workspace = workspace_dir.strip()
+        if (
+            current is None
+            or current.user_id <= 0
+            or not current.chat_id
+            or general_thread_id <= 0
+            or not raw_workspace
+            or current.thread_id == general_thread_id
+        ):
+            return None
+        workspace = os.path.abspath(os.path.expanduser(raw_workspace))
+
+        user_id = current.user_id
+        chat_id = current.chat_id
+        old_thread_id = current.thread_id
+        old_slot = self._find_topic_slot_key(
+            user_id,
+            old_thread_id,
+            chat_id=chat_id,
+        )
+        new_slot = self._topic_slot_key(
+            thread_id=general_thread_id,
+            chat_id=chat_id,
+        )
+        per_user = self.topic_bindings_v2.setdefault(user_id, {})
+        source = per_user.get(old_slot) if old_slot is not None else None
+        if source is None:
+            source = per_user.get(new_slot)
+        if source is None:
+            machine_id, machine_display_name = self._local_machine_identity()
+            source = TopicBinding(
+                window_id=self.allocate_virtual_window_id(),
+                machine_id=machine_id,
+                machine_display_name=machine_display_name,
+            )
+
+        binding = TopicBinding(
+            transport=source.transport,
+            chat_id=chat_id,
+            thread_id=general_thread_id,
+            window_id=source.window_id or self.allocate_virtual_window_id(),
+            codex_thread_id=source.codex_thread_id,
+            cwd=workspace,
+            display_name="coco-control",
+            sync_mode=source.sync_mode,
+            machine_id=source.machine_id,
+            machine_display_name=source.machine_display_name,
+            model_slug=source.model_slug,
+            reasoning_effort=source.reasoning_effort,
+            model_selection_explicit=source.model_selection_explicit,
+            service_tier=source.service_tier,
+            response_mode=source.response_mode,
+        )
+        moved_history = bool(binding.codex_thread_id.strip())
+        state = self.get_window_state(binding.window_id)
+        if not binding.codex_thread_id and state.codex_thread_id.strip():
+            binding.codex_thread_id = state.codex_thread_id.strip()
+            moved_history = True
+        state.cwd = workspace
+        state.window_name = "coco-control"
+        state.codex_thread_id = binding.codex_thread_id
+
+        if old_slot is not None and old_slot != new_slot:
+            per_user.pop(old_slot, None)
+        self._set_topic_binding(
+            user_id=user_id,
+            thread_id=general_thread_id,
+            chat_id=chat_id,
+            binding=binding,
+        )
+
+        for settings in (self.thread_skills, self.thread_codex_skills):
+            per_user_settings = settings.get(user_id)
+            if not per_user_settings or old_slot is None:
+                continue
+            if old_slot in per_user_settings:
+                per_user_settings[new_slot] = per_user_settings.pop(old_slot)
+
+        self.group_chat_ids[f"{user_id}:{new_slot}"] = chat_id
+        self.group_chat_ids[f"{user_id}:{general_thread_id}"] = chat_id
+        self.coco_control_topic = CocoControlTopic(
+            user_id=user_id,
+            thread_id=general_thread_id,
+            chat_id=chat_id,
+        )
+        self._save_state()
+        return CocoControlMigration(
+            user_id=user_id,
+            chat_id=chat_id,
+            previous_thread_id=old_thread_id,
+            general_thread_id=general_thread_id,
+            moved_history=moved_history,
+        )
 
     def get_topic_model_selection(
         self,
@@ -3152,15 +3994,47 @@ class SessionManager:
         binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
         if binding is None:
             return "", "No session is bound to this topic. Run `/start` or `/folder` first."
+        persisted_binding = self._get_persisted_topic_binding(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if persisted_binding is None:
+            return "", "No persisted topic binding exists for this topic."
+
+        # Goal recovery is an implicit operation, so only the raw persisted
+        # binding may authorize the thread, machine, and workspace it touches.
+        binding = persisted_binding
 
         local_machine_id, _local_machine_name = self._local_machine_identity()
         machine_id = binding.machine_id.strip()
         is_remote = bool(machine_id and machine_id != local_machine_id)
 
         window_id = binding.window_id.strip()
-        codex_thread_id = binding.codex_thread_id.strip()
-        if not codex_thread_id and window_id:
-            codex_thread_id = self.get_window_codex_thread_id(window_id)
+        binding_cwd = binding.cwd.strip()
+        codex_thread_id = (
+            persisted_binding.codex_thread_id.strip()
+            if persisted_binding is not None
+            else ""
+        )
+        cached_thread_id = (
+            self.get_window_codex_thread_id(window_id) if window_id else ""
+        )
+        if persisted_binding is not None and not codex_thread_id and cached_thread_id:
+            return (
+                "",
+                "No canonical Codex thread is persisted for this topic, but "
+                "the window cache contains a thread ID. Use `/resume` to select "
+                "the intended thread explicitly.",
+            )
+        if codex_thread_id and cached_thread_id and cached_thread_id != codex_thread_id:
+            return (
+                "",
+                "The topic binding and window cache disagree about the Codex "
+                "thread. Use `/resume` to select the intended thread explicitly.",
+            )
+        if codex_thread_id and window_id and not cached_thread_id:
+            self._set_window_codex_thread_cache(window_id, codex_thread_id)
         if codex_thread_id and not force_refresh:
             return codex_thread_id, ""
 
@@ -3171,7 +4045,11 @@ class SessionManager:
             return "", "No session is bound to this topic. Run `/start` or `/folder` first."
 
         state = self.get_window_state(window_id)
-        cwd = binding.cwd.strip() or state.cwd.strip()
+        # Goal recovery is implicit.  A cached window cwd is not authority to
+        # repair an incomplete raw topic binding because that cache can belong
+        # to a previously rebound session.  Only an explicit lifecycle action
+        # may establish the missing workspace in the persisted binding.
+        cwd = binding_cwd
         if not cwd:
             return "", "No workspace is bound to this topic yet. Run `/start` or `/folder` first."
 
@@ -3179,43 +4057,60 @@ class SessionManager:
             from .agent_rpc import agent_rpc_client
 
             machine_name = binding.machine_display_name.strip() or machine_id
-            try:
-                resumed = await agent_rpc_client.resume_latest(
-                    machine_id,
-                    window_id=window_id,
-                    cwd=cwd,
-                    window_name=binding.display_name.strip() or state.window_name.strip(),
-                    approval_mode=state.approval_mode.strip(),
-                )
-            except Exception as e:
-                logger.debug(
-                    "Remote goal thread resume skipped for %s (%s on %s): %s",
-                    window_id,
-                    self.get_display_name(window_id),
-                    machine_name,
-                    e,
-                )
-                resumed = {}
+            if codex_thread_id:
+                try:
+                    resumed = await agent_rpc_client.resume_thread(
+                        machine_id,
+                        window_id=window_id,
+                        cwd=cwd,
+                        thread_id=codex_thread_id,
+                        window_name=(
+                            binding.display_name.strip()
+                            or state.window_name.strip()
+                        ),
+                        approval_mode=state.approval_mode.strip(),
+                    )
+                except Exception as e:
+                    return "", self._format_goal_transport_error(e)
 
-            resumed_thread_id = str(resumed.get("thread_id", "")).strip() if isinstance(resumed, dict) else ""
-            if resumed_thread_id:
-                self.bind_topic_to_codex_thread(
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    chat_id=chat_id,
-                    codex_thread_id=resumed_thread_id,
-                    cwd=cwd,
-                    display_name=binding.display_name.strip() or self.get_display_name(window_id),
-                    window_id=window_id,
-                    machine_id=machine_id,
-                    machine_display_name=machine_name,
+                resumed_thread_id = (
+                    str(resumed.get("thread_id", "")).strip()
+                    if isinstance(resumed, dict)
+                    else ""
                 )
+                if resumed_thread_id != codex_thread_id:
+                    emit_telemetry(
+                        "session.implicit_rebind_blocked",
+                        window_id=window_id,
+                        bound_thread_id=codex_thread_id,
+                        rejected_thread_id=resumed_thread_id,
+                        source="goal_refresh_remote",
+                    )
+                    return (
+                        "",
+                        "Refused to replace this topic's bound Codex thread "
+                        "during goal recovery.",
+                    )
+                if not self._topic_binding_ownership_matches(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                    window_id=window_id,
+                    codex_thread_id=codex_thread_id,
+                    machine_id=machine_id,
+                    cwd=binding_cwd,
+                ):
+                    return (
+                        "",
+                        "The topic's canonical Codex binding changed while goal "
+                        "recovery was in flight.",
+                    )
                 self.inherit_window_topic_model_selection(
                     window_id=window_id,
                     model_slug=str(resumed.get("model_slug", "")).strip(),
                     reasoning_effort=str(resumed.get("reasoning_effort", "")).strip(),
                 )
-                return resumed_thread_id, ""
+                return codex_thread_id, ""
 
             try:
                 ensured = await agent_rpc_client.ensure_thread(
@@ -3234,6 +4129,20 @@ class SessionManager:
             ensured_thread_id = str(ensured.get("thread_id", "")).strip() if isinstance(ensured, dict) else ""
             if not ensured_thread_id:
                 return "", f"Failed to create a Codex thread on remote machine `{machine_name}`."
+            if not self._topic_binding_ownership_matches(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=window_id,
+                codex_thread_id="",
+                machine_id=machine_id,
+                cwd=binding_cwd,
+            ):
+                return (
+                    "",
+                    "The topic's canonical Codex binding changed while a remote "
+                    "goal thread was being created.",
+                )
             self.bind_topic_to_codex_thread(
                 user_id=user_id,
                 thread_id=thread_id,
@@ -3252,29 +4161,82 @@ class SessionManager:
             existing_thread_id = self.get_window_codex_thread_id(window_id)
             if existing_thread_id and not force_refresh:
                 return existing_thread_id, ""
-            if force_refresh and existing_thread_id:
-                self.set_window_codex_thread_id(window_id, "")
-
-            resumed_thread_id = ""
-            try:
-                resumed_thread_id = await self.resume_latest_codex_session_for_window(
+            bound_thread_id = codex_thread_id or existing_thread_id
+            if bound_thread_id:
+                try:
+                    resumed_thread_id = await self.resume_codex_session_for_window(
+                        window_id=window_id,
+                        cwd=cwd,
+                        thread_id=bound_thread_id,
+                    )
+                except Exception as e:
+                    return "", self._format_goal_transport_error(e)
+                if resumed_thread_id != bound_thread_id:
+                    emit_telemetry(
+                        "session.implicit_rebind_blocked",
+                        window_id=window_id,
+                        bound_thread_id=bound_thread_id,
+                        rejected_thread_id=resumed_thread_id,
+                        source="goal_refresh_local",
+                    )
+                    return (
+                        "",
+                        "Refused to replace this topic's bound Codex thread "
+                        "during goal recovery.",
+                    )
+                if not self._topic_binding_ownership_matches(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
                     window_id=window_id,
-                    cwd=cwd,
+                    codex_thread_id=codex_thread_id,
+                    machine_id=machine_id,
+                    cwd=binding_cwd,
+                ):
+                    return (
+                        "",
+                        "The topic's canonical Codex binding changed while local "
+                        "goal recovery was in flight.",
+                    )
+                return bound_thread_id, ""
+
+            try:
+                created_thread_id, _approval_policy = (
+                    await self._ensure_codex_thread_for_window(
+                        window_id=window_id,
+                        cwd=cwd,
+                        sync_topic_bindings=False,
+                    )
                 )
             except Exception as e:
-                logger.debug(
-                    "Goal thread resume skipped for %s (%s): %s",
-                    window_id,
-                    self.get_display_name(window_id),
-                    e,
-                )
-
-            if resumed_thread_id:
-                return resumed_thread_id, ""
-
-            created_thread_id, _approval_policy = await self._ensure_codex_thread_for_window(
+                return "", self._format_goal_transport_error(e)
+            if not self._topic_binding_ownership_matches(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
                 window_id=window_id,
+                codex_thread_id="",
+                machine_id=machine_id,
+                cwd=binding_cwd,
+            ):
+                return (
+                    "",
+                    "The topic's canonical Codex binding changed while a local "
+                    "goal thread was being created.",
+                )
+            self.bind_topic_to_codex_thread(
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                codex_thread_id=created_thread_id,
                 cwd=cwd,
+                display_name=(
+                    binding.display_name.strip()
+                    or self.get_display_name(window_id)
+                ),
+                window_id=window_id,
+                machine_id=machine_id,
+                machine_display_name=binding.machine_display_name.strip(),
             )
             return created_thread_id, ""
 
@@ -3333,23 +4295,57 @@ class SessionManager:
         )
         if not codex_thread_id:
             return False, None, error
-        binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
-        machine_id = binding.machine_id.strip() if binding else ""
         local_machine_id, _local_machine_name = self._local_machine_identity()
 
         async def _send_goal(target_thread_id: str) -> dict[str, Any]:
-            if machine_id and machine_id != local_machine_id:
+            binding = (
+                self._get_persisted_topic_binding(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
+                if thread_id is not None
+                else None
+            )
+            if (
+                binding is None
+                or binding.codex_thread_id.strip() != target_thread_id.strip()
+            ):
+                raise CodexAppServerError(
+                    "The topic's canonical Codex binding changed before the goal "
+                    "mutation. The request was not sent."
+                )
+            captured_window_id = binding.window_id.strip()
+            captured_machine_id = binding.machine_id.strip()
+            captured_cwd = binding.cwd.strip()
+            if captured_machine_id and captured_machine_id != local_machine_id:
                 from .agent_rpc import agent_rpc_client
 
-                return await agent_rpc_client.thread_goal_set(
-                    machine_id,
+                payload = await agent_rpc_client.thread_goal_set(
+                    captured_machine_id,
                     thread_id=target_thread_id,
                     goal=normalized_goal_text,
                 )
-            return await codex_app_server_client.thread_goal_set(
-                thread_id=target_thread_id,
-                goal=normalized_goal_text,
-            )
+            else:
+                payload = await codex_app_server_client.thread_goal_set(
+                    thread_id=target_thread_id,
+                    goal=normalized_goal_text,
+                )
+            if not self._topic_binding_ownership_matches(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=captured_window_id,
+                codex_thread_id=target_thread_id,
+                machine_id=captured_machine_id,
+                cwd=captured_cwd,
+            ):
+                raise CodexAppServerError(
+                    "The topic's canonical Codex binding changed while the goal "
+                    "mutation was in flight; the outcome is uncertain and the "
+                    "request will not be replayed automatically."
+                )
+            return payload
 
         try:
             payload = await _send_goal(codex_thread_id)
@@ -3366,7 +4362,7 @@ class SessionManager:
                     create=True,
                     force_refresh=True,
                 )
-                if refreshed_thread_id and refreshed_thread_id != codex_thread_id:
+                if refreshed_thread_id:
                     try:
                         payload = await _send_goal(refreshed_thread_id)
                     except Exception as retry_err:
@@ -3954,13 +4950,28 @@ class SessionManager:
         result: list[tuple[int, int | None, str, int]] = []
         for user_id, chat_id, thread_id, window_id in self.iter_topic_window_bindings():
             state = self.get_window_state(window_id)
+            persisted = self._get_persisted_topic_binding(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+            )
+            canonical_thread_id = (
+                persisted.codex_thread_id.strip() if persisted is not None else ""
+            )
+            if not canonical_thread_id:
+                continue
+            if canonical_thread_id and session_id != canonical_thread_id:
+                continue
             if state.session_id == session_id:
                 result.append((user_id, chat_id, window_id, thread_id))
                 continue
 
             # Known non-empty session IDs are authoritative enough to skip
             # expensive transcript re-resolution on every streamed chunk.
-            if state.session_id:
+            if state.session_id and (
+                not canonical_thread_id
+                or state.session_id == canonical_thread_id
+            ):
                 continue
 
             # Session ID can be briefly empty right after sending input in Codex
@@ -3988,10 +4999,8 @@ class SessionManager:
             return []
         result: list[tuple[int, int | None, str, int]] = []
         for user_id, chat_id, thread_id, binding in self.iter_topic_bindings():
-            resolved_codex_thread_id = binding.codex_thread_id
+            resolved_codex_thread_id = binding.codex_thread_id.strip()
             window_id = binding.window_id.strip()
-            if not resolved_codex_thread_id and window_id:
-                resolved_codex_thread_id = self.get_window_state(window_id).codex_thread_id
             if resolved_codex_thread_id != codex_thread_id:
                 continue
             if not window_id:
@@ -4033,7 +5042,7 @@ class SessionManager:
             self._save_state()
 
     async def validate_codex_topic_bindings(self) -> dict[str, int]:
-        """Validate persisted Codex thread bindings and clear stale thread ids."""
+        """Validate persisted Codex thread bindings without changing ownership."""
         thread_ids: set[str] = set()
         for _user_id, bindings in self.topic_bindings_v2.items():
             for _slot_key, binding in bindings.items():
@@ -4046,7 +5055,6 @@ class SessionManager:
 
         checked = 0
         invalid_thread_ids: set[str] = set()
-        oversized_thread_ids: set[str] = set()
         for codex_thread_id in sorted(thread_ids):
             checked += 1
             try:
@@ -4069,10 +5077,8 @@ class SessionManager:
                 continue
             resume_limit = int(config.codex_max_resume_bytes)
             if rollout_size > resume_limit:
-                invalid_thread_ids.add(codex_thread_id)
-                oversized_thread_ids.add(codex_thread_id)
                 emit_telemetry(
-                    "transport.app_server.oversized_binding_rollover",
+                    "transport.app_server.oversized_binding_preserved",
                     runtime_mode=config.runtime_mode,
                     codex_transport=config.codex_transport,
                     thread_id=codex_thread_id,
@@ -4081,8 +5087,8 @@ class SessionManager:
                     resume_limit_bytes=resume_limit,
                 )
                 logger.warning(
-                    "Skipping app-server validation for oversized Codex "
-                    "thread %s (size=%d limit=%d)",
+                    "Preserving oversized Codex binding without app-server "
+                    "validation for thread %s (size=%d limit=%d)",
                     codex_thread_id,
                     rollout_size,
                     resume_limit,
@@ -4128,49 +5134,10 @@ class SessionManager:
 
         if not invalid_thread_ids:
             return {"checked": checked, "invalid": 0, "repaired": 0}
-
-        repaired = 0
-        changed = False
-        for _user_id, bindings in self.topic_bindings_v2.items():
-            for _thread_id, binding in bindings.items():
-                codex_thread_id = binding.codex_thread_id.strip()
-                if not codex_thread_id or codex_thread_id not in invalid_thread_ids:
-                    continue
-                binding.codex_thread_id = ""
-                repaired += 1
-                changed = True
-                window_id = binding.window_id.strip()
-                if not window_id:
-                    continue
-                state = self.get_window_state(window_id)
-                if state.codex_thread_id == codex_thread_id:
-                    state.codex_thread_id = ""
-                    state.codex_active_turn_id = ""
-                    if codex_thread_id in oversized_thread_ids:
-                        self.mark_window_pending_session_start_reason(
-                            window_id,
-                            "oversized_rollover",
-                        )
-
-        for window_id, state in self.window_states.items():
-            codex_thread_id = state.codex_thread_id.strip()
-            if codex_thread_id and codex_thread_id in invalid_thread_ids:
-                state.codex_thread_id = ""
-                state.codex_active_turn_id = ""
-                if codex_thread_id in oversized_thread_ids:
-                    self.mark_window_pending_session_start_reason(
-                        window_id,
-                        "oversized_rollover",
-                    )
-                changed = True
-
-        if changed:
-            self._save_state()
-
         return {
             "checked": checked,
             "invalid": len(invalid_thread_ids),
-            "repaired": repaired,
+            "repaired": 0,
         }
 
     # --- Tmux helpers ---
@@ -4400,6 +5367,7 @@ class SessionManager:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        on_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Start a turn once; timeout outcomes are uncertain and never replayed."""
         turn_kwargs: dict[str, Any] = {}
@@ -4407,6 +5375,9 @@ class SessionManager:
             turn_kwargs["model"] = model_slug
         if reasoning_effort:
             turn_kwargs["effort"] = reasoning_effort
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
         try:
             return await codex_app_server_client.turn_start(
                 thread_id=thread_id,
@@ -4414,6 +5385,7 @@ class SessionManager:
                 approval_policy=approval_policy,
                 service_tier=service_tier.strip() or None,
                 timeout=APP_SERVER_TURN_START_TIMEOUT_SECONDS,
+                **dispatch_kwargs,
                 **turn_kwargs,
             )
         except Exception as error:
@@ -4442,6 +5414,8 @@ class SessionManager:
         model: str = "",
         effort: str = "",
         service_tier: str = "",
+        sync_topic_bindings: bool = True,
+        ownership_validator: Callable[[], bool] | None = None,
     ) -> tuple[str, str]:
         """Ensure a window has a Codex app-server thread id.
 
@@ -4473,17 +5447,26 @@ class SessionManager:
         new_thread_id = thread.get("id") if isinstance(thread, dict) else None
         if not isinstance(new_thread_id, str) or not new_thread_id:
             raise CodexAppServerError("thread/start did not return a thread id")
+        if state.codex_thread_id.strip() != thread_id:
+            raise CodexAppServerError(
+                "window thread binding changed while thread/start was in flight"
+            )
+        if ownership_validator is not None and not ownership_validator():
+            raise CodexAppServerError(
+                "topic binding changed while thread/start was in flight"
+            )
 
         changed = False
         if state.codex_thread_id != new_thread_id:
             state.codex_thread_id = new_thread_id
             state.codex_active_turn_id = ""
             changed = True
-        if self._sync_topic_bindings_for_window_codex_thread(
-            window_id=window_id,
-            thread_id=new_thread_id,
-        ):
-            changed = True
+        if sync_topic_bindings:
+            if self._sync_topic_bindings_for_window_codex_thread(
+                window_id=window_id,
+                thread_id=new_thread_id,
+            ):
+                changed = True
         if cwd and state.cwd != cwd:
             state.cwd = cwd
             changed = True
@@ -4583,11 +5566,17 @@ class SessionManager:
             return ""
 
         try:
-            return await self.resume_codex_session_for_window(
+            resumed_thread_id = await self.resume_codex_session_for_window(
                 window_id=window_id,
                 cwd=cwd,
                 thread_id=latest_thread_id,
             )
+            # Choosing "Resume latest" is an explicit lifecycle action. The
+            # exact-resume primitive intentionally repairs only the window
+            # cache so implicit recovery cannot rebind topics; perform the
+            # authorized topic rebind here at the explicit boundary.
+            self.set_window_codex_thread_id(window_id, resumed_thread_id)
+            return resumed_thread_id
         except _CodexAggregateResumeLimitError:
             self.set_window_codex_thread_id(window_id, "")
             self.mark_window_pending_session_start_reason(
@@ -4638,6 +5627,7 @@ class SessionManager:
             )
 
         state = self.get_window_state(window_id)
+        starting_window_thread_id = state.codex_thread_id.strip()
         known_turn_id = (
             state.codex_active_turn_id.strip()
             if state.codex_thread_id.strip() == normalized_thread_id
@@ -4731,10 +5721,31 @@ class SessionManager:
                         ] = rollout_path
         resumed_thread_id = self._extract_lifecycle_thread_id(
             result,
-            fallback=normalized_thread_id,
         )
         if not resumed_thread_id:
-            return ""
+            raise CodexAppServerError(
+                "thread/resume did not return a thread id for exact resume"
+            )
+        if resumed_thread_id != normalized_thread_id:
+            emit_telemetry(
+                "session.implicit_rebind_blocked",
+                window_id=window_id,
+                bound_thread_id=normalized_thread_id,
+                rejected_thread_id=resumed_thread_id,
+                source="thread_resume_response",
+            )
+            raise CodexAppServerError(
+                "thread/resume returned a different thread id "
+                f"({resumed_thread_id}) than requested ({normalized_thread_id})"
+            )
+        current_window_thread_id = state.codex_thread_id.strip()
+        if (
+            current_window_thread_id != starting_window_thread_id
+            and current_window_thread_id != normalized_thread_id
+        ):
+            raise CodexAppServerError(
+                "window thread binding changed while exact resume was in flight"
+            )
         current_transport_state = self._normalize_codex_transport_snapshot(
             codex_app_server_client.transport_state_snapshot()
         )
@@ -4765,7 +5776,7 @@ class SessionManager:
                 current_transport_epoch=current_transport_state[0],
                 current_transport_generation=current_transport_state[2],
             )
-        self.set_window_codex_thread_id(window_id, resumed_thread_id)
+        self._set_window_codex_thread_cache(window_id, resumed_thread_id)
         self.set_window_codex_active_turn_id(window_id, resumed_turn_id)
         if current_transport_state[0]:
             self.set_window_codex_transport_state(
@@ -4823,15 +5834,21 @@ class SessionManager:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        ownership_validator: Callable[[], bool] | None = None,
+        dispatch_state: TopicSendDispatchState | None = None,
     ) -> tuple[bool, str]:
-        """Clear stale thread id and retry one send using a fresh thread."""
-        if stale_thread_id:
-            self.set_window_codex_thread_id(window_id, "")
-        else:
+        """Retry a missing app-server thread without changing topic ownership."""
+        if ownership_validator is not None and not ownership_validator():
+            return (
+                False,
+                "The topic's canonical Codex binding changed during recovery. "
+                "The request was not sent.",
+            )
+        if not stale_thread_id:
             self.clear_window_codex_turn(window_id)
 
         logger.warning(
-            "App-server thread missing for %s (%s), retrying with a resumed/latest or fresh thread id",
+            "App-server thread missing for %s (%s), retrying the bound thread",
             window_id,
             self.get_display_name(window_id),
         )
@@ -4845,14 +5862,15 @@ class SessionManager:
             stale_thread_id=stale_thread_id,
         )
 
-        try:
-            resumed_thread_id = await self.resume_latest_codex_session_for_window(
-                window_id=window_id,
-                cwd=cwd,
-            )
-            if resumed_thread_id:
+        if stale_thread_id:
+            try:
+                resumed_thread_id = await self.resume_codex_session_for_window(
+                    window_id=window_id,
+                    cwd=cwd,
+                    thread_id=stale_thread_id,
+                )
                 emit_telemetry(
-                    "transport.app_server.thread_missing_resumed_latest",
+                    "transport.app_server.thread_missing_resumed_bound",
                     runtime_mode=config.runtime_mode,
                     codex_transport=config.codex_transport,
                     window_id=window_id,
@@ -4861,25 +5879,51 @@ class SessionManager:
                     resumed_thread_id=resumed_thread_id,
                     cwd=cwd,
                 )
-        except Exception as resume_error:
+            except Exception as resume_error:
+                emit_telemetry(
+                    "transport.app_server.thread_missing_resume_bound_failed",
+                    runtime_mode=config.runtime_mode,
+                    codex_transport=config.codex_transport,
+                    window_id=window_id,
+                    display=self.get_display_name(window_id),
+                    stale_thread_id=stale_thread_id,
+                    cwd=cwd,
+                    error=str(resume_error),
+                )
+                raise
+        else:
+            resumed_thread_id = ""
+
+        if resumed_thread_id and resumed_thread_id != stale_thread_id:
             emit_telemetry(
-                "transport.app_server.thread_missing_resume_latest_failed",
-                runtime_mode=config.runtime_mode,
-                codex_transport=config.codex_transport,
+                "session.implicit_rebind_blocked",
                 window_id=window_id,
-                display=self.get_display_name(window_id),
-                stale_thread_id=stale_thread_id,
-                cwd=cwd,
-                error=str(resume_error),
+                bound_thread_id=stale_thread_id,
+                rejected_thread_id=resumed_thread_id,
+                source="missing_thread_recovery",
+            )
+            raise CodexAppServerError(
+                "Refused to replace the topic's bound Codex thread during recovery"
             )
 
-        send_kwargs: dict[str, str] = {}
+        if ownership_validator is not None and not ownership_validator():
+            return (
+                False,
+                "The topic's canonical Codex binding changed during recovery. "
+                "The request was not sent.",
+            )
+
+        send_kwargs: dict[str, Any] = {}
         if model_slug:
             send_kwargs["model_slug"] = model_slug
         if reasoning_effort:
             send_kwargs["reasoning_effort"] = reasoning_effort
         if service_tier:
             send_kwargs["service_tier"] = service_tier
+        if ownership_validator is not None:
+            send_kwargs["ownership_validator"] = ownership_validator
+        if dispatch_state is not None:
+            send_kwargs["dispatch_state"] = dispatch_state
         ok, msg = await self._send_inputs_via_codex_app_server(
             window_id=window_id,
             inputs=inputs,
@@ -4923,8 +5967,16 @@ class SessionManager:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        ownership_validator: Callable[[], bool] | None = None,
+        dispatch_state: TopicSendDispatchState | None = None,
     ) -> tuple[bool, str]:
         """Clear a definitively stale active turn and retry once via turn/start."""
+        if ownership_validator is not None and not ownership_validator():
+            return (
+                False,
+                "The topic's canonical Codex binding changed during recovery. "
+                "The request was not sent.",
+            )
         if thread_id:
             codex_app_server_client.clear_active_turn(thread_id)
         self.clear_window_codex_turn(window_id)
@@ -4946,13 +5998,17 @@ class SessionManager:
             thread_id=thread_id,
         )
 
-        send_kwargs: dict[str, str] = {}
+        send_kwargs: dict[str, Any] = {}
         if model_slug:
             send_kwargs["model_slug"] = model_slug
         if reasoning_effort:
             send_kwargs["reasoning_effort"] = reasoning_effort
         if service_tier:
             send_kwargs["service_tier"] = service_tier
+        if ownership_validator is not None:
+            send_kwargs["ownership_validator"] = ownership_validator
+        if dispatch_state is not None:
+            send_kwargs["dispatch_state"] = dispatch_state
         ok, msg = await self._send_inputs_via_codex_app_server(
             window_id=window_id,
             inputs=inputs,
@@ -4997,6 +6053,8 @@ class SessionManager:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        ownership_validator: Callable[[], bool] | None = None,
+        dispatch_state: TopicSendDispatchState | None = None,
     ) -> tuple[bool, str]:
         if not model_slug and not reasoning_effort:
             model_slug, reasoning_effort = self.get_window_topic_model_selection(window_id)
@@ -5016,8 +6074,16 @@ class SessionManager:
         thread_id, approval_policy = await self._ensure_codex_thread_for_window(
             window_id=window_id,
             cwd=cwd,
+            sync_topic_bindings=ownership_validator is None,
+            ownership_validator=ownership_validator,
             **ensure_kwargs,
         )
+        if ownership_validator is not None and not ownership_validator():
+            return (
+                False,
+                "The topic's canonical Codex binding changed before turn dispatch. "
+                "The request was not sent.",
+            )
         workspace_path, can_write = self._runtime_write_state(cwd)
         session_start_reason = pending_session_start_reason
         if not session_start_reason and not had_thread_before and thread_id:
@@ -5057,6 +6123,12 @@ class SessionManager:
         if force_new_turn:
             active_turn = ""
 
+        on_dispatch = (
+            dispatch_state.mark_transport_dispatch_started
+            if dispatch_state is not None
+            else None
+        )
+
         if steer and not active_turn:
             logger.info(
                 "No active app-server turn for %s (%s); starting a new turn instead of steering",
@@ -5066,11 +6138,15 @@ class SessionManager:
             steer = False
 
         if steer or active_turn:
+            dispatch_kwargs = (
+                {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+            )
             try:
                 result = await codex_app_server_client.turn_steer(
                     thread_id=thread_id,
                     expected_turn_id=active_turn,
                     inputs=turn_inputs,
+                    **dispatch_kwargs,
                 )
             except CodexAppServerError as error:
                 if self._is_turn_steer_timeout_error(error):
@@ -5081,6 +6157,13 @@ class SessionManager:
                         turn_id=active_turn,
                     ) from error
                 raise
+            if ownership_validator is not None and not ownership_validator():
+                return (
+                    False,
+                    "The topic's canonical Codex binding changed while turn/steer "
+                    "was in flight; the outcome is uncertain and the request will "
+                    "not be replayed automatically.",
+                )
             new_turn_id = result.get("turnId") if isinstance(result, dict) else None
             state.codex_active_turn_id = (
                 new_turn_id
@@ -5088,11 +6171,13 @@ class SessionManager:
                 else active_turn
             )
         else:
-            turn_start_kwargs: dict[str, str] = {}
+            turn_start_kwargs: dict[str, Any] = {}
             if model_slug:
                 turn_start_kwargs["model_slug"] = model_slug
             if reasoning_effort:
                 turn_start_kwargs["reasoning_effort"] = reasoning_effort
+            if on_dispatch is not None:
+                turn_start_kwargs["on_dispatch"] = on_dispatch
             try:
                 result = await self._turn_start_with_retry(
                     thread_id=thread_id,
@@ -5109,6 +6194,13 @@ class SessionManager:
                         thread_id=thread_id,
                     ) from error
                 raise
+            if ownership_validator is not None and not ownership_validator():
+                return (
+                    False,
+                    "The topic's canonical Codex binding changed while turn/start "
+                    "was in flight; the outcome is uncertain and the request will "
+                    "not be replayed automatically.",
+                )
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None
             state.codex_active_turn_id = turn_id if isinstance(turn_id, str) else ""
@@ -5139,12 +6231,26 @@ class SessionManager:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        remote_thread_id: str | None = None,
+        remote_cwd: str = "",
+        remote_window_name: str = "",
+        remote_approval_mode: str = "",
+        result_snapshot: dict[str, str] | None = None,
+        dispatch_cwd: str | None = None,
+        ownership_validator: Callable[[], bool] | None = None,
+        dispatch_state: TopicSendDispatchState | None = None,
     ) -> tuple[bool, str]:
         """Send structured user inputs to a window via Codex app-server."""
         display = self.get_display_name(window_id)
-        lock = self._get_window_send_lock(window_id)
         lock_wait_started = time.monotonic()
-        async with lock:
+        async with self._window_send_context(
+            window_id,
+            remote_thread_id=remote_thread_id,
+            remote_cwd=remote_cwd,
+            remote_window_name=remote_window_name,
+            remote_approval_mode=remote_approval_mode,
+            result_snapshot=result_snapshot,
+        ):
             lock_wait_elapsed = time.monotonic() - lock_wait_started
             if lock_wait_elapsed >= 0.01:
                 logger.debug(
@@ -5158,11 +6264,31 @@ class SessionManager:
             codex_app_server_mode = self._codex_app_server_mode_enabled()
             fallback_state = self.get_window_state(window_id)
             window_name = fallback_state.window_name or display
-            cwd = fallback_state.cwd
+            cwd = (
+                fallback_state.cwd
+                if dispatch_cwd is None
+                else dispatch_cwd.strip()
+            )
+            initial_topic_ownership = self._window_topic_ownership_snapshot(window_id)
+
+            def _send_ownership_is_current() -> bool:
+                if (
+                    initial_topic_ownership
+                    and self._window_topic_ownership_snapshot(window_id)
+                    != initial_topic_ownership
+                ):
+                    return False
+                return ownership_validator is None or ownership_validator()
 
             if codex_app_server_mode:
                 if not cwd:
                     return False, "No workspace bound to this topic. Run /start first."
+                if not _send_ownership_is_current():
+                    return (
+                        False,
+                        "The topic's canonical Codex binding changed before "
+                        "dispatch. The request was not sent.",
+                    )
                 try:
                     send_kwargs: dict[str, Any] = {}
                     if model_slug:
@@ -5171,19 +6297,49 @@ class SessionManager:
                         send_kwargs["reasoning_effort"] = reasoning_effort
                     if service_tier:
                         send_kwargs["service_tier"] = service_tier
-                    return await self._send_inputs_via_codex_app_server(
+                    dispatched_thread_id = fallback_state.codex_thread_id.strip()
+                    dispatched_turn_id = fallback_state.codex_active_turn_id.strip()
+                    strict_ownership_validator = (
+                        _send_ownership_is_current
+                        if initial_topic_ownership
+                        or ownership_validator is not None
+                        else None
+                    )
+                    initial_send_kwargs = dict(send_kwargs)
+                    if strict_ownership_validator is not None:
+                        initial_send_kwargs["ownership_validator"] = (
+                            strict_ownership_validator
+                        )
+                    if dispatch_state is not None:
+                        initial_send_kwargs["dispatch_state"] = dispatch_state
+                    send_result = await self._send_inputs_via_codex_app_server(
                         window_id=window_id,
                         inputs=inputs,
                         steer=steer,
                         force_new_turn=force_new_turn,
                         window_name=window_name,
                         cwd=cwd,
-                        **send_kwargs,
+                        **initial_send_kwargs,
                     )
+                    if not _send_ownership_is_current():
+                        return (
+                            False,
+                            "The topic's canonical Codex binding changed while the "
+                            "request was in flight; the outcome is uncertain and "
+                            "the request will not be replayed automatically.",
+                        )
+                    return send_result
                 except Exception as e:
-                    stale_thread_id = fallback_state.codex_thread_id.strip()
-                    stale_turn_id = fallback_state.codex_active_turn_id.strip()
+                    stale_thread_id = dispatched_thread_id
+                    stale_turn_id = dispatched_turn_id
                     error_text = str(e)
+                    if not _send_ownership_is_current():
+                        return (
+                            False,
+                            "The topic's canonical Codex binding changed while the "
+                            "request was in flight. Recovery was not attempted and "
+                            "the request will not be replayed automatically.",
+                        )
                     turn_timeout_method = (
                         "turn/start"
                         if self._is_turn_start_timeout(e)
@@ -5207,6 +6363,8 @@ class SessionManager:
                                 cwd=cwd,
                                 steer=steer,
                                 stale_thread_id=stale_thread_id,
+                                ownership_validator=_send_ownership_is_current,
+                                dispatch_state=dispatch_state,
                                 **send_kwargs,
                             )
                         except Exception as retry_error:
@@ -5263,6 +6421,8 @@ class SessionManager:
                                 steer=steer,
                                 stale_turn_id=stale_turn_id,
                                 thread_id=stale_thread_id,
+                                ownership_validator=_send_ownership_is_current,
+                                dispatch_state=dispatch_state,
                                 **send_kwargs,
                             )
                         except Exception as retry_error:
@@ -5413,6 +6573,9 @@ class SessionManager:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        dispatch_cwd: str | None = None,
+        ownership_validator: Callable[[], bool] | None = None,
+        dispatch_state: TopicSendDispatchState | None = None,
     ) -> tuple[bool, str]:
         """Send plain text input to a window.
 
@@ -5435,6 +6598,9 @@ class SessionManager:
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
+            dispatch_cwd=dispatch_cwd,
+            ownership_validator=ownership_validator,
+            dispatch_state=dispatch_state,
         )
 
     # --- Message history ---

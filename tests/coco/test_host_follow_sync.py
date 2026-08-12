@@ -1,11 +1,13 @@
 """Tests for one-way host-follow sync and takeover routing."""
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 
 import coco.bot as bot
+import coco.handlers.message_queue as mq
 from coco.session import (
     TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL,
     TOPIC_SYNC_MODE_TELEGRAM_LIVE,
@@ -18,7 +20,9 @@ from coco.session_monitor import NewMessage
 def mgr(monkeypatch) -> SessionManager:
     monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
     monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
-    return SessionManager()
+    manager = SessionManager()
+    monkeypatch.setattr(mq, "session_manager", manager)
+    return manager
 
 
 @pytest.mark.asyncio
@@ -810,6 +814,458 @@ async def test_handle_new_message_task_complete_dispatches_waiting_queue(
     assert len(dispatched) == 1
     assert dispatched[0]["thread_id"] == 10
     assert dispatched[0]["window_id"] == "@1"
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_drops_late_final_after_topic_rebind_before_enqueue(
+    monkeypatch, mgr: SessionManager
+):
+    """A final from Codex A must not enter Telegram after the topic selects B."""
+    user_id = 991002
+    telegram_thread_id = 10
+    chat_id = -100010
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        codex_thread_id="codex-A",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+
+    monkeypatch.setattr(bot, "_codex_app_server_enabled", lambda: True)
+    monkeypatch.setattr(bot, "session_manager", mgr)
+    monkeypatch.setattr(mq, "session_manager", mgr)
+    monkeypatch.setattr(bot, "note_run_activity", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "build_response_parts", lambda text, *_args: [text])
+    monkeypatch.setattr(bot, "consume_looper_completion_keyword", lambda **_kwargs: None)
+
+    async def _shadow_passthrough(**_kwargs):
+        return False
+
+    monkeypatch.setattr(bot, "_handle_shadow_transcript_message_for_topic", _shadow_passthrough)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 0)
+
+    attachment_started = asyncio.Event()
+    release_attachment = asyncio.Event()
+
+    async def _extract_attachments(text, *, workspace_dir, window_id):
+        _ = workspace_dir, window_id
+        attachment_started.set()
+        await release_attachment.wait()
+        return text, None, None, None
+
+    monkeypatch.setattr(bot, "_extract_telegram_attachments_for_window", _extract_attachments)
+
+    async def _enqueue_progress_finalize(*_args, **_kwargs):
+        return None
+
+    async def _update_offset(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_progress_finalize)
+    monkeypatch.setattr(bot, "_update_user_read_offset_for_window", _update_offset)
+
+    sent: list[str] = []
+
+    async def _send(_bot, _chat_id, text, **_kwargs):
+        sent.append(text)
+        return SimpleNamespace(message_id=len(sent))
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send)
+
+    handling = asyncio.create_task(
+        bot.handle_new_message(
+            NewMessage(
+                session_id="codex-A",
+                text="late answer from A",
+                is_complete=True,
+                content_type="text",
+                role="assistant",
+                source="app_server",
+            ),
+            SimpleNamespace(),
+        )
+    )
+    await asyncio.wait_for(attachment_started.wait(), timeout=1)
+
+    # Model an explicit /resume selection while A's callback is awaiting I/O.
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        codex_thread_id="codex-B",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    release_attachment.set()
+    await handling
+
+    observed: list[str] = []
+    try:
+        queue = mq.get_message_queue(user_id)
+        if queue is not None:
+            await asyncio.wait_for(queue.join(), timeout=1)
+        observed = list(sent)
+    finally:
+        worker = mq._queue_workers.pop(user_id, None)
+        if worker is not None:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, chat_id, telegram_thread_id), None)
+
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_content_delivery_stops_split_output_after_topic_rebind(
+    monkeypatch, mgr: SessionManager
+):
+    """A queued split response must re-check topic ownership before each send."""
+    user_id = 991001
+    telegram_thread_id = 11
+    chat_id = -100011
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        codex_thread_id="codex-A",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    monkeypatch.setattr(mq, "session_manager", mgr)
+
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+    sent_parts: list[str] = []
+
+    async def _send(_bot, _chat_id, text, **_kwargs):
+        sent_parts.append(text)
+        if text == "first part from A":
+            first_send_started.set()
+            await release_first_send.wait()
+        return SimpleNamespace(message_id=len(sent_parts))
+
+    async def _status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send)
+    monkeypatch.setattr(mq, "_check_and_send_status", _status)
+
+    await mq.enqueue_content_message(
+        object(),  # type: ignore[arg-type]
+        user_id,
+        "@1",
+        ["first part from A", "late second part from A"],
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+    )
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))
+
+    try:
+        await asyncio.wait_for(first_send_started.wait(), timeout=1)
+        mgr.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=telegram_thread_id,
+            chat_id=chat_id,
+            codex_thread_id="codex-B",
+            window_id="@1",
+            cwd="/tmp/demo",
+            display_name="demo",
+        )
+        release_first_send.set()
+        await asyncio.wait_for(queue.join(), timeout=1)
+
+        assert sent_parts == ["first part from A"]
+    finally:
+        release_first_send.set()
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, chat_id, telegram_thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_tool_result_delivery_stops_after_status_clear_topic_rebind(
+    monkeypatch, mgr: SessionManager
+):
+    """A tool result must not edit A after its awaited status clear loses ownership."""
+    user_id = 991003
+    telegram_thread_id = 12
+    chat_id = -100012
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        codex_thread_id="codex-A",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    mgr.set_group_chat_id(user_id, telegram_thread_id, chat_id)
+    monkeypatch.setattr(mq, "session_manager", mgr)
+
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    clear_started = asyncio.Event()
+    release_clear = asyncio.Event()
+    edits: list[dict[str, object]] = []
+    sends: list[dict[str, object]] = []
+
+    class _Bot:
+        async def delete_message(self, **_kwargs):
+            clear_started.set()
+            await release_clear.wait()
+
+        async def edit_message_text(self, **kwargs):
+            edits.append(kwargs)
+
+        async def send_message(self, **kwargs):
+            sends.append(kwargs)
+            return SimpleNamespace(message_id=len(sends))
+
+    tool_use_id = "tool-A"
+    mq._tool_msg_ids[(tool_use_id, user_id, chat_id, telegram_thread_id)] = 7001
+    mq._status_msg_info[(user_id, chat_id, telegram_thread_id)] = (
+        7002,
+        "@1",
+        "working",
+    )
+    task = mq.MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["result from A"],
+        tool_use_id=tool_use_id,
+        content_type="tool_result",
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        topic_ownership=mq.capture_topic_ownership(
+            user_id,
+            telegram_thread_id,
+            chat_id,
+        ),
+    )
+    mq._put_queued_task(user_id, queue, task)
+    worker = asyncio.create_task(mq._message_queue_worker(_Bot(), user_id))
+
+    try:
+        await asyncio.wait_for(clear_started.wait(), timeout=1)
+        mgr.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=telegram_thread_id,
+            chat_id=chat_id,
+            codex_thread_id="codex-B",
+            window_id="@1",
+            cwd="/tmp/demo",
+            display_name="demo",
+        )
+        release_clear.set()
+        await asyncio.wait_for(queue.join(), timeout=1)
+
+        assert edits == []
+        assert sends == []
+    finally:
+        release_clear.set()
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, chat_id, telegram_thread_id), None)
+        mq._tool_msg_ids.pop((tool_use_id, user_id, chat_id, telegram_thread_id), None)
+        mq._status_msg_info.pop((user_id, chat_id, telegram_thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_tool_result_delivery_stops_plain_fallback_edit_after_awaited_rebind(
+    monkeypatch, mgr: SessionManager
+):
+    """A failed Markdown edit must not fall back after the topic rebinds."""
+    user_id = 991005
+    telegram_thread_id = 14
+    chat_id = -100014
+    tool_use_id = "tool-A"
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        codex_thread_id="codex-A",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    mgr.set_group_chat_id(user_id, telegram_thread_id, chat_id)
+    monkeypatch.setattr(mq, "session_manager", mgr)
+
+    markdown_started = asyncio.Event()
+    release_markdown = asyncio.Event()
+    calls: list[str] = []
+    sent: list[str] = []
+
+    class _Bot:
+        async def edit_message_text(self, **kwargs):
+            if kwargs.get("parse_mode") == "MarkdownV2":
+                calls.append("markdown-edit:start")
+                markdown_started.set()
+                await release_markdown.wait()
+                calls.append("markdown-edit:raise")
+                raise RuntimeError("markdown edit failed")
+            calls.append("plain-edit")
+            raise RuntimeError("plain fallback must not run")
+
+    async def _send(_bot, _chat_id, text, **_kwargs):
+        sent.append(text)
+        calls.append("send")
+        return SimpleNamespace(message_id=len(sent))
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send)
+    mq._tool_msg_ids[(tool_use_id, user_id, chat_id, telegram_thread_id)] = 7003
+
+    bot_instance = _Bot()
+    try:
+        await mq.enqueue_content_message(
+            bot_instance,
+            user_id,
+            "@1",
+            ["result from A"],
+            tool_use_id=tool_use_id,
+            content_type="tool_result",
+            text="result from A",
+            thread_id=telegram_thread_id,
+            chat_id=chat_id,
+        )
+        await asyncio.wait_for(markdown_started.wait(), timeout=1)
+
+        mgr.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=telegram_thread_id,
+            chat_id=chat_id,
+            codex_thread_id="codex-B",
+            window_id="@1",
+            cwd="/tmp/demo",
+            display_name="demo",
+        )
+        release_markdown.set()
+        queue = mq.get_message_queue(user_id)
+        assert queue is not None
+        await asyncio.wait_for(queue.join(), timeout=1)
+
+        assert calls == ["markdown-edit:start", "markdown-edit:raise"]
+        assert sent == []
+    finally:
+        release_markdown.set()
+        worker = mq._queue_workers.pop(user_id, None)
+        if worker is not None:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, chat_id, telegram_thread_id), None)
+        mq._tool_msg_ids.pop((tool_use_id, user_id, chat_id, telegram_thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_content_delivery_stops_fallback_send_after_awaited_edit_rebind(
+    monkeypatch, mgr: SessionManager
+):
+    """A failed awaited status edit must not fall through to sending stale A content."""
+    user_id = 991004
+    telegram_thread_id = 13
+    chat_id = -100013
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        codex_thread_id="codex-A",
+        window_id="@1",
+        cwd="/tmp/demo",
+        display_name="demo",
+    )
+    mgr.set_group_chat_id(user_id, telegram_thread_id, chat_id)
+    monkeypatch.setattr(mq, "session_manager", mgr)
+
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    edit_started = asyncio.Event()
+    release_edit = asyncio.Event()
+    sent: list[str] = []
+
+    async def _failed_status_edit(*_args, **_kwargs):
+        edit_started.set()
+        await release_edit.wait()
+        return None
+
+    async def _send(_bot, _chat_id, text, **_kwargs):
+        sent.append(text)
+        return SimpleNamespace(message_id=len(sent))
+
+    monkeypatch.setattr(mq, "_convert_status_to_content", _failed_status_edit)
+    monkeypatch.setattr(mq, "send_with_fallback", _send)
+
+    task = mq.MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["late output from A"],
+        content_type="text",
+        thread_id=telegram_thread_id,
+        chat_id=chat_id,
+        topic_ownership=mq.capture_topic_ownership(
+            user_id,
+            telegram_thread_id,
+            chat_id,
+        ),
+    )
+    mq._put_queued_task(user_id, queue, task)
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))
+
+    try:
+        await asyncio.wait_for(edit_started.wait(), timeout=1)
+        mgr.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=telegram_thread_id,
+            chat_id=chat_id,
+            codex_thread_id="codex-B",
+            window_id="@1",
+            cwd="/tmp/demo",
+            display_name="demo",
+        )
+        release_edit.set()
+        await asyncio.wait_for(queue.join(), timeout=1)
+
+        assert sent == []
+    finally:
+        release_edit.set()
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, chat_id, telegram_thread_id), None)
 
 
 @pytest.mark.asyncio

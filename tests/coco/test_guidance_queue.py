@@ -8,7 +8,57 @@ import pytest
 from telegram.error import RetryAfter
 
 import coco.bot as bot
+import coco.codex_app_server as cas
 import coco.handlers.message_queue as mq
+import coco.session as session_module
+from coco.session import SessionManager
+
+
+_TEST_TOPIC_OWNERSHIP = mq.TopicOwnership(
+    window_id="@test-owner",
+    codex_thread_id="test-codex-thread",
+    machine_id="test-machine",
+    cwd="/test/workspace",
+)
+
+
+def _enqueue_test_topic_input(*args, capture_current: bool = False, **kwargs):
+    """Seed queue fixtures with explicit ownership unless a test exercises capture."""
+    if "topic_ownership" not in kwargs and not capture_current:
+        kwargs["topic_ownership"] = _TEST_TOPIC_OWNERSHIP
+    return mq.enqueue_queued_topic_input(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _keep_synthetic_queue_owner_current(monkeypatch):
+    original_bot_current = bot.is_topic_ownership_current
+    original_queue_current = mq.is_topic_ownership_current
+    original_queue_capture = mq.capture_topic_ownership
+
+    def _bot_is_current(user_id, thread_id, chat_id, ownership):
+        if ownership == _TEST_TOPIC_OWNERSHIP:
+            return True
+        return original_bot_current(user_id, thread_id, chat_id, ownership)
+
+    def _queue_is_current(user_id, thread_id, chat_id, ownership):
+        if ownership == _TEST_TOPIC_OWNERSHIP:
+            return True
+        return original_queue_current(user_id, thread_id, chat_id, ownership)
+
+    def _queue_capture(user_id, thread_id, chat_id=None):
+        return (
+            original_queue_capture(user_id, thread_id, chat_id)
+            or _TEST_TOPIC_OWNERSHIP
+        )
+
+    monkeypatch.setattr(bot, "is_topic_ownership_current", _bot_is_current)
+    monkeypatch.setattr(mq, "is_topic_ownership_current", _queue_is_current)
+    monkeypatch.setattr(mq, "capture_topic_ownership", _queue_capture)
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: _TEST_TOPIC_OWNERSHIP,
+    )
 
 
 def test_extract_command_args():
@@ -27,8 +77,8 @@ def test_queued_topic_input_fifo_and_count():
 
     assert mq.queued_topic_input_count(user_id, thread_id, -100) == 0
 
-    assert mq.enqueue_queued_topic_input(user_id, thread_id, "first", -100, 1) == 1
-    assert mq.enqueue_queued_topic_input(user_id, thread_id, "second", -100, 2) == 2
+    assert _enqueue_test_topic_input(user_id, thread_id, "first", -100, 1) == 1
+    assert _enqueue_test_topic_input(user_id, thread_id, "second", -100, 2) == 2
     assert mq.queued_topic_input_count(user_id, thread_id, -100) == 2
 
     assert mq.pop_queued_topic_input(user_id, thread_id, -100) == ("first", -100, 1)
@@ -819,6 +869,7 @@ async def test_merge_content_tasks_removes_merged_tasks_from_pending_topic_index
         thread_id=thread_id,
         parts=["hello"],
         delivery_generation=0,
+        topic_ownership=_TEST_TOPIC_OWNERSHIP,
     )
     mergeable = mq.MessageTask(
         task_type="content",
@@ -1055,6 +1106,7 @@ async def test_message_queue_worker_retries_content_after_retry_after(monkeypatc
             window_id="@301",
             thread_id=301,
             parts=["hello"],
+            topic_ownership=_TEST_TOPIC_OWNERSHIP,
         )
     )
 
@@ -1156,6 +1208,7 @@ async def test_message_queue_worker_retries_progress_finalize_after_long_retry_a
             task_type="progress_finalize",
             window_id="@302",
             thread_id=302,
+            topic_ownership=_TEST_TOPIC_OWNERSHIP,
         )
     )
 
@@ -1330,8 +1383,9 @@ async def test_steer_message_keeps_progress_block_active(monkeypatch):
         window_id: str,
         text: str,
         steer: bool = False,
+        topic_ownership=None,
     ):
-        _ = user_id, thread_id, chat_id, text, steer
+        _ = user_id, thread_id, chat_id, text, steer, topic_ownership
         events.append(("send_to_window", window_id))
         return True, ""
 
@@ -1503,8 +1557,9 @@ async def test_text_handler_bound_topic_app_server_only_skips_legacy_window_look
         window_id: str,
         text: str,
         steer: bool = False,
+        topic_ownership=None,
     ):
-        _ = user_id, thread_id, chat_id, text, steer
+        _ = user_id, thread_id, chat_id, text, steer, topic_ownership
         events.append(f"send:{window_id}")
         return True, "ok"
 
@@ -1758,6 +1813,7 @@ async def test_content_task_stops_between_parts_after_topic_cancellation(monkeyp
         thread_id=thread_id,
         parts=["first", "late second"],
         delivery_generation=0,
+        topic_ownership=_TEST_TOPIC_OWNERSHIP,
     )
 
     monkeypatch.setattr(mq.session_manager, "resolve_chat_id", lambda *_args: -100123)
@@ -1790,11 +1846,12 @@ async def test_content_task_stops_between_parts_after_topic_cancellation(monkeyp
 async def test_text_handler_auto_queues_when_host_turn_is_active(monkeypatch):
     user_id = 1147817421
     thread_id = 777
-    mq.clear_queued_topic_inputs(user_id, thread_id)
+    chat_id = -100123
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
 
     class _Chat:
         type = "supergroup"
-        id = -100123
+        id = chat_id
 
         async def send_action(self, *_args, **_kwargs):
             raise AssertionError("typing indicator should not run while host turn is active")
@@ -1873,7 +1930,208 @@ async def test_text_handler_auto_queues_when_host_turn_is_active(monkeypatch):
         assert "hourglass" in events
         assert not any(item.startswith("safe_reply:") for item in events)
     finally:
-        mq.clear_queued_topic_inputs(user_id, thread_id)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_forward_topic_text_queues_when_send_discovers_external_writer(monkeypatch):
+    user_id = 1147817421
+    thread_id = 778
+    chat_id = -100123
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    events: list[str] = []
+
+    class _Chat:
+        id = chat_id
+
+    message = SimpleNamespace(
+        chat=_Chat(),
+        chat_id=chat_id,
+        message_id=100,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@900000",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-old",
+            cwd="/tmp/demo",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _send_topic_text_to_window(**_kwargs):
+        return False, "Latest Codex run has an active writer."
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    async def _set_hourglass(_message):
+        events.append("hourglass")
+
+    async def _sync_dock(*_args, **_kwargs):
+        events.append("dock")
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        events.append(f"safe_reply:{text}")
+
+    async def _dispatch_retry(*_args, **_kwargs):
+        events.append("dispatch_retry")
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "_start_ingress_ack", lambda _message: [])
+    monkeypatch.setattr(bot, "enqueue_status_update", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _noop_async)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _set_hourglass)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch_retry)
+
+    try:
+        await bot._forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text="keep this exact question",
+        )
+
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("keep this exact question", chat_id, 100)
+        ]
+        assert events == ["hourglass", "dock", "dispatch_retry"]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_forward_topic_text_does_not_queue_uncertain_result_during_external_race(
+    monkeypatch,
+):
+    user_id = 1147817421
+    thread_id = 779
+    chat_id = -100123
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    events: list[str] = []
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        chat_id=chat_id,
+        message_id=101,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@900000",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-old",
+            cwd="/tmp/demo",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    external_checks = iter([False, True])
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: next(external_checks),
+    )
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _send_uncertain(**_kwargs):
+        return (
+            False,
+            "the outcome is uncertain and the request will not be replayed automatically",
+        )
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        events.append(f"safe_reply:{text}")
+
+    async def _unexpected_dispatch(*_args, **_kwargs):
+        raise AssertionError("uncertain send must not schedule a replay")
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "_start_ingress_ack", lambda _message: [])
+    monkeypatch.setattr(bot, "enqueue_status_update", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _noop_async)
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send_uncertain)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _unexpected_dispatch)
+
+    try:
+        await bot._forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text="do not replay me",
+        )
+
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+        assert events
+        assert "will not be replayed automatically" in events[0]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
 
 
 @pytest.mark.asyncio
@@ -2019,8 +2277,9 @@ async def test_text_handler_mentions_only_allows_bot_mentions(monkeypatch):
         window_id: str,
         text: str,
         steer: bool = False,
+        topic_ownership=None,
     ):
-        _ = user_id, thread_id, chat_id, text, steer
+        _ = user_id, thread_id, chat_id, text, steer, topic_ownership
         events.append(f"send:{window_id}")
         return True, "ok"
 
@@ -2152,6 +2411,91 @@ async def test_forward_topic_text_message_coco_control_tell_routes_to_target(mon
 
 
 @pytest.mark.asyncio
+async def test_forward_general_message_activates_default_coco_control(monkeypatch):
+    events: list[str] = []
+    activated: list[tuple[int, int, int | None]] = []
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100123),
+        chat_id=-100123,
+        message_id=655,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    binding = SimpleNamespace(
+        window_id="@general",
+        codex_thread_id="thread-general",
+        cwd="/tmp/general",
+    )
+
+    def _activate_general(*, user_id: int, thread_id: int, chat_id: int | None):
+        activated.append((user_id, thread_id, chat_id))
+        return binding
+
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", _activate_general)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, tid, **_kwargs: "@general" if tid == 1 else None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda _uid, tid, *, chat_id=None: tid == 1 and chat_id == -100123,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _send(**kwargs):
+        events.append(f"send:{kwargs['window_id']}:{kwargs['text']}")
+        return True, "ok"
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "capture_topic_ownership", lambda *_args: object())
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "_start_ingress_ack", lambda _message: [])
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "enqueue_status_update", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_start", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=1147817421,
+        thread_id=1,
+        chat_id=-100123,
+        text="show me the active topics",
+    )
+
+    assert activated == [(1147817421, 1, -100123)]
+    assert events == ["send:@general:show me the active topics"]
+
+
+@pytest.mark.asyncio
 async def test_forward_topic_text_message_coco_control_queue_routes_to_target_queue(monkeypatch):
     events: list[str] = []
 
@@ -2219,7 +2563,9 @@ async def test_forward_topic_text_message_coco_control_queue_routes_to_target_qu
     async def _noop_async(*_args, **_kwargs):
         return None
 
-    def _enqueue(user_id, thread_id, text, source_chat_id, source_message_id):
+    def _enqueue(
+        user_id, thread_id, text, source_chat_id, source_message_id, **_kwargs
+    ):
         events.append(f"queue:{user_id}:{thread_id}:{text}:{source_chat_id}:{source_message_id}")
         return 1
 
@@ -2309,7 +2655,14 @@ async def test_q_enqueues_internal_queue_and_updates_dock_when_in_progress(monke
     async def _set_eyes(_message):
         events.append("eyes")
 
-    def _enqueue(_uid: int, _tid: int, _text: str, _chat_id: int, _msg_id: int):
+    def _enqueue(
+        _uid: int,
+        _tid: int,
+        _text: str,
+        _chat_id: int,
+        _msg_id: int,
+        **_kwargs,
+    ):
         events.append("internal_queue")
         return 1
 
@@ -2399,7 +2752,14 @@ async def test_q_uses_internal_queue_when_app_server_turn_is_active(monkeypatch)
     async def _set_hourglass(_message):
         events.append("hourglass")
 
-    def _enqueue(_uid: int, _tid: int, _text: str, _chat_id: int, _msg_id: int):
+    def _enqueue(
+        _uid: int,
+        _tid: int,
+        _text: str,
+        _chat_id: int,
+        _msg_id: int,
+        **_kwargs,
+    ):
         events.append("internal_queue")
         return 1
 
@@ -2501,7 +2861,14 @@ async def test_q_does_not_attempt_native_queue_when_turn_is_active(monkeypatch):
     async def _unexpected_send_topic_text_to_window(**_kwargs):
         raise AssertionError("/q should not steer or send immediately while a turn is active")
 
-    def _enqueue(_uid: int, _tid: int, _text: str, _chat_id: int, _msg_id: int):
+    def _enqueue(
+        _uid: int,
+        _tid: int,
+        _text: str,
+        _chat_id: int,
+        _msg_id: int,
+        **_kwargs,
+    ):
         events.append("internal_queue")
         return 1
 
@@ -2602,6 +2969,7 @@ async def test_q_immediate_send_forces_new_turn_semantics(monkeypatch):
         text: str,
         steer: bool = False,
         force_new_turn: bool = False,
+        topic_ownership=None,
     ):
         captured.update(
             {
@@ -2612,6 +2980,7 @@ async def test_q_immediate_send_forces_new_turn_semantics(monkeypatch):
                 "text": text,
                 "steer": steer,
                 "force_new_turn": force_new_turn,
+                "topic_ownership": topic_ownership,
             }
         )
         return True, ""
@@ -2642,10 +3011,103 @@ async def test_q_immediate_send_forces_new_turn_semantics(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_q_immediate_active_writer_result_is_queued(monkeypatch):
+    events: list[str] = []
+
+    class _Chat:
+        type = "supergroup"
+        id = -100321
+
+    message = SimpleNamespace(
+        text="/q preserve this task",
+        chat=_Chat(),
+        chat_id=-100321,
+        message_thread_id=777,
+        message_id=889,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1147817421),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@77",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-77",
+            cwd="/tmp/project",
+        ),
+    )
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _send_topic_text_to_window(**_kwargs):
+        return False, "Latest Codex run already has an active writer."
+
+    def _enqueue(
+        _uid: int,
+        _tid: int,
+        text: str,
+        _chat_id: int,
+        _msg_id: int,
+        **_kwargs,
+    ):
+        events.append(f"queue:{text}")
+        return 1
+
+    async def _hourglass(_message):
+        events.append("hourglass")
+
+    async def _dock(*_args, **_kwargs):
+        events.append("dock")
+
+    async def _safe_reply(*_args, **_kwargs):
+        events.append("safe_reply")
+
+    async def _dispatch_retry(*_args, **_kwargs):
+        events.append("dispatch_retry")
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "enqueue_queued_topic_input", _enqueue)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _hourglass)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _dock)
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch_retry)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    await bot.queue_command(update, context)
+
+    assert events == [
+        "queue:preserve this task",
+        "hourglass",
+        "dock",
+        "dispatch_retry",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch):
     mq.clear_queued_topic_inputs(1147817421, 777)
-    mq.enqueue_queued_topic_input(1147817421, 777, "first queued task", -100321, 111)
-    mq.enqueue_queued_topic_input(1147817421, 777, "second queued task", -100321, 222)
+    _enqueue_test_topic_input(1147817421, 777, "first queued task", -100321, 111)
+    _enqueue_test_topic_input(1147817421, 777, "second queued task", -100321, 222)
 
     events: list[str] = []
 
@@ -2672,8 +3134,9 @@ async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch)
         text: str,
         steer: bool = False,
         force_new_turn: bool = False,
+        dispatch_state=None,
     ):
-        _ = user_id, thread_id, chat_id, steer
+        _ = user_id, thread_id, chat_id, steer, dispatch_state
         events.append(f"send_to_window:{window_id}:{text}:force_new_turn={force_new_turn}")
         return True, ""
 
@@ -2712,7 +3175,7 @@ async def test_dispatch_next_q_updates_dock_posts_marker_and_reacts(monkeypatch)
 @pytest.mark.asyncio
 async def test_dispatch_next_q_requeues_when_send_fails(monkeypatch):
     mq.clear_queued_topic_inputs(1147817421, 888)
-    mq.enqueue_queued_topic_input(1147817421, 888, "first queued task", -100321, 333)
+    _enqueue_test_topic_input(1147817421, 888, "first queued task", -100321, 333)
 
     sync_counts: list[int] = []
     sent_text: list[str] = []
@@ -2743,8 +3206,18 @@ async def test_dispatch_next_q_requeues_when_send_fails(monkeypatch):
         text: str,
         steer: bool = False,
         force_new_turn: bool = False,
+        dispatch_state=None,
     ):
-        _ = user_id, thread_id, chat_id, window_id, text, steer, force_new_turn
+        _ = (
+            user_id,
+            thread_id,
+            chat_id,
+            window_id,
+            text,
+            steer,
+            force_new_turn,
+            dispatch_state,
+        )
         return False, "boom"
 
     async def _safe_send(_bot, _chat_id, text, **_kwargs):
@@ -2773,9 +3246,332 @@ async def test_dispatch_next_q_requeues_when_send_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_next_q_requeues_active_writer_exception(monkeypatch):
+    user_id = 1147817421
+    thread_id = 889
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "preserve after exception",
+        chat_id,
+        334,
+    )
+    sent_text: list[str] = []
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            raise AssertionError("reaction should not be set on send failure")
+
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**_kwargs):
+        raise bot.CodexAppServerError(
+            "thread thread-live already has an active writer"
+        )
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        sent_text.append(text)
+
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    try:
+        await bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@89",
+            chat_id=chat_id,
+            active_writer_retries_remaining=0,
+        )
+
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("preserve after exception", chat_id, 334)
+        ]
+        assert sent_text
+        assert "active writer" in sent_text[0]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_retries_active_writer_then_succeeds(monkeypatch):
+    user_id = 1147817421
+    thread_id = 891
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "retry after writer closes",
+        chat_id,
+        336,
+    )
+    send_calls = 0
+    sleep_calls: list[float] = []
+    sent_text: list[str] = []
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            return None
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**_kwargs):
+        nonlocal send_calls
+        send_calls += 1
+        if send_calls == 1:
+            return False, "thread already has an active writer"
+        return True, "ok"
+
+    async def _sleep(delay: float):
+        sleep_calls.append(delay)
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        sent_text.append(text)
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+
+    try:
+        await bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@91",
+            chat_id=chat_id,
+        )
+
+        assert send_calls == 2
+        assert sleep_calls == [bot.QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+        assert sent_text == []
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_requeues_active_writer_conflict_after_dispatch_marker(
+    monkeypatch,
+):
+    """A definite writer conflict must replay A before dispatching queued B."""
+    user_id = 1147817421
+    thread_id = 893
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 338)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 339)
+
+    sent: list[str] = []
+    retry_sleeps: list[float] = []
+    conflict_returned = False
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            return None
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        nonlocal conflict_returned
+        text = kwargs["text"]
+        sent.append(text)
+        if text == "A" and not conflict_returned:
+            conflict_returned = True
+            dispatch_state = kwargs["dispatch_state"]
+            dispatch_state.transport_dispatch_started = True
+            return False, "thread already has an active writer"
+        return True, "ok"
+
+    async def _sleep(delay: float):
+        retry_sleeps.append(delay)
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+
+    try:
+        await bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@93",
+            chat_id=chat_id,
+        )
+
+        # The active-writer retry must own A again; B cannot overtake it.
+        assert sent == ["A", "A"]
+        assert retry_sleeps == [bot.QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("B", chat_id, 339)
+        ]
+
+        await bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@93",
+            chat_id=chat_id,
+        )
+
+        assert sent == ["A", "A", "B"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_does_not_requeue_uncertain_false_result(monkeypatch):
+    user_id = 1147817421
+    thread_id = 892
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "possibly delivered remotely",
+        chat_id,
+        337,
+    )
+    sent_text: list[str] = []
+
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**_kwargs):
+        return (
+            False,
+            "Remote Codex returned a different thread; "
+            "the request will not be replayed automatically.",
+        )
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        sent_text.append(text)
+
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    try:
+        await bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@92",
+            chat_id=chat_id,
+        )
+
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+        assert sent_text
+        assert "will not be replayed automatically" in sent_text[0]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_does_not_replay_uncertain_exception(monkeypatch):
+    user_id = 1147817421
+    thread_id = 890
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "do not replay uncertain send",
+        chat_id,
+        335,
+    )
+
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        kwargs["dispatch_state"].transport_dispatch_started = True
+        raise RuntimeError("remote delivery outcome is uncertain")
+
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="delivery outcome is uncertain"):
+            await bot._dispatch_next_queued_input(
+                bot=object(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id="@90",
+                chat_id=chat_id,
+            )
+
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
 async def test_dispatch_next_q_defers_when_window_still_in_progress(monkeypatch):
     mq.clear_queued_topic_inputs(1147817421, 999)
-    mq.enqueue_queued_topic_input(1147817421, 999, "first queued task", -100321, 444)
+    _enqueue_test_topic_input(1147817421, 999, "first queued task", -100321, 444)
 
     sync_counts: list[int] = []
     events: list[str] = []
@@ -2822,3 +3618,2592 @@ async def test_dispatch_next_q_defers_when_window_still_in_progress(monkeypatch)
     assert "queue.dispatch.deferred_active_turn:999" in events
 
     mq.clear_queued_topic_inputs(1147817421, 999)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_concurrent_drains_are_single_flight_and_fifo(monkeypatch):
+    user_id = 1147817421
+    thread_id = 1000
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    sent: list[str] = []
+    active_sends = 0
+    max_active_sends = 0
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            return None
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        nonlocal active_sends, max_active_sends
+        text = kwargs["text"]
+        sent.append(text)
+        active_sends += 1
+        max_active_sends = max(max_active_sends, active_sends)
+        try:
+            if text == "A":
+                first_send_started.set()
+                await release_first_send.wait()
+            return True, ""
+        finally:
+            active_sends -= 1
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+
+    first_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1000",
+            chat_id=chat_id,
+        )
+    )
+    second_drain: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(first_send_started.wait(), timeout=1)
+        second_drain = asyncio.create_task(
+            bot._dispatch_next_queued_input(
+                bot=_FakeBot(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id="@1000",
+                chat_id=chat_id,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert sent == ["A"]
+        assert max_active_sends == 1
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("B", chat_id, 2)
+        ]
+
+        release_first_send.set()
+        await asyncio.gather(first_drain, second_drain)
+        assert sent == ["A"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("B", chat_id, 2)
+        ]
+    finally:
+        release_first_send.set()
+        drains = [first_drain]
+        if second_drain is not None:
+            drains.append(second_drain)
+        await asyncio.gather(*drains, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_completion_wakeup_drains_pending_fifo_after_reaction_tail(
+    monkeypatch,
+):
+    user_id = 1147817421
+    thread_id = 1002
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    sent: list[str] = []
+    active_sends = 0
+    max_active_sends = 0
+    first_reaction_started = asyncio.Event()
+    release_first_reaction = asyncio.Event()
+
+    class _FakeBot:
+        async def set_message_reaction(self, *, message_id: int, **_kwargs):
+            if message_id == 1:
+                first_reaction_started.set()
+                await release_first_reaction.wait()
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        nonlocal active_sends, max_active_sends
+        active_sends += 1
+        max_active_sends = max(max_active_sends, active_sends)
+        try:
+            sent.append(kwargs["text"])
+            return True, ""
+        finally:
+            active_sends -= 1
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+
+    first_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1002",
+            chat_id=chat_id,
+        )
+    )
+    second_drain: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(first_reaction_started.wait(), timeout=1)
+
+        # Model a transcript/completion callback arriving while the owner is
+        # still in its reaction/dock tail. This wakeup must not be dropped.
+        second_drain = asyncio.create_task(
+            bot._dispatch_next_queued_input(
+                bot=_FakeBot(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id="@1002",
+                chat_id=chat_id,
+                preserve_coalesced_wakeup=True,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert sent == ["A"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("B", chat_id, 2)
+        ]
+
+        release_first_reaction.set()
+        await asyncio.gather(first_drain, second_drain)
+
+        assert sent == ["A", "B"]
+        assert max_active_sends == 1
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        release_first_reaction.set()
+        drains = [first_drain]
+        if second_drain is not None:
+            drains.append(second_drain)
+        await asyncio.gather(*drains, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_active_writer_requeue_coalesces_concurrent_retry(
+    monkeypatch,
+):
+    user_id = 1147817421
+    thread_id = 1001
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    sent: list[str] = []
+    retry_sleeps: list[float] = []
+    first_retry_waiting = asyncio.Event()
+    release_retry = asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        return False, "thread already has an active writer"
+
+    async def _sleep(delay: float):
+        retry_sleeps.append(delay)
+        if len(retry_sleeps) == 1:
+            first_retry_waiting.set()
+        await release_retry.wait()
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _safe_send(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+
+    first_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1001",
+            chat_id=chat_id,
+            active_writer_retries_remaining=1,
+        )
+    )
+    second_drain: asyncio.Task[None] | None = None
+    try:
+        await first_retry_waiting.wait()
+        second_drain = asyncio.create_task(
+            bot._dispatch_next_queued_input(
+                bot=object(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id="@1001",
+                chat_id=chat_id,
+                active_writer_retries_remaining=1,
+            )
+        )
+        await original_sleep(0)
+
+        assert sent == ["A"]
+        assert retry_sleeps == [bot.QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+
+        release_retry.set()
+        await asyncio.gather(first_drain, second_drain)
+        assert sent == ["A", "A"]
+        assert retry_sleeps == [bot.QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+    finally:
+        release_retry.set()
+        drains = [first_drain]
+        if second_drain is not None:
+            drains.append(second_drain)
+        await asyncio.gather(*drains, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_uncertain_owner_exception_preserves_completion_wakeup(
+    monkeypatch,
+):
+    """A completion wakeup must drain the next item after an uncertain A send."""
+    user_id = 1147817421
+    thread_id = 1003
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    sent: list[str] = []
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            return None
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        text = kwargs["text"]
+        sent.append(text)
+        if text == "A":
+            first_send_started.set()
+            await release_first_send.wait()
+            kwargs["dispatch_state"].transport_dispatch_started = True
+            raise RuntimeError("remote delivery outcome is uncertain")
+        return True, ""
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+
+    first_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1003",
+            chat_id=chat_id,
+        )
+    )
+    second_drain: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(first_send_started.wait(), timeout=1)
+        second_drain = asyncio.create_task(
+            bot._dispatch_next_queued_input(
+                bot=_FakeBot(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id="@1003",
+                chat_id=chat_id,
+                preserve_coalesced_wakeup=True,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert sent == ["A"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("B", chat_id, 2)
+        ]
+
+        release_first_send.set()
+        results = await asyncio.gather(
+            first_drain,
+            second_drain,
+            return_exceptions=True,
+        )
+
+        assert isinstance(results[0], RuntimeError)
+        assert sent == ["A", "B"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        release_first_send.set()
+        drains = [first_drain]
+        if second_drain is not None:
+            drains.append(second_drain)
+        await asyncio.gather(*drains, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_q_queues_behind_owned_drain_after_writer_becomes_idle(monkeypatch):
+    """A /q arriving during an owned retry cannot overtake its requeued A."""
+    user_id = 1147817421
+    thread_id = 1004
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+
+    sent: list[str] = []
+    writer_active = False
+    retry_sleep_started = asyncio.Event()
+    release_retry = asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            return None
+
+    class _Chat:
+        type = "supergroup"
+        id = chat_id
+
+    message = SimpleNamespace(
+        text="/q B",
+        chat=_Chat(),
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        message_id=2,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=_FakeBot(), user_data={})
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return writer_active
+
+    async def _send_topic_text_to_window(**kwargs):
+        nonlocal writer_active
+        text = kwargs["text"]
+        sent.append(text)
+        if text == "A" and sent.count("A") == 1:
+            writer_active = True
+            return False, "thread already has an active writer"
+        writer_active = False
+        return True, ""
+
+    async def _sleep(delay: float):
+        nonlocal writer_active
+        if delay == bot.QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS:
+            writer_active = False
+            retry_sleep_started.set()
+            await release_retry.wait()
+            return
+        await original_sleep(delay)
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot, "safe_send", _noop_async)
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@1004",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-1004",
+            cwd="/tmp/project",
+        ),
+    )
+
+    first_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1004",
+            chat_id=chat_id,
+            active_writer_retries_remaining=1,
+        )
+    )
+    try:
+        await asyncio.wait_for(retry_sleep_started.wait(), timeout=1)
+        await bot.queue_command(update, context)
+
+        assert sent == ["A"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+
+        release_retry.set()
+        await first_drain
+        assert sent == ["A", "A", "B"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        release_retry.set()
+        await asyncio.gather(first_drain, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_forward_topic_text_queues_behind_owned_drain_after_writer_becomes_idle(
+    monkeypatch,
+):
+    """Normal text arriving during an owned retry cannot overtake its requeued A."""
+    user_id = 1147817421
+    thread_id = 1005
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+
+    sent: list[str] = []
+    writer_active = False
+    retry_sleep_started = asyncio.Event()
+    release_retry = asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    class _FakeBot:
+        async def set_message_reaction(self, **_kwargs):
+            return None
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        chat_id=chat_id,
+        message_id=3,
+    )
+    context = SimpleNamespace(bot=_FakeBot(), user_data={})
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return writer_active
+
+    async def _send_topic_text_to_window(**kwargs):
+        nonlocal writer_active
+        text = kwargs["text"]
+        sent.append(text)
+        if text == "A" and sent.count("A") == 1:
+            writer_active = True
+            return False, "thread already has an active writer"
+        writer_active = False
+        return True, ""
+
+    async def _sleep(delay: float):
+        nonlocal writer_active
+        if delay == bot.QUEUE_ACTIVE_WRITER_RETRY_DELAY_SECONDS:
+            writer_active = False
+            retry_sleep_started.set()
+            await release_retry.wait()
+            return
+        await original_sleep(delay)
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(bot, "_start_ingress_ack", lambda _message: [])
+    monkeypatch.setattr(bot, "enqueue_status_update", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_start", _noop_async)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, _tid, **_kwargs: "@1005",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id="thread-1005",
+            cwd="/tmp/project",
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+
+    first_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=_FakeBot(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1005",
+            chat_id=chat_id,
+            active_writer_retries_remaining=1,
+        )
+    )
+    try:
+        await asyncio.wait_for(retry_sleep_started.wait(), timeout=1)
+        await bot._forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text="C",
+        )
+
+        assert sent == ["A"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("C", chat_id, 3),
+        ]
+
+        release_retry.set()
+        await first_drain
+        assert sent == ["A", "A", "C"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        release_retry.set()
+        await asyncio.gather(first_drain, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_restores_fifo_once_when_cancelled_before_send(
+    monkeypatch,
+):
+    """Cancellation in the pre-send dock barrier must not lose the popped item."""
+    user_id = 1147817421
+    thread_id = 1100
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    sync_started = asyncio.Event()
+    release_sync = asyncio.Event()
+    prepend_calls: list[tuple[str, int, int]] = []
+    sent: list[str] = []
+
+    async def _sync_dock(*_args, **_kwargs):
+        # The queue item must already be owned/popped before this await.
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("B", chat_id, 2)
+        ]
+        sync_started.set()
+        await release_sync.wait()
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        raise AssertionError("send must not begin after pre-dispatch cancellation")
+
+    original_prepend = bot.prepend_queued_topic_input
+
+    def _prepend(*args, **kwargs):
+        prepend_calls.append((args[2], args[3], args[4]))
+        return original_prepend(*args, **kwargs)
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send_topic_text_to_window)
+    monkeypatch.setattr(bot, "prepend_queued_topic_input", _prepend)
+
+    drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1100",
+            chat_id=chat_id,
+        )
+    )
+    try:
+        await asyncio.wait_for(sync_started.wait(), timeout=1)
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+
+        release_sync.set()
+        assert sent == []
+        assert prepend_calls == [("A", chat_id, 1)]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+    finally:
+        release_sync.set()
+        await asyncio.gather(drain, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_restores_once_when_cancelled_waiting_on_session_send_lock(
+    monkeypatch,
+):
+    """Cancellation while waiting for the real send lock is still pre-write."""
+    user_id = 1147817421
+    thread_id = 1104
+    chat_id = -100321
+    window_id = "@1104"
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    monkeypatch.setattr(
+        manager,
+        "_local_machine_identity",
+        lambda: ("local-test-machine", "Local test machine"),
+    )
+    manager.set_group_chat_id(user_id, thread_id, chat_id)
+    state = manager.get_window_state(window_id)
+    state.cwd = "/tmp/project"
+    state.window_name = "lock-window"
+    state.codex_thread_id = "codex-thread-1104"
+    manager.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        codex_thread_id=state.codex_thread_id,
+        cwd=state.cwd,
+        window_id=window_id,
+    )
+
+    class _TrackingLock(asyncio.Lock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waiting = asyncio.Event()
+
+        async def acquire(self) -> bool:
+            if self.locked():
+                self.waiting.set()
+            return await super().acquire()
+
+    lock = _TrackingLock()
+    await lock.acquire()
+    manager._window_send_locks[window_id] = lock
+
+    app_server_calls = 0
+    dispatch_states: list[bot.TopicSendDispatchState] = []
+    prepend_calls: list[tuple[str, int, int]] = []
+
+    async def _unexpected_app_server_send(**_kwargs):
+        nonlocal app_server_calls
+        app_server_calls += 1
+        raise AssertionError("turn transport must not begin while the lock is held")
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    state_type = bot.TopicSendDispatchState
+
+    def _capture_dispatch_state():
+        dispatch_state = state_type()
+        dispatch_states.append(dispatch_state)
+        return dispatch_state
+
+    original_prepend = bot.prepend_queued_topic_input
+
+    def _prepend(*args, **kwargs):
+        prepend_calls.append((args[2], args[3], args[4]))
+        return original_prepend(*args, **kwargs)
+
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(manager, "_codex_app_server_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_send_inputs_via_codex_app_server",
+        _unexpected_app_server_send,
+    )
+    monkeypatch.setattr(bot, "TopicSendDispatchState", _capture_dispatch_state)
+    monkeypatch.setattr(bot, "prepend_queued_topic_input", _prepend)
+    monkeypatch.setattr(
+        bot,
+        "is_topic_ownership_current",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+
+    drain_key = bot._queued_topic_drain_key(
+        user_id,
+        thread_id,
+        chat_id,
+    )
+    bot._queued_topic_drains.discard(drain_key)
+    bot._queued_topic_drain_wakeups.pop(drain_key, None)
+    drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            chat_id=chat_id,
+        )
+    )
+    try:
+        await asyncio.wait_for(lock.waiting.wait(), timeout=1)
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+
+        assert app_server_calls == 0
+        assert len(dispatch_states) == 1
+        assert prepend_calls == [("A", chat_id, 1)]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+        assert dispatch_states[0].transport_dispatch_started is False
+    finally:
+        if lock.locked():
+            lock.release()
+        await asyncio.gather(drain, return_exceptions=True)
+        bot._queued_topic_drains.discard(drain_key)
+        bot._queued_topic_drain_wakeups.pop(drain_key, None)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_restores_fifo_when_cancelled_before_app_server_write(
+    monkeypatch,
+):
+    """Cancellation while the app-server write lock is held is pre-write."""
+    user_id = 1147817421
+    thread_id = 1105
+    chat_id = -100321
+    window_id = "@1105"
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    manager.set_group_chat_id(user_id, thread_id, chat_id)
+    state = manager.get_window_state(window_id)
+    state.cwd = "/tmp/project"
+    state.window_name = "write-window"
+    state.codex_thread_id = "codex-thread-1105"
+    manager.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        codex_thread_id=state.codex_thread_id,
+        cwd=state.cwd,
+        window_id=window_id,
+    )
+    owner = mq.TopicOwnership(
+        window_id=window_id,
+        codex_thread_id=state.codex_thread_id,
+        machine_id=manager.get_window_machine_id(window_id),
+        cwd=state.cwd,
+    )
+    mq.enqueue_queued_topic_input(
+        user_id,
+        thread_id,
+        "A",
+        chat_id,
+        1,
+        topic_ownership=owner,
+    )
+    mq.enqueue_queued_topic_input(
+        user_id,
+        thread_id,
+        "B",
+        chat_id,
+        2,
+        topic_ownership=owner,
+    )
+
+    class _TrackingLock(asyncio.Lock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waiting = asyncio.Event()
+
+        async def acquire(self) -> bool:
+            if self.locked():
+                self.waiting.set()
+            return await super().acquire()
+
+    class _FakeStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+    stdin = _FakeStdin()
+    client = cas.CodexAppServerClient()
+    client._proc = SimpleNamespace(returncode=None, stdin=stdin)
+    client._initialized = True
+    client._transport_generation = 1
+    write_lock = _TrackingLock()
+    await write_lock.acquire()
+    client._write_lock = write_lock
+
+    dispatch_states: list[bot.TopicSendDispatchState] = []
+    prepend_calls: list[tuple[str, int, int]] = []
+    state_type = bot.TopicSendDispatchState
+
+    def _capture_dispatch_state():
+        dispatch_state = state_type()
+        dispatch_states.append(dispatch_state)
+        return dispatch_state
+
+    original_prepend = bot.prepend_queued_topic_input
+
+    def _prepend(*args, **kwargs):
+        prepend_calls.append((args[2], args[3], args[4]))
+        return original_prepend(*args, **kwargs)
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(session_module, "codex_app_server_client", client)
+    monkeypatch.setattr(manager, "_codex_app_server_mode_enabled", lambda: True)
+    monkeypatch.setattr(bot, "TopicSendDispatchState", _capture_dispatch_state)
+    monkeypatch.setattr(bot, "prepend_queued_topic_input", _prepend)
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+
+    drain_key = bot._queued_topic_drain_key(user_id, thread_id, chat_id)
+    bot._queued_topic_drains.discard(drain_key)
+    bot._queued_topic_drain_wakeups.pop(drain_key, None)
+    drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            chat_id=chat_id,
+        )
+    )
+    try:
+        await asyncio.wait_for(write_lock.waiting.wait(), timeout=1)
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+
+        assert stdin.writes == []
+        assert client._pending == {}
+        assert client._in_flight_mutation_requests == {}
+        assert len(dispatch_states) == 1
+        assert dispatch_states[0].transport_dispatch_started is False
+        assert prepend_calls == [("A", chat_id, 1)]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+    finally:
+        if write_lock.locked():
+            write_lock.release()
+        await asyncio.gather(drain, return_exceptions=True)
+        bot._queued_topic_drains.discard(drain_key)
+        bot._queued_topic_drain_wakeups.pop(drain_key, None)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_restores_fifo_once_when_queue_barrier_fails(
+    monkeypatch,
+):
+    """A queue.join exception before send starts must re-prepend exactly once."""
+    user_id = 1147817421
+    thread_id = 1101
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    prepend_calls: list[tuple[str, int, int]] = []
+    sent: list[str] = []
+
+    class _Queue:
+        async def join(self):
+            assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+                ("B", chat_id, 2)
+            ]
+            raise RuntimeError("pre-send queue barrier failed")
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        raise AssertionError("send must not begin after queue barrier failure")
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    original_prepend = bot.prepend_queued_topic_input
+
+    def _prepend(*args, **kwargs):
+        prepend_calls.append((args[2], args[3], args[4]))
+        return original_prepend(*args, **kwargs)
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: _Queue())
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send_topic_text_to_window)
+    monkeypatch.setattr(bot, "prepend_queued_topic_input", _prepend)
+
+    try:
+        with pytest.raises(RuntimeError, match="pre-send queue barrier failed"):
+            await bot._dispatch_next_queued_input(
+                bot=object(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id="@1101",
+                chat_id=chat_id,
+            )
+
+        assert sent == []
+        assert prepend_calls == [("A", chat_id, 1)]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_queued_topic_input_is_not_dispatched_after_explicit_rebind(
+    monkeypatch,
+):
+    """Normal queueing captures A's owner and cannot silently execute on B."""
+    user_id = 1147817421
+    thread_id = 1102
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    owner = {
+        "chat_id": chat_id,
+        "window_id": "@owner-a",
+        "codex_thread_id": "codex-thread-a",
+        "machine_id": "machine-a",
+        "cwd": "/workspace/a",
+    }
+    warnings: list[str] = []
+    sent: list[str] = []
+
+    def _binding(*_args, **_kwargs):
+        return SimpleNamespace(**owner)
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _sync_dock(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        return True, ""
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        warnings.append(text)
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        chat_id=chat_id,
+        message_id=1,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, _tid, **_kwargs: owner["window_id"],
+    )
+    monkeypatch.setattr(bot.session_manager, "resolve_topic_binding", _binding)
+    monkeypatch.setattr(bot.session_manager, "_get_persisted_topic_binding", _binding)
+    monkeypatch.setattr(bot, "capture_topic_ownership", mq.capture_topic_ownership)
+    monkeypatch.setattr(bot.session_manager, "set_topic_response_mode", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot.session_manager, "is_coco_control_topic", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bot.session_manager, "get_window_mention_only", lambda _wid: False)
+    monkeypatch.setattr(bot.session_manager, "is_window_external_turn_active", lambda _wid: True)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _sync_dock)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send_topic_text_to_window)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    try:
+        await bot._forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text="captured under owner A",
+        )
+        assert mq.queued_topic_input_count(user_id, thread_id, chat_id) == 1
+
+        # Model an explicit /resume rebind before the queued drain wakes up.
+        owner.update(
+            window_id="@owner-b",
+            codex_thread_id="codex-thread-b",
+            machine_id="machine-b",
+            cwd="/workspace/b",
+        )
+        await bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@owner-b",
+            chat_id=chat_id,
+        )
+
+        assert sent == []
+        assert mq.queued_topic_input_count(user_id, thread_id, chat_id) == 0
+        assert warnings
+        warning = warnings[-1].lower()
+        assert "not sent" in warning
+        assert "binding" in warning or "rebind" in warning
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_queued_topic_drain_drops_stale_owner_and_checks_next_item(
+    monkeypatch,
+):
+    """A stale A item is dropped while a later B item is independently checked."""
+    user_id = 1147817421
+    thread_id = 1103
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    owner = {
+        "chat_id": chat_id,
+        "window_id": "@owner-a",
+        "codex_thread_id": "codex-thread-a",
+        "machine_id": "machine-a",
+        "cwd": "/workspace/a",
+    }
+    warnings: list[str] = []
+    sent: list[str] = []
+
+    def _binding(*_args, **_kwargs):
+        return SimpleNamespace(**owner)
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _sync_dock(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        return True, ""
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        warnings.append(text)
+
+    monkeypatch.setattr(bot.session_manager, "resolve_topic_binding", _binding)
+    monkeypatch.setattr(bot.session_manager, "_get_persisted_topic_binding", _binding)
+    monkeypatch.setattr(bot.session_manager, "get_window_for_thread", lambda _uid, _tid, **_kwargs: owner["window_id"])
+    monkeypatch.setattr(bot.session_manager, "is_window_external_turn_active", lambda _wid: False)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send_topic_text_to_window)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+
+    try:
+        _enqueue_test_topic_input(
+            user_id,
+            thread_id,
+            "stale A",
+            chat_id,
+            1,
+            capture_current=True,
+        )
+        owner.update(
+            window_id="@owner-b",
+            codex_thread_id="codex-thread-b",
+            machine_id="machine-b",
+            cwd="/workspace/b",
+        )
+        _enqueue_test_topic_input(
+            user_id,
+            thread_id,
+            "current B",
+            chat_id,
+            2,
+            capture_current=True,
+        )
+
+        await bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@owner-b",
+            chat_id=chat_id,
+        )
+
+        assert sent == ["current B"]
+        assert warnings
+        warning = warnings[-1].lower()
+        assert "not sent" in warning
+        assert "binding" in warning or "rebind" in warning
+        assert mq.queued_topic_input_count(user_id, thread_id, chat_id) == 0
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_rechecks_owner_after_dock_and_queue_barriers(
+    monkeypatch,
+):
+    """A queued A request must not cross a rebind while pre-send waits run."""
+    user_id = 1147817421
+    thread_id = 1200
+    chat_id = -100321
+    owner_a = mq.TopicOwnership(
+        window_id="@1200-a",
+        codex_thread_id="codex-1200-a",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    owner_b = mq.TopicOwnership(
+        window_id="@1200-b",
+        codex_thread_id="codex-1200-b",
+        machine_id="machine-b",
+        cwd="/workspace/b",
+    )
+    current_owner = {"value": owner_a}
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "old A request",
+        chat_id,
+        1,
+        topic_ownership=owner_a,
+    )
+
+    sync_started = asyncio.Event()
+    release_sync = asyncio.Event()
+    queue_join_started = asyncio.Event()
+    release_queue_join = asyncio.Event()
+    sync_calls = 0
+    sent: list[str] = []
+    warnings: list[str] = []
+
+    class _Queue:
+        async def join(self):
+            queue_join_started.set()
+            await release_queue_join.wait()
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _sync_dock(*_args, **_kwargs):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            sync_started.set()
+            await release_sync.wait()
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        return True, ""
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        warnings.append(text)
+
+    def _binding_matches(
+        _user_id,
+        _thread_id,
+        *,
+        chat_id,
+        window_id,
+        codex_thread_id,
+        machine_id,
+        cwd,
+    ):
+        expected = current_owner["value"]
+        return (
+            chat_id == expected_chat_id
+            and window_id == expected.window_id
+            and codex_thread_id == expected.codex_thread_id
+            and machine_id == expected.machine_id
+            and cwd == expected.cwd
+        )
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: _Queue())
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    expected_chat_id = chat_id
+    monkeypatch.setattr(
+        bot.session_manager,
+        "_topic_binding_ownership_matches",
+        _binding_matches,
+    )
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+
+    drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=owner_a.window_id,
+            chat_id=chat_id,
+        )
+    )
+    try:
+        await asyncio.wait_for(sync_started.wait(), timeout=1)
+        release_sync.set()
+        await asyncio.wait_for(queue_join_started.wait(), timeout=1)
+
+        # /resume rebinds the topic while the drain is still at its final
+        # pre-dispatch barrier. The popped A item must not be sent to B.
+        current_owner["value"] = owner_b
+        release_queue_join.set()
+        await asyncio.wait_for(drain, timeout=1)
+
+        assert sent == []
+        assert warnings
+        assert "not sent" in warnings[-1].lower()
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        release_sync.set()
+        release_queue_join.set()
+        await asyncio.gather(drain, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_ingress_during_empty_owned_drain_preserves_wakeup(monkeypatch):
+    """An ingress item arriving during an empty drain must not be stranded."""
+    user_id = 1147817421
+    thread_id = 1201
+    chat_id = -100321
+    owner = mq.TopicOwnership(
+        window_id="@1201",
+        codex_thread_id="codex-1201",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    sent: list[str] = []
+    sync_started = asyncio.Event()
+    release_sync = asyncio.Event()
+    sync_calls = 0
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _sync_dock(*_args, **_kwargs):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            sync_started.set()
+            await release_sync.wait()
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        return True, ""
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _noop_async)
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda _uid, _tid, **_kwargs: owner.window_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: SimpleNamespace(
+            codex_thread_id=owner.codex_thread_id,
+            cwd=owner.cwd,
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_response_mode",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_mention_only",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_window_external_turn_active",
+        lambda _wid: False,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(mq, "capture_topic_ownership", lambda *_args, **_kwargs: owner)
+
+    owner_drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=owner.window_id,
+            chat_id=chat_id,
+        )
+    )
+    try:
+        await asyncio.wait_for(sync_started.wait(), timeout=1)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id),
+            chat_id=chat_id,
+            message_id=2,
+        )
+        context = SimpleNamespace(bot=object(), user_data={})
+
+        # The owning drain has popped an empty queue and is waiting on dock
+        # sync. Normal ingress must enqueue B and preserve a completion wakeup.
+        await bot._forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text="new ingress B",
+        )
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("new ingress B", chat_id, 2)
+        ]
+
+        release_sync.set()
+        await asyncio.wait_for(owner_drain, timeout=1)
+        assert sent == ["new ingress B"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+    finally:
+        release_sync.set()
+        await asyncio.gather(owner_drain, return_exceptions=True)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+        bot._queued_topic_drain_wakeups.clear()
+        bot._queued_topic_drains.clear()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_restores_pre_dispatch_exception_once_with_owner_fifo(
+    monkeypatch,
+):
+    """A definite pre-send resume failure restores the popped item exactly once."""
+    user_id = 1147817421
+    thread_id = 1202
+    chat_id = -100321
+    owner = mq.TopicOwnership(
+        window_id="@1202",
+        codex_thread_id="codex-1202",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "A before resume failure",
+        chat_id,
+        1,
+        topic_ownership=owner,
+    )
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "B after A",
+        chat_id,
+        2,
+        topic_ownership=owner,
+    )
+    sent: list[str] = []
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        # This models the exact host-follow resume failure before any turn
+        # input is accepted by app-server.
+        raise bot.CodexAppServerError("thread not found: codex-1202")
+
+    async def _safe_send(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+
+    try:
+        try:
+            await bot._dispatch_next_queued_input(
+                bot=object(),
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=owner.window_id,
+                chat_id=chat_id,
+            )
+        except bot.CodexAppServerError as exc:
+            assert "thread not found" in str(exc)
+
+        bucket = mq._queued_topic_inputs[mq._topic_key(user_id, thread_id, chat_id)]
+        assert [item.text for item in bucket] == [
+            "A before resume failure",
+            "B after A",
+        ]
+        assert [item.topic_ownership for item in bucket] == [owner, owner]
+        assert sent == ["A before resume failure"]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_post_write_disconnect_is_not_requeued_or_replayed(
+    monkeypatch,
+):
+    """A post-write app-server disconnect must not replay the queued request."""
+    user_id = 1147817421
+    thread_id = 1203
+    chat_id = -100321
+    owner = mq.TopicOwnership(
+        window_id="@1203",
+        codex_thread_id="codex-1203",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(
+        user_id,
+        thread_id,
+        "possibly delivered request",
+        chat_id,
+        1,
+        topic_ownership=owner,
+    )
+    send_calls: list[str] = []
+    failures: list[str] = []
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_sync(*_args, **_kwargs):
+        return None
+
+    async def _send_topic_text_to_window(**kwargs):
+        send_calls.append(kwargs["text"])
+        # The transport reports only a generic disconnect after the write. The
+        # queue layer must classify this as post-dispatch uncertainty rather
+        # than relying on an explicit "uncertain" marker in the message.
+        dispatch_state = kwargs.get("dispatch_state")
+        if dispatch_state is not None:
+            dispatch_state.transport_dispatch_started = True
+        return False, "App-server disconnected"
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        failures.append(text)
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_sync)
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+
+    try:
+        await bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id="@1203",
+            chat_id=chat_id,
+        )
+
+        assert send_calls == ["possibly delivered request"]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == []
+        assert failures
+        assert "App-server disconnected" in failures[0]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_q_capture_gap_drops_ownerless_input_before_rebound_owner_can_send(
+    monkeypatch,
+):
+    """A queue item captured during an A->unbound->B gap must not target B."""
+    user_id = 1147817421
+    thread_id = 1104
+    chat_id = -100321
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+    owner_a = SimpleNamespace(
+        chat_id=chat_id,
+        window_id="@owner-a",
+        codex_thread_id="codex-thread-a",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    owner_b = SimpleNamespace(
+        chat_id=chat_id,
+        window_id="@owner-b",
+        codex_thread_id="codex-thread-b",
+        machine_id="machine-b",
+        cwd="/workspace/b",
+    )
+    raw_binding = {"value": owner_a}
+    active_turn = {"value": True}
+    sent: list[str] = []
+    warnings: list[str] = []
+
+    def _raw_binding(*_args, **_kwargs):
+        return raw_binding["value"]
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        return active_turn["value"]
+
+    async def _send_topic_text_to_window(**kwargs):
+        sent.append(kwargs["text"])
+        return True, ""
+
+    async def _safe_send(_bot, _chat_id, text, **_kwargs):
+        warnings.append(text)
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    original_enqueue = mq.enqueue_queued_topic_input
+
+    def _enqueue_during_binding_gap(*args, **kwargs):
+        # The handler already resolved A. The persisted binding disappears
+        # before capture, then B is rebound before the drain wakes up.
+        raw_binding["value"] = None
+        result = original_enqueue(*args, **kwargs)
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("old input from A", chat_id, 1)
+        ]
+        raw_binding["value"] = owner_b
+        return result
+
+    message = SimpleNamespace(
+        text="/q old input from A",
+        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        message_id=1,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda _uid, _tid, **_kwargs: owner_a.window_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda _uid, _tid, **_kwargs: owner_a,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "_get_persisted_topic_binding",
+        _raw_binding,
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: mq.TopicOwnership(
+            window_id=owner_a.window_id,
+            codex_thread_id=owner_a.codex_thread_id,
+            machine_id=owner_a.machine_id,
+            cwd=owner_a.cwd,
+        ),
+    )
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "enqueue_queued_topic_input", _enqueue_during_binding_gap)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _noop_async)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "safe_send", _safe_send)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda *_args, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+
+    try:
+        await bot.queue_command(update, context)
+        assert mq.queued_topic_input_count(user_id, thread_id, chat_id) == 1
+
+        active_turn["value"] = False
+        await bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=owner_b.window_id,
+            chat_id=chat_id,
+        )
+
+        assert sent == []
+        assert mq.queued_topic_input_count(user_id, thread_id, chat_id) == 0
+        assert warnings
+        warning = warnings[-1].lower()
+        assert "not sent" in warning
+        assert "binding" in warning or "owner" in warning
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+async def test_ownerless_non_topic_task_remains_deliverable(monkeypatch):
+    """Missing topic ownership is valid for ordinary non-topic delivery."""
+    user_id = 7718
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    delivered: list[mq.MessageTask] = []
+
+    async def _process(_bot, _user_id: int, task: mq.MessageTask):
+        delivered.append(task)
+
+    monkeypatch.setattr(mq, "_process_content_task", _process)
+    task = mq.MessageTask(task_type="content", parts=["ordinary message"])
+    mq._put_queued_task(user_id, queue, task)
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=0.5)
+        assert delivered == [task]
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, 0, 0), None)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_next_q_restores_fifo_once_when_remote_rpc_cancelled_before_write(
+    monkeypatch,
+):
+    """Remote connect cancellation is still before the RPC writer boundary."""
+    import coco.agent_rpc as agent_rpc_module
+    import coco.cluster_rpc as cluster_rpc_module
+
+    user_id = 1147817421
+    thread_id = 1204
+    chat_id = -100321
+    window_id = _TEST_TOPIC_OWNERSHIP.window_id
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    _enqueue_test_topic_input(user_id, thread_id, "A", chat_id, 1)
+    _enqueue_test_topic_input(user_id, thread_id, "B", chat_id, 2)
+
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    monkeypatch.setattr(
+        manager,
+        "_local_machine_identity",
+        lambda: ("local-test-machine", "Local test machine"),
+    )
+    manager.set_group_chat_id(user_id, thread_id, chat_id)
+    state = manager.get_window_state(window_id)
+    state.cwd = _TEST_TOPIC_OWNERSHIP.cwd
+    state.window_name = "remote-window"
+    state.codex_thread_id = _TEST_TOPIC_OWNERSHIP.codex_thread_id
+    manager.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        codex_thread_id=state.codex_thread_id,
+        cwd=state.cwd,
+        window_id=window_id,
+        machine_id=_TEST_TOPIC_OWNERSHIP.machine_id,
+    )
+
+    async def _no_goal_context(*_args, **_kwargs):
+        return ""
+
+    monkeypatch.setattr(manager, "_build_coco_operator_context", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(manager, "_build_live_goal_context", _no_goal_context)
+    monkeypatch.setattr(manager, "resolve_thread_skills", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(manager, "resolve_thread_codex_skills", lambda *_args, **_kwargs: [])
+
+    remote_client = agent_rpc_module.AgentRpcClient(shared_secret="rpc-secret")
+    monkeypatch.setattr(
+        remote_client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("remote.test", 12345),
+    )
+
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+    writer_writes: list[bytes] = []
+
+    class _Reader:
+        async def readline(self):
+            return b""
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            writer_writes.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def _open_connection(_host, _port, **_kwargs):
+        connect_started.set()
+        await release_connect.wait()
+        return _Reader(), _Writer()
+
+    monkeypatch.setattr(
+        cluster_rpc_module.asyncio,
+        "open_connection",
+        _open_connection,
+    )
+    monkeypatch.setattr(agent_rpc_module, "agent_rpc_client", remote_client)
+    monkeypatch.setattr(session_module.node_registry, "get_node", lambda _machine_id: None)
+
+    dispatch_states: list[bot.TopicSendDispatchState] = []
+    state_type = bot.TopicSendDispatchState
+
+    def _capture_dispatch_state():
+        dispatch_state = state_type()
+        dispatch_states.append(dispatch_state)
+        return dispatch_state
+
+    prepend_calls: list[tuple[str, int, int]] = []
+    original_prepend = bot.prepend_queued_topic_input
+
+    def _prepend(*args, **kwargs):
+        prepend_calls.append((args[2], args[3], args[4]))
+        return original_prepend(*args, **kwargs)
+
+    async def _not_in_progress(*_args, **_kwargs):
+        return False
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(bot, "TopicSendDispatchState", _capture_dispatch_state)
+    monkeypatch.setattr(bot, "prepend_queued_topic_input", _prepend)
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "_is_window_in_progress", _not_in_progress)
+    monkeypatch.setattr(bot, "get_message_queue", lambda _uid: None)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+
+    drain_key = bot._queued_topic_drain_key(user_id, thread_id, chat_id)
+    bot._queued_topic_drains.discard(drain_key)
+    bot._queued_topic_drain_wakeups.pop(drain_key, None)
+    drain = asyncio.create_task(
+        bot._dispatch_next_queued_input(
+            bot=object(),
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            chat_id=chat_id,
+        )
+    )
+    try:
+        for _ in range(100):
+            if connect_started.is_set() or drain.done():
+                break
+            await asyncio.sleep(0.01)
+        assert connect_started.is_set(), (
+            "remote drain ended before the RPC connect boundary: "
+            f"{drain.exception() if drain.done() else 'still running'}"
+        )
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+
+        assert writer_writes == []
+        assert len(dispatch_states) == 1
+        assert dispatch_states[0].transport_dispatch_started is False
+        assert prepend_calls == [("A", chat_id, 1)]
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("A", chat_id, 1),
+            ("B", chat_id, 2),
+        ]
+    finally:
+        release_connect.set()
+        await asyncio.gather(drain, return_exceptions=True)
+        bot._queued_topic_drains.discard(drain_key)
+        bot._queued_topic_drain_wakeups.pop(drain_key, None)
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "helper_name",
+    (
+        "status_update",
+        "status_clear",
+        "progress_update",
+        "progress_start",
+        "progress_clear",
+        "progress_finalize",
+    ),
+)
+async def test_topic_scoped_status_progress_tasks_drop_after_explicit_rebind(
+    monkeypatch,
+    helper_name,
+):
+    """Queued A status/progress work must not write after an A->B rebind."""
+    user_id = 7720
+    thread_id = 7721
+    chat_id = -1007721
+    owner_a = {
+        "window_id": "@progress-a",
+        "codex_thread_id": "codex-progress-a",
+        "cwd": "/workspace/progress-a",
+        "machine_id": "machine-a",
+    }
+    owner_b = {
+        "window_id": "@progress-b",
+        "codex_thread_id": "codex-progress-b",
+        "cwd": "/workspace/progress-b",
+        "machine_id": "machine-b",
+    }
+
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    manager.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        window_id=owner_a["window_id"],
+        codex_thread_id=owner_a["codex_thread_id"],
+        cwd=owner_a["cwd"],
+        machine_id=owner_a["machine_id"],
+        display_name="owner A",
+    )
+    monkeypatch.setattr(mq, "session_manager", manager)
+
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    skey = mq._topic_key(user_id, thread_id, chat_id)
+    writes: list[str] = []
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs):
+            writes.append("edit")
+
+        async def delete_message(self, **_kwargs):
+            writes.append("delete")
+
+        async def send_chat_action(self, **_kwargs):
+            writes.append("typing")
+
+    async def _send_with_fallback(*_args, **_kwargs):
+        writes.append("send")
+        return SimpleNamespace(message_id=8800)
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send_with_fallback)
+    bot_obj = _Bot()
+    owner_a_snapshot = mq.capture_topic_ownership(user_id, thread_id, chat_id)
+    assert owner_a_snapshot is not None
+
+    if helper_name == "status_update":
+        mq._status_msg_info[skey] = (8701, owner_a["window_id"], "old status")
+        await mq.enqueue_status_update(
+            bot_obj,
+            user_id,
+            owner_a["window_id"],
+            "new status",
+            thread_id,
+            chat_id,
+        )
+    elif helper_name == "status_clear":
+        mq._status_msg_info[skey] = (8702, owner_a["window_id"], "old status")
+        await mq.enqueue_status_update(
+            bot_obj,
+            user_id,
+            owner_a["window_id"],
+            None,
+            thread_id,
+            chat_id,
+        )
+    elif helper_name == "progress_update":
+        mq._progress_msg_info[skey] = (8703, owner_a["window_id"], "old progress")
+        await mq.enqueue_progress_update(
+            bot_obj,
+            user_id,
+            owner_a["window_id"],
+            " + next",
+            thread_id,
+            chat_id,
+        )
+    elif helper_name == "progress_start":
+        await mq.enqueue_progress_start(
+            bot_obj,
+            user_id,
+            owner_a["window_id"],
+            thread_id,
+            chat_id,
+        )
+    elif helper_name == "progress_clear":
+        mq._progress_msg_info[skey] = (8704, owner_a["window_id"], "old progress")
+        await mq.enqueue_progress_clear(bot_obj, user_id, thread_id, chat_id)
+    else:
+        mq._progress_msg_info[skey] = (8705, owner_a["window_id"], "old progress")
+        await mq.enqueue_progress_finalize(
+            bot_obj,
+            user_id,
+            owner_a["window_id"],
+            thread_id,
+            chat_id=chat_id,
+        )
+
+    assert queue.qsize() == 1
+
+    # This is the explicit lifecycle rebind that must fence work captured for A.
+    manager.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        window_id=owner_b["window_id"],
+        codex_thread_id=owner_b["codex_thread_id"],
+        cwd=owner_b["cwd"],
+        machine_id=owner_b["machine_id"],
+        display_name="owner B",
+    )
+
+    worker = asyncio.create_task(mq._message_queue_worker(bot_obj, user_id))
+    try:
+        await asyncio.wait_for(queue.join(), timeout=1)
+        assert writes == []
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queue_workers.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._topic_delivery_generations.pop(skey, None)
+        mq._status_msg_info.pop(skey, None)
+        mq._progress_msg_info.pop(skey, None)
+        mq._progress_text_cache.pop(skey, None)
+
+
+@pytest.mark.asyncio
+async def test_threadless_progress_task_remains_deliverable(monkeypatch):
+    """A helper task without a topic owner still reaches Telegram."""
+    user_id = 7722
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    writes: list[str] = []
+
+    async def _send_with_fallback(*_args, **_kwargs):
+        writes.append("send")
+        return SimpleNamespace(message_id=8801)
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send_with_fallback)
+    await mq.enqueue_progress_start(
+        object(),  # type: ignore[arg-type]
+        user_id,
+        "@threadless",
+    )
+    worker = asyncio.create_task(mq._message_queue_worker(object(), user_id))
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=1)
+        assert writes == ["send"]
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queue_workers.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, 0, 0), None)
+        mq._progress_msg_info.pop((user_id, 0, 0), None)
+        mq._progress_text_cache.pop((user_id, 0, 0), None)
+
+
+@pytest.mark.asyncio
+async def test_progress_update_captures_owner_before_coalescing_lock_wait(monkeypatch):
+    """Progress ownership must be A even if coalescing waits through an A->B rebind."""
+    user_id = 7723
+    thread_id = 7724
+    chat_id = -1007724
+    owner_a = {
+        "window_id": "@progress-lock-a",
+        "codex_thread_id": "codex-progress-lock-a",
+        "cwd": "/workspace/progress-lock-a",
+        "machine_id": "machine-a",
+    }
+    owner_b = {
+        "window_id": "@progress-lock-b",
+        "codex_thread_id": "codex-progress-lock-b",
+        "cwd": "/workspace/progress-lock-b",
+        "machine_id": "machine-b",
+    }
+
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    manager.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        window_id=owner_a["window_id"],
+        codex_thread_id=owner_a["codex_thread_id"],
+        cwd=owner_a["cwd"],
+        machine_id=owner_a["machine_id"],
+        display_name="owner A",
+    )
+    monkeypatch.setattr(mq, "session_manager", manager)
+
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+
+    class _TrackingLock(asyncio.Lock):
+        def __init__(self):
+            super().__init__()
+            self.waiting = asyncio.Event()
+
+        async def acquire(self):
+            if self.locked():
+                self.waiting.set()
+            return await super().acquire()
+
+    lock = _TrackingLock()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = lock
+    skey = mq._topic_key(user_id, thread_id, chat_id)
+    mq._progress_msg_info[skey] = (8706, owner_a["window_id"], "old progress")
+    writes: list[str] = []
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs):
+            writes.append("edit")
+
+        async def delete_message(self, **_kwargs):
+            writes.append("delete")
+
+    async def _send_with_fallback(*_args, **_kwargs):
+        writes.append("send")
+        return SimpleNamespace(message_id=8802)
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send_with_fallback)
+    bot_obj = _Bot()
+    enqueue_task: asyncio.Task[None] | None = None
+    worker: asyncio.Task[None] | None = None
+
+    await lock.acquire()
+    try:
+        enqueue_task = asyncio.create_task(
+            mq.enqueue_progress_update(
+                bot_obj,
+                user_id,
+                owner_a["window_id"],
+                " + stale A progress",
+                thread_id,
+                chat_id,
+            )
+        )
+        await asyncio.wait_for(lock.waiting.wait(), timeout=1)
+        assert not enqueue_task.done()
+
+        # The enqueue coroutine is suspended at the coalescing lock. Rebinding
+        # now must not make its A output capture B after the await resumes.
+        manager.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            window_id=owner_b["window_id"],
+            codex_thread_id=owner_b["codex_thread_id"],
+            cwd=owner_b["cwd"],
+            machine_id=owner_b["machine_id"],
+            display_name="owner B",
+        )
+        lock.release()
+        await asyncio.wait_for(enqueue_task, timeout=1)
+        assert queue.qsize() == 1
+
+        worker = asyncio.create_task(mq._message_queue_worker(bot_obj, user_id))
+        await asyncio.wait_for(queue.join(), timeout=1)
+        assert writes == []
+    finally:
+        if lock.locked():
+            lock.release()
+        if enqueue_task is not None:
+            await asyncio.gather(enqueue_task, return_exceptions=True)
+        if worker is not None:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queue_workers.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._active_delivery_topics.pop(user_id, None)
+        mq._topic_delivery_generations.pop(skey, None)
+        mq._progress_msg_info.pop(skey, None)
+        mq._progress_text_cache.pop(skey, None)
+
+
+@pytest.mark.asyncio
+async def test_forward_topic_text_drops_prompt_when_owner_rebinds_before_send(
+    monkeypatch,
+):
+    """An immediate text prompt captured for A must not dispatch to rebound B."""
+    user_id = 1147817421
+    thread_id = 1301
+    chat_id = -100321
+    owner_a = mq.TopicOwnership(
+        window_id="@owner-a-1301",
+        codex_thread_id="codex-thread-a-1301",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    owner_b = mq.TopicOwnership(
+        window_id="@owner-b-1301",
+        codex_thread_id="codex-thread-b-1301",
+        machine_id="machine-b",
+        cwd="/workspace/b",
+    )
+    current_owner = {"value": owner_a}
+    capture_started = asyncio.Event()
+    progress_check_started = asyncio.Event()
+    release_progress_check = asyncio.Event()
+    dispatched: list[tuple[str, str]] = []
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        chat_id=chat_id,
+        message_id=130101,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    def _resolve_binding(_uid, _tid, **_kwargs):
+        owner = current_owner["value"]
+        return SimpleNamespace(
+            window_id=owner.window_id,
+            codex_thread_id=owner.codex_thread_id,
+            machine_id=owner.machine_id,
+            cwd=owner.cwd,
+        )
+
+    def _capture_ownership(*_args, **_kwargs):
+        assert current_owner["value"] is owner_a
+        capture_started.set()
+        return owner_a
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        progress_check_started.set()
+        await release_progress_check.wait()
+        return False
+
+    async def _send_topic_text_to_window(
+        *, window_id, text, topic_ownership=None, **_kwargs
+    ):
+        # This fake models the vulnerable SessionManager behavior: without the
+        # ingress snapshot, it resolves the rebound canonical owner (B).
+        if topic_ownership is None:
+            dispatched.append((current_owner["value"].window_id, text))
+            return True, ""
+        if topic_ownership != current_owner["value"]:
+            return False, "stale topic owner; request was not sent"
+        dispatched.append((window_id, text))
+        return True, ""
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda *_args, **_kwargs: owner_a.window_id,
+    )
+    monkeypatch.setattr(bot.session_manager, "resolve_topic_binding", _resolve_binding)
+    monkeypatch.setattr(bot, "capture_topic_ownership", _capture_ownership)
+    monkeypatch.setattr(
+        bot.session_manager, "set_topic_response_mode", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        bot.session_manager, "is_coco_control_topic", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(
+        bot.session_manager, "get_window_mention_only", lambda _wid: False
+    )
+    monkeypatch.setattr(
+        bot.session_manager, "is_window_external_turn_active", lambda _wid: False
+    )
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(bot, "_start_ingress_ack", lambda _message: [])
+    monkeypatch.setattr(bot, "enqueue_status_update", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _noop_async)
+    monkeypatch.setattr(bot, "enqueue_progress_start", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+
+    send_task = asyncio.create_task(
+        bot._forward_topic_text_message(
+            message=message,
+            context=context,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text="prompt captured for owner A",
+        )
+    )
+    await asyncio.wait_for(
+        asyncio.gather(capture_started.wait(), progress_check_started.wait()),
+        timeout=1,
+    )
+    current_owner["value"] = owner_b
+    release_progress_check.set()
+    await asyncio.wait_for(send_task, timeout=1)
+
+    assert not any(window_id == owner_b.window_id for window_id, _text in dispatched)
+
+
+@pytest.mark.asyncio
+async def test_q_drops_prompt_when_owner_rebinds_before_immediate_send(monkeypatch):
+    """A direct /q captured for A must not dispatch to rebound owner B."""
+    user_id = 1147817421
+    thread_id = 1302
+    chat_id = -100321
+    owner_a = mq.TopicOwnership(
+        window_id="@owner-a-1302",
+        codex_thread_id="codex-thread-a-1302",
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    owner_b = mq.TopicOwnership(
+        window_id="@owner-b-1302",
+        codex_thread_id="codex-thread-b-1302",
+        machine_id="machine-b",
+        cwd="/workspace/b",
+    )
+    current_owner = {"value": owner_a}
+    capture_started = asyncio.Event()
+    progress_check_started = asyncio.Event()
+    release_progress_check = asyncio.Event()
+    dispatched: list[tuple[str, str]] = []
+
+    message = SimpleNamespace(
+        text="/q prompt captured for owner A",
+        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        message_id=130201,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    def _resolve_binding(_uid, _tid, **_kwargs):
+        owner = current_owner["value"]
+        return SimpleNamespace(
+            window_id=owner.window_id,
+            codex_thread_id=owner.codex_thread_id,
+            machine_id=owner.machine_id,
+            cwd=owner.cwd,
+        )
+
+    def _capture_ownership(*_args, **_kwargs):
+        assert current_owner["value"] is owner_a
+        capture_started.set()
+        return owner_a
+
+    async def _is_window_in_progress(*_args, **_kwargs):
+        progress_check_started.set()
+        await release_progress_check.wait()
+        return False
+
+    async def _send_topic_text_to_window(
+        *, window_id, text, topic_ownership=None, **_kwargs
+    ):
+        if topic_ownership is None:
+            dispatched.append((current_owner["value"].window_id, text))
+            return True, ""
+        if topic_ownership != current_owner["value"]:
+            return False, "stale topic owner; request was not sent"
+        dispatched.append((window_id, text))
+        return True, ""
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda *_args, **_kwargs: owner_a.window_id,
+    )
+    monkeypatch.setattr(bot.session_manager, "resolve_topic_binding", _resolve_binding)
+    monkeypatch.setattr(bot, "capture_topic_ownership", _capture_ownership)
+    monkeypatch.setattr(bot, "_is_window_in_progress", _is_window_in_progress)
+    monkeypatch.setattr(
+        bot.session_manager, "send_topic_text_to_window", _send_topic_text_to_window
+    )
+    monkeypatch.setattr(
+        bot.session_manager, "is_codex_active_writer_error", lambda _error: False
+    )
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "note_run_started", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    send_task = asyncio.create_task(bot.queue_command(update, context))
+    await asyncio.wait_for(
+        asyncio.gather(capture_started.wait(), progress_check_started.wait()),
+        timeout=1,
+    )
+    current_owner["value"] = owner_b
+    release_progress_check.set()
+    await asyncio.wait_for(send_task, timeout=1)
+
+    assert not any(window_id == owner_b.window_id for window_id, _text in dispatched)

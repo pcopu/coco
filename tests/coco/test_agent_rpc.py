@@ -337,6 +337,11 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         model_slug="",
         reasoning_effort="",
         service_tier="",
+        remote_thread_id=None,
+        remote_cwd="",
+        remote_window_name="",
+        remote_approval_mode="",
+        result_snapshot=None,
     ):
         captured["window_id"] = window_id
         captured["inputs"] = inputs
@@ -345,9 +350,15 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         captured["model_slug"] = model_slug
         captured["reasoning_effort"] = reasoning_effort
         captured["service_tier"] = service_tier
+        captured["remote_thread_id"] = remote_thread_id
+        captured["remote_cwd"] = remote_cwd
+        captured["remote_window_name"] = remote_window_name
+        captured["remote_approval_mode"] = remote_approval_mode
         current = session_manager.get_window_state(window_id)
         current.codex_thread_id = "thread-1"
         current.codex_active_turn_id = "turn-1"
+        if result_snapshot is not None:
+            result_snapshot.update(thread_id="thread-1", turn_id="turn-1")
         return True, "ok"
 
     async def _ensure_started() -> None:
@@ -390,6 +401,9 @@ async def test_agent_rpc_send_inputs_passes_model_selection(monkeypatch):
         assert captured["model_slug"] == "gpt-5.4"
         assert captured["reasoning_effort"] == "high"
         assert captured["service_tier"] == "fast"
+        assert captured["remote_thread_id"] == ""
+        assert captured["remote_cwd"] == "/tmp/demo"
+        assert captured["remote_window_name"] == "demo"
         assert payload["thread_id"] == "thread-1"
         assert payload["turn_id"] == "turn-1"
         assert isinstance(payload["transport_epoch"], str)
@@ -1132,6 +1146,96 @@ async def test_agent_send_starts_transport_before_acknowledgement_fence(
     assert payload["transport_generation"] == 1
     assert payload["transport_reset_occurred"] is False
     assert events == ["ensure_started", "send"]
+
+
+@pytest.mark.asyncio
+async def test_agent_concurrent_sends_configure_expected_thread_inside_send_lock(
+    monkeypatch,
+):
+    window_id = "@remote-send-thread-race"
+    first_start_entered = asyncio.Event()
+    release_first_start = asyncio.Event()
+    ensure_calls = 0
+    dispatched: list[tuple[str, str]] = []
+    transport_state = {
+        "epoch": "agent-epoch-1",
+        "epoch_started_at": 100.0,
+        "generation": 1,
+        "reset_sequence": 0,
+        "last_reset_generation": 0,
+        "last_reset_reason": "",
+        "last_reset_at": 0.0,
+    }
+
+    async def _ensure_started() -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+        if ensure_calls == 1:
+            first_start_entered.set()
+            await release_first_start.wait()
+
+    async def _send_inputs_via_codex_app_server(
+        *, window_id: str, inputs: list[dict[str, object]], **_kwargs
+    ):
+        text = str(inputs[0]["text"])
+        current_thread_id = session_manager.get_window_codex_thread_id(window_id)
+        dispatched.append((text, current_thread_id))
+        return True, "ok"
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "ensure_started",
+        _ensure_started,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: dict(transport_state),
+    )
+    monkeypatch.setattr(
+        session_manager,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(session_manager, "_save_state", lambda: None)
+
+    previous_state = session_manager.window_states.pop(window_id, None)
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    try:
+        send_a = asyncio.create_task(
+            server._send_inputs(
+                {
+                    "window_id": window_id,
+                    "cwd": "/tmp/demo",
+                    "window_name": "demo",
+                    "thread_id": "thread-a",
+                    "inputs": [{"type": "text", "text": "A"}],
+                }
+            )
+        )
+        await first_start_entered.wait()
+        send_b = asyncio.create_task(
+            server._send_inputs(
+                {
+                    "window_id": window_id,
+                    "cwd": "/tmp/demo",
+                    "window_name": "demo",
+                    "thread_id": "thread-b",
+                    "inputs": [{"type": "text", "text": "B"}],
+                }
+            )
+        )
+        await send_b
+        release_first_start.set()
+        await send_a
+    finally:
+        release_first_start.set()
+        if previous_state is None:
+            session_manager.window_states.pop(window_id, None)
+        else:
+            session_manager.window_states[window_id] = previous_state
+
+    assert dispatched == [("B", "thread-b"), ("A", "thread-a")]
 
 
 @pytest.mark.asyncio

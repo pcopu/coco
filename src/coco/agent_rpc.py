@@ -755,19 +755,13 @@ class AgentRpcServer:
         inputs = params.get("inputs", [])
         if not isinstance(inputs, list):
             raise ClusterRpcError("inputs must be a list")
-        _configure_remote_window(
-            window_id=window_id,
-            cwd=cwd,
-            window_name=window_name,
-            approval_mode=approval_mode,
-            codex_thread_id=codex_thread_id,
-        )
         # Establish the transport before fencing the mutation so an ordinary
         # first startup is not mistaken for a concurrent recycle.
         await codex_app_server_client.ensure_started()
         transport_state_before = (
             codex_app_server_client.transport_state_snapshot()
         )
+        result_snapshot: dict[str, str] = {}
         ok, message = await session_manager.send_inputs_to_window(
             window_id,
             inputs,
@@ -776,6 +770,11 @@ class AgentRpcServer:
             model_slug=model_slug,
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
+            remote_thread_id=codex_thread_id,
+            remote_cwd=cwd,
+            remote_window_name=window_name,
+            remote_approval_mode=approval_mode,
+            result_snapshot=result_snapshot,
         )
         state = session_manager.get_window_state(window_id)
         transport_state = codex_app_server_client.transport_state_snapshot()
@@ -806,8 +805,8 @@ class AgentRpcServer:
         return {
             "ok": ok,
             "message": message,
-            "thread_id": state.codex_thread_id,
-            "turn_id": state.codex_active_turn_id,
+            "thread_id": result_snapshot.get("thread_id", state.codex_thread_id),
+            "turn_id": result_snapshot.get("turn_id", state.codex_active_turn_id),
             **_codex_transport_response_fields(transport_state),
             "transport_reset_occurred": False,
         }
@@ -915,14 +914,19 @@ class AgentRpcClient:
         port: int,
         method: str,
         params: dict[str, Any],
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         """Preserve a definitive agent-side fence rejection for callers."""
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
         try:
             return await self._client.call(
                 host=host,
                 port=port,
                 method=method,
                 params=params,
+                **dispatch_kwargs,
             )
         except ClusterRpcError as exc:
             message = str(exc)
@@ -1487,12 +1491,16 @@ class AgentRpcClient:
         model_slug: str = "",
         reasoning_effort: str = "",
         service_tier: str = "",
+        on_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         dispatch_fence = await self._require_codex_mutation_dispatch(
             machine_id=machine_id,
             operation="send",
         )
         host, port = self._resolve_endpoint(machine_id)
+        dispatch_kwargs = (
+            {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+        )
         result = await self._call_codex_mutation(
             host=host,
             port=port,
@@ -1511,6 +1519,7 @@ class AgentRpcClient:
                 "service_tier": service_tier,
                 **dispatch_fence,
             },
+            **dispatch_kwargs,
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid send response")

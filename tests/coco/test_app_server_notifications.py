@@ -9,6 +9,38 @@ import coco.bot as bot
 import coco.handlers.run_watchdog as run_watchdog
 
 
+def _install_current_topic_owners(
+    monkeypatch,
+    bindings: list[tuple[int, int | None, str, int]],
+    *,
+    codex_thread_id: str,
+) -> None:
+    """Provide raw topic ownership for mocked thread bindings."""
+    persisted_bindings = {
+        (user_id, bound_thread_id, chat_id): SimpleNamespace(
+            window_id=window_id,
+            codex_thread_id=codex_thread_id,
+            machine_id=bot.session_manager.get_window_machine_id(window_id),
+            cwd="",
+        )
+        for user_id, chat_id, window_id, bound_thread_id in bindings
+    }
+
+    def _get_persisted_topic_binding(
+        user_id: int,
+        thread_id: int,
+        *,
+        chat_id: int | None = None,
+    ) -> SimpleNamespace | None:
+        return persisted_bindings.get((user_id, thread_id, chat_id))
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "_get_persisted_topic_binding",
+        _get_persisted_topic_binding,
+    )
+
+
 def _install_legacy_remote_binding(monkeypatch) -> None:
     monkeypatch.setattr(
         bot,
@@ -1740,6 +1772,11 @@ async def test_remote_bookkeeping_does_not_cross_same_thread_between_machines(
             "@machine-b": "machine-b",
         }.get(window_id, ""),
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        bindings,
+        codex_thread_id="shared-thread",
+    )
     monkeypatch.setattr(
         bot.session_manager,
         "set_codex_turn_for_thread",
@@ -2210,6 +2247,11 @@ async def test_interrupted_completion_dispatches_input_queued_after_escape(monke
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-interrupted-queue",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
     monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(
@@ -2318,6 +2360,11 @@ async def test_turn_completed_finalizes_progress_and_clears_active_turn(monkeypa
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, None, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, None, "@1", 111)],
+        codex_thread_id="th-1",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **kwargs: completed.append(kwargs))
 
     async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
@@ -2371,6 +2418,11 @@ async def test_turn_completed_failed_clears_progress_and_dispatches_queue(monkey
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-2",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
     async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
@@ -2420,6 +2472,11 @@ async def test_turn_completed_completed_dispatches_queued_input(monkeypatch):
         bot.session_manager,
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-completed-q",
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
@@ -2481,6 +2538,11 @@ async def test_turn_completed_failed_retries_pending_text_after_transient_stream
         bot.session_manager,
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-retry",
     )
     monkeypatch.setattr(
         bot.session_manager,
@@ -2583,6 +2645,11 @@ async def test_turn_completed_promotes_progress_when_no_final_text(monkeypatch):
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-fallback",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
     monkeypatch.setattr(
         bot,
@@ -2636,6 +2703,11 @@ async def test_turn_completed_uses_warning_when_progress_empty(monkeypatch):
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-empty",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
     monkeypatch.setattr(
         bot,
@@ -2681,6 +2753,11 @@ async def test_turn_completed_skips_warning_after_image_only_tool_result(monkeyp
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-image",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
     async def _enqueue_finalize(_bot, user_id, window_id, thread_id=None, *, compact=False, chat_id=None):
@@ -2720,6 +2797,11 @@ async def test_turn_completed_waits_for_late_image_generation_result(monkeypatch
         bot.session_manager,
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-late-image",
     )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
 
@@ -2769,6 +2851,11 @@ async def test_turn_completed_image_generation_still_warns_after_grace_when_no_r
         "find_users_for_codex_thread",
         lambda _thread_id: [(10, -10010, "@1", 111)],
     )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id="th-image-empty",
+    )
     monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
     monkeypatch.setattr(
         bot,
@@ -2803,3 +2890,114 @@ async def test_turn_completed_image_generation_still_warns_after_grace_when_no_r
     assert finalized == [(10, "@1", 111, True)]
     assert len(final_content) == 1
     assert "without a final assistant response" in final_content[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_drops_request_after_topic_rebind_during_progress_clear(
+    monkeypatch,
+):
+    """A retry accepted for owner A must not resend into rebound owner B."""
+    user_id = 1147817421
+    thread_id = 177
+    chat_id = -100123
+    codex_thread_id = "retry-thread-a"
+    owner_a = SimpleNamespace(
+        window_id="@retry-a",
+        codex_thread_id=codex_thread_id,
+        machine_id="machine-a",
+        cwd="/workspace/a",
+    )
+    owner_b = SimpleNamespace(
+        window_id="@retry-b",
+        codex_thread_id="retry-thread-b",
+        machine_id="machine-b",
+        cwd="/workspace/b",
+    )
+    current_owner = {"value": owner_a}
+    captured: list[object] = []
+    progress_clear_started = asyncio.Event()
+    release_progress_clear = asyncio.Event()
+    dispatched: list[tuple[str, str]] = []
+
+    candidate = SimpleNamespace(
+        resend_text="retry this prompt",
+        resend_text_len=len("retry this prompt"),
+        auto_retry_allowed=True,
+        auto_retry_reason="eligible",
+        retry_count=0,
+        max_auto_retries=2,
+    )
+
+    def _capture_topic_ownership(*_args, **_kwargs):
+        assert current_owner["value"] is owner_a
+        captured.append(owner_a)
+        return owner_a
+
+    async def _enqueue_progress_clear(*_args, **_kwargs):
+        progress_clear_started.set()
+        # Explicit lifecycle rebind while the retry is awaiting progress
+        # cleanup. Any later send must still be fenced to owner A.
+        current_owner["value"] = owner_b
+        await release_progress_clear.wait()
+
+    async def _send_topic_text_to_window(
+        *,
+        window_id: str,
+        text: str,
+        topic_ownership=None,
+        **_kwargs,
+    ):
+        if topic_ownership is None:
+            dispatched.append((current_owner["value"].window_id, text))
+            return True, ""
+        if topic_ownership != current_owner["value"]:
+            return False, "stale topic owner; request was not sent"
+        dispatched.append((window_id, text))
+        return True, ""
+
+    monkeypatch.setattr(
+        bot,
+        "_find_codex_thread_bindings_for_source",
+        lambda *_args, **_kwargs: [
+            (user_id, chat_id, owner_a.window_id, thread_id)
+        ],
+    )
+    monkeypatch.setattr(bot, "capture_topic_ownership", _capture_topic_ownership)
+    monkeypatch.setattr(
+        bot,
+        "get_immediate_auto_retry_candidate",
+        lambda **_kwargs: candidate,
+    )
+    monkeypatch.setattr(bot, "note_auto_retry_attempt", lambda **_kwargs: (1, 2))
+    monkeypatch.setattr(bot, "note_auto_retry_result", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "enqueue_progress_clear", _enqueue_progress_clear)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_text_to_window",
+        _send_topic_text_to_window,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_chat_id",
+        lambda *_args, **_kwargs: chat_id,
+    )
+    monkeypatch.setattr(bot, "enqueue_progress_start", _enqueue_progress_clear)
+    monkeypatch.setattr(bot, "safe_send", _enqueue_progress_clear)
+    monkeypatch.setattr(bot, "emit_telemetry", lambda *_args, **_kwargs: None)
+
+    retry_task = asyncio.create_task(
+        bot._retry_failed_turn_after_transient_app_server_error(
+            bot=object(),
+            codex_thread_id=codex_thread_id,
+            status="failed",
+            error_message="transient stream failure",
+            source_machine_id="machine-a",
+        )
+    )
+    await asyncio.wait_for(progress_clear_started.wait(), timeout=1)
+    assert current_owner["value"] is owner_b
+    release_progress_clear.set()
+    await asyncio.wait_for(retry_task, timeout=1)
+
+    assert not any(window_id == owner_b.window_id for window_id, _text in dispatched)
+    assert captured == [owner_a]

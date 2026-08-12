@@ -643,14 +643,26 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             text_len=len(queued_text),
         )
         return
+    queue_topic_ownership = capture_topic_ownership(
+        user.id,
+        thread_id,
+        chat_id,
+    )
+    if queue_topic_ownership is None:
+        await safe_reply(
+            update.message,
+            "❌ The topic binding changed before the request could be queued. Retry it.",
+        )
+        return
 
-    if await _is_window_in_progress(user.id, thread_id, wid):
+    async def _enqueue_for_later(*, native_error: str = "") -> None:
         qsize = enqueue_queued_topic_input(
             user.id,
             thread_id,
             queued_text,
             update.message.chat_id,
             update.message.message_id,
+            topic_ownership=queue_topic_ownership,
         )
         await _set_hourglass_reaction(update.message)
         await sync_queued_topic_dock(
@@ -668,7 +680,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             queue_size=qsize,
             used_native_queue=False,
             native_attempts=0,
-            native_error="",
+            native_error=native_error,
             text_len=len(queued_text),
         )
         logger.info(
@@ -678,6 +690,29 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             wid,
             qsize,
         )
+
+    if (
+        queued_topic_input_count(user.id, thread_id, chat_id) > 0
+        or _is_queued_topic_drain_active(user.id, thread_id, chat_id)
+    ):
+        await _enqueue_for_later()
+        await _dispatch_next_queued_input(
+            context.bot,
+            user.id,
+            thread_id,
+            wid,
+            chat_id=chat_id,
+            preserve_coalesced_wakeup=True,
+        )
+        return
+
+    if await _is_window_in_progress(
+        user.id,
+        thread_id,
+        wid,
+        chat_id=chat_id,
+    ):
+        await _enqueue_for_later()
         return
 
     success, send_msg = await session_manager.send_topic_text_to_window(
@@ -687,6 +722,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         window_id=wid,
         text=queued_text,
         force_new_turn=True,
+        topic_ownership=queue_topic_ownership,
     )
     emit_telemetry(
         "queue.q_immediate_send_result",
@@ -698,6 +734,17 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text_len=len(queued_text),
     )
     if not success:
+        if session_manager.is_codex_active_writer_error(send_msg):
+            await _enqueue_for_later(native_error=send_msg)
+            await _dispatch_next_queued_input(
+                context.bot,
+                user.id,
+                thread_id,
+                wid,
+                chat_id=chat_id,
+                preserve_coalesced_wakeup=True,
+            )
+            return
         await safe_reply(update.message, f"❌ {send_msg}")
         return
     note_run_started(
@@ -2371,13 +2418,24 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
 
-    thread_id = update.message.message_thread_id
+    thread_id = _get_thread_id(update)
     if thread_id is None:
         await safe_reply(update.message, "❌ Use `/coco` inside a named topic.")
         return
     chat_id = _scoped_chat_id(update)
     if chat_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+    if thread_id != GENERAL_TOPIC_THREAD_ID:
+        await safe_reply(
+            update.message,
+            "ℹ️ CoCo control is permanently assigned to General. Use `/coco` there.",
+        )
+        return
+    _ensure_default_coco_general_control(
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
 
     raw_args = _extract_command_args(update.message.text or "").strip()
     if raw_args:
@@ -2430,6 +2488,18 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if not payload_text:
                 await safe_reply(update.message, "❌ Message cannot be empty.")
                 return
+            target_ownership = capture_topic_ownership(
+                target_user_id,
+                target_thread_id,
+                target_chat_id,
+            )
+            if target_ownership is None:
+                await safe_reply(
+                    update.message,
+                    "❌ The target topic binding changed before the request "
+                    "could be accepted. Retry it.",
+                )
+                return
             if subcommand == "queue":
                 qsize = enqueue_queued_topic_input(
                     target_user_id,
@@ -2437,6 +2507,7 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     payload_text,
                     update.message.chat_id,
                     update.message.message_id,
+                    topic_ownership=target_ownership,
                 )
                 await sync_queued_topic_dock(
                     context.bot,
@@ -2457,6 +2528,7 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 window_id=wid,
                 text=payload_text,
                 steer=True,
+                topic_ownership=target_ownership,
             )
             if not success:
                 await safe_reply(update.message, f"❌ {send_msg}")
@@ -2600,11 +2672,16 @@ async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message:
         return
 
-    thread_id = update.message.message_thread_id
+    thread_id = _get_thread_id(update)
     if thread_id is None:
         await safe_reply(update.message, "❌ Use `/voice` inside a named topic.")
         return
     chat_id = _scoped_chat_id(update)
+    _ensure_default_coco_general_control(
+        user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
     raw_args = _extract_command_args(update.message.text or "").strip().lower()
 
     if not raw_args or raw_args == "status":
