@@ -12,7 +12,23 @@ from typing import Any
 
 
 class ClusterRpcError(RuntimeError):
-    """Raised for cluster RPC transport or application errors."""
+    """Raised for cluster RPC transport or application errors.
+
+    ``request_dispatched`` records whether the request frame was written to
+    the socket before the failure.  ``False`` is a definitive pre-dispatch
+    rejection; ``True`` means the remote endpoint may have applied the
+    mutation even when its response was lost; ``None`` means the transport
+    could not prove either state and callers must be conservative.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_dispatched: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_dispatched = request_dispatched
 
 
 RpcHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | list[Any] | str | int | float | None]]
@@ -158,7 +174,10 @@ class ClusterRpcClient:
                 timeout=self._timeout_seconds,
             )
         except Exception as exc:
-            raise ClusterRpcError(str(exc) or "connect_failed") from exc
+            raise ClusterRpcError(
+                str(exc) or "connect_failed",
+                request_dispatched=False,
+            ) from exc
 
         request_id = uuid.uuid4().hex
         payload = {
@@ -167,16 +186,40 @@ class ClusterRpcClient:
             "method": method,
             "params": params,
         }
+        request_dispatched: bool | None = False
         try:
-            writer.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
-            if on_dispatch is not None:
-                on_dispatch()
             try:
-                async with asyncio.timeout(self._timeout_seconds):
-                    await writer.drain()
-                    raw = await reader.readline()
-            except TimeoutError as exc:
-                raise ClusterRpcError("request_timeout") from exc
+                # A write failure may happen after a partial frame reached the
+                # peer, so the state becomes unknown while the write is in
+                # progress.  Only a completed write is definitively marked as
+                # dispatched.
+                request_dispatched = None
+                writer.write(
+                    (json.dumps(payload, separators=(",", ":")) + "\n").encode(
+                        "utf-8"
+                    )
+                )
+                request_dispatched = True
+                if on_dispatch is not None:
+                    on_dispatch()
+                try:
+                    async with asyncio.timeout(self._timeout_seconds):
+                        await writer.drain()
+                        raw = await reader.readline()
+                except TimeoutError as exc:
+                    raise ClusterRpcError(
+                        "request_timeout",
+                        request_dispatched=request_dispatched,
+                    ) from exc
+            except ClusterRpcError as exc:
+                if exc.request_dispatched is None:
+                    exc.request_dispatched = request_dispatched
+                raise
+            except Exception as exc:
+                raise ClusterRpcError(
+                    str(exc) or "rpc_transport_error",
+                    request_dispatched=request_dispatched,
+                ) from exc
         finally:
             writer.close()
             with contextlib.suppress(OSError, TimeoutError):
@@ -186,15 +229,30 @@ class ClusterRpcClient:
                 )
 
         if not raw:
-            raise ClusterRpcError("empty_response")
+            raise ClusterRpcError(
+                "empty_response",
+                request_dispatched=request_dispatched,
+            )
         try:
             response = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ClusterRpcError("invalid_response") from exc
+            raise ClusterRpcError(
+                "invalid_response",
+                request_dispatched=request_dispatched,
+            ) from exc
         if not isinstance(response, dict):
-            raise ClusterRpcError("invalid_response")
+            raise ClusterRpcError(
+                "invalid_response",
+                request_dispatched=request_dispatched,
+            )
         if response.get("id") != request_id:
-            raise ClusterRpcError("mismatched_response")
+            raise ClusterRpcError(
+                "mismatched_response",
+                request_dispatched=request_dispatched,
+            )
         if response.get("ok") is not True:
-            raise ClusterRpcError(str(response.get("error", "rpc_error")))
+            raise ClusterRpcError(
+                str(response.get("error", "rpc_error")),
+                request_dispatched=request_dispatched,
+            )
         return response.get("result")

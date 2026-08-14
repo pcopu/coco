@@ -115,11 +115,35 @@ async def test_cluster_rpc_client_times_out_blocked_write(monkeypatch):
     monkeypatch.setattr(asyncio, "open_connection", _open_connection)
     client = ClusterRpcClient(shared_secret="secret", timeout_seconds=0.01)
 
-    with pytest.raises(ClusterRpcError, match="request_timeout"):
+    with pytest.raises(ClusterRpcError, match="request_timeout") as raised:
         await asyncio.wait_for(
             client.call(host="127.0.0.1", port=1, method="ping", params={}),
             timeout=0.2,
         )
+    assert raised.value.request_dispatched is True
+
+
+@pytest.mark.asyncio
+async def test_cluster_rpc_response_loss_marks_request_as_dispatched():
+    applied: list[dict[str, object]] = []
+
+    async def _apply_and_drop_response(reader, writer):
+        raw = await reader.readline()
+        applied.append(json.loads(raw.decode("utf-8")))
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(_apply_and_drop_response, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    try:
+        client = ClusterRpcClient(shared_secret="secret", timeout_seconds=1)
+        with pytest.raises(ClusterRpcError) as raised:
+            await client.call(host=host, port=port, method="interrupt", params={})
+        assert raised.value.request_dispatched is True
+        assert applied and applied[0]["method"] == "interrupt"
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 COCO_DIR_ENV = "COCO_DIR"
+CODEX_HOME_ENV = "CODEX_HOME"
+
 
 def env_alias(name: str, *, default: str = "") -> str:
     """Return one env var by name."""
@@ -31,6 +33,19 @@ def coco_dir() -> Path:
 
     home = Path.home()
     return home / ".coco"
+
+
+def codex_home() -> Path:
+    """Resolve the Codex home directory using Codex's environment semantics."""
+    raw = env_alias(CODEX_HOME_ENV)
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".codex"
+
+
+def codex_config_path() -> Path:
+    """Return the Codex config path for the active Codex home."""
+    return codex_home() / "config.toml"
 
 
 def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:

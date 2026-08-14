@@ -2089,6 +2089,35 @@ async def test_mutating_request_timeout_preserves_idle_transport_without_replay(
 
 
 @pytest.mark.asyncio
+async def test_turn_interrupt_timeout_exposes_dispatched_outcome(monkeypatch):
+    client = cas.CodexAppServerClient()
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _request_started(
+        method: str,
+        _params: dict[str, object],
+        *,
+        timeout: float = 60.0,
+        expected_stop_sequence: int | None = None,
+        on_dispatch=None,
+    ) -> object:
+        _ = method, timeout, expected_stop_sequence, on_dispatch
+        raise cas.CodexAppServerError(
+            "Timed out waiting for app-server response: turn/interrupt",
+            request_dispatched=True,
+        )
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "_request_started", _request_started)
+
+    with pytest.raises(cas.CodexAppServerError) as raised:
+        await client.turn_interrupt(thread_id="thread-1", turn_id="turn-1")
+    assert raised.value.request_dispatched is True
+
+
+@pytest.mark.asyncio
 async def test_uncertain_turn_timeout_recovery_preserves_unrelated_active_turn(
     monkeypatch,
 ):

@@ -74,6 +74,34 @@ async def test_start_command_app_server_only_skips_legacy_window_listing(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_start_command_refuses_reserved_general_before_browsing(monkeypatch):
+    update = _make_update(thread_id=1)
+    replies: list[str] = []
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot.session_manager, "get_coco_control_topic", lambda _chat: object()
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: pytest.fail("must reject before routing mutation"),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_sorted_machine_choices",
+        lambda: pytest.fail("must not open folder browser"),
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    await commands.start_command(update, SimpleNamespace(bot=object(), user_data={}))
+    assert replies and "permanent control channel" in replies[0]
+
+
+@pytest.mark.asyncio
 async def test_start_command_app_server_only_accepts_existing_non_legacy_binding(
     monkeypatch,
 ):

@@ -76,6 +76,11 @@ class MessageTask:
     # Snapshot of the topic delivery generation at first enqueue. Cancellation
     # advances the generation so already-dequeued/retried work becomes stale.
     delivery_generation: int | None = None
+    # Monotonic enqueue sequence used to capture an exact pending-delivery
+    # cutoff.  This is distinct from ``delivery_generation``: the latter is an
+    # invalidation fence, while this value identifies when the item entered the
+    # queue.
+    delivery_sequence: int | None = None
     # Canonical raw topic ownership captured when source output was enqueued.
     # A later explicit lifecycle rebind invalidates this task even when the
     # Telegram topic ID itself is unchanged.
@@ -92,6 +97,8 @@ class QueuedTopicInput:
     source_chat_id: int
     source_message_id: int
     topic_ownership: TopicOwnership | None = None
+    # Monotonic per-topic enqueue generation used by interrupt cleanup.
+    generation: int = 0
 
     def legacy_tuple(self) -> tuple[str, int, int]:
         return (self.text, self.source_chat_id, self.source_message_id)
@@ -104,6 +111,8 @@ _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 _active_delivery_topics: dict[int, set[tuple[int, int]]] = {}
 _queued_delivery_topic_counts: dict[int, dict[tuple[int, int], int]] = {}
 _topic_delivery_generations: dict[tuple[int, int, int], int] = {}
+_topic_delivery_enqueue_sequences: dict[tuple[int, int, int], int] = {}
+_queued_topic_input_generations: dict[tuple[int, int, int], int] = {}
 
 
 def _track_queued_task(user_id: int, task: MessageTask) -> None:
@@ -143,6 +152,11 @@ def _put_queued_task(
     if task.delivery_generation is None:
         topic_key = (user_id, task.chat_id or 0, task.thread_id or 0)
         task.delivery_generation = _topic_delivery_generations.get(topic_key, 0)
+    if task.delivery_sequence is None:
+        topic_key = (user_id, task.chat_id or 0, task.thread_id or 0)
+        sequence = _topic_delivery_enqueue_sequences.get(topic_key, 0) + 1
+        _topic_delivery_enqueue_sequences[topic_key] = sequence
+        task.delivery_sequence = sequence
     queue.put_nowait(task)
     _track_queued_task(user_id, task)
 
@@ -546,8 +560,24 @@ def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
     return items
 
 
+def get_topic_delivery_generation(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> int:
+    """Return the latest enqueue sequence for one topic."""
+    return _topic_delivery_enqueue_sequences.get(
+        (user_id, chat_id or 0, thread_id or 0),
+        0,
+    )
+
+
 async def cancel_topic_delivery(
-    user_id: int, thread_id: int | None, *, chat_id: int | None = None
+    user_id: int,
+    thread_id: int | None,
+    *,
+    chat_id: int | None = None,
+    generation_cutoff: int | None = None,
 ) -> int:
     """Discard pending Telegram delivery work for one topic only.
 
@@ -556,8 +586,17 @@ async def cancel_topic_delivery(
     Returns the number of discarded tasks.
     """
     generation_key = (user_id, chat_id or 0, thread_id or 0)
-    canceled_generation = _topic_delivery_generations.get(generation_key, 0)
-    _topic_delivery_generations[generation_key] = canceled_generation + 1
+    current_generation = _topic_delivery_generations.get(generation_key, 0)
+    targeted_cutoff = generation_cutoff is not None
+    enqueue_cutoff = _topic_delivery_enqueue_sequences.get(generation_key, 0)
+    if targeted_cutoff:
+        enqueue_cutoff = max(0, int(generation_cutoff))
+    else:
+        # Legacy whole-topic cancellation advances the invalidation fence so an
+        # already-dequeued task becomes stale.  Targeted cleanup deliberately
+        # leaves that fence alone: items enqueued after the click, including an
+        # in-flight task, must not be invalidated by the later interrupt RPC.
+        _topic_delivery_generations[generation_key] = current_generation + 1
     queue = _message_queues.get(user_id)
     lock = _queue_locks.get(user_id)
     if queue is None or lock is None:
@@ -569,14 +608,20 @@ async def cancel_topic_delivery(
     async with lock:
         items = _inspect_queue(queue)
         for item in items:
-            item_generation = item.delivery_generation
-            is_canceled_generation = (
-                item_generation is None or item_generation <= canceled_generation
-            )
+            item_sequence = item.delivery_sequence
+            if targeted_cutoff:
+                is_captured_item = (
+                    item_sequence is None or item_sequence <= enqueue_cutoff
+                )
+            else:
+                is_captured_item = (
+                    item.delivery_generation is None
+                    or item.delivery_generation <= current_generation
+                )
             if (
                 (item.thread_id or 0) == target_topic
                 and (item.chat_id or 0) == target_chat
-                and is_canceled_generation
+                and is_captured_item
             ):
                 _untrack_queued_task(user_id, item)
                 queue.task_done()
@@ -716,6 +761,7 @@ async def _merge_content_tasks(
             video_data=first.video_data,
             response_mode_override=first.response_mode_override,
             delivery_generation=first.delivery_generation,
+            delivery_sequence=first.delivery_sequence,
             topic_ownership=first.topic_ownership,
         ),
         merge_count,
@@ -2037,6 +2083,8 @@ def enqueue_queued_topic_input(
     """
     skey = _topic_key(user_id, thread_id, source_chat_id)
     bucket = _queued_topic_inputs.setdefault(skey, [])
+    generation = _queued_topic_input_generations.get(skey, 0) + 1
+    _queued_topic_input_generations[skey] = generation
     bucket.append(
         QueuedTopicInput(
             text=text,
@@ -2047,6 +2095,7 @@ def enqueue_queued_topic_input(
                 if topic_ownership is not None
                 else capture_topic_ownership(user_id, thread_id, source_chat_id)
             ),
+            generation=generation,
         )
     )
     return len(bucket)
@@ -2067,6 +2116,8 @@ def prepend_queued_topic_input(
     """
     skey = _topic_key(user_id, thread_id, source_chat_id)
     bucket = _queued_topic_inputs.setdefault(skey, [])
+    generation = _queued_topic_input_generations.get(skey, 0) + 1
+    _queued_topic_input_generations[skey] = generation
     bucket.insert(
         0,
         QueuedTopicInput(
@@ -2078,6 +2129,7 @@ def prepend_queued_topic_input(
                 if topic_ownership is not None
                 else capture_topic_ownership(user_id, thread_id, source_chat_id)
             ),
+            generation=generation,
         ),
     )
     return len(bucket)
@@ -2135,6 +2187,50 @@ def queued_topic_input_count(
     return len(_queued_topic_inputs.get(skey, []))
 
 
+def get_queued_topic_input_generation(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> int:
+    """Return the latest enqueue generation for one topic."""
+    return _queued_topic_input_generations.get(
+        _topic_key(user_id, thread_id, chat_id),
+        0,
+    )
+
+
+def discard_queued_topic_inputs_before_generation(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+    *,
+    generation_cutoff: int,
+) -> int:
+    """Discard only guidance captured at or before a generation cutoff.
+
+    The caller captures the cutoff before an asynchronous operation.  Items
+    appended afterward receive newer generations and remain queued.
+    """
+    skey = _topic_key(user_id, thread_id, chat_id)
+    bucket = _queued_topic_inputs.get(skey)
+    if not bucket:
+        return 0
+    cutoff = int(generation_cutoff)
+    retained: list[QueuedTopicInput | tuple[str, int, int]] = []
+    removed = 0
+    for item in bucket:
+        generation = item.generation if isinstance(item, QueuedTopicInput) else 0
+        if generation <= cutoff:
+            removed += 1
+        else:
+            retained.append(item)
+    if retained:
+        _queued_topic_inputs[skey] = retained
+    else:
+        _queued_topic_inputs.pop(skey, None)
+    return removed
+
+
 def clear_queued_topic_inputs(
     user_id: int,
     thread_id: int | None = None,
@@ -2181,5 +2277,7 @@ async def shutdown_workers() -> None:
     _active_delivery_topics.clear()
     _queued_delivery_topic_counts.clear()
     _topic_delivery_generations.clear()
+    _topic_delivery_enqueue_sequences.clear()
+    _queued_topic_input_generations.clear()
     _queue_dock_msg_info.clear()
     logger.info("Message queue workers stopped")

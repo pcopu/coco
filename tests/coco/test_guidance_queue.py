@@ -1668,6 +1668,79 @@ async def test_cancel_topic_delivery_is_scoped_to_chat():
         mq._topic_delivery_generations.pop((user_id, -1001, thread_id), None)
 
 
+def test_discard_queued_topic_inputs_before_generation_preserves_later_guidance():
+    """An interrupt cleanup cutoff must not remove guidance added after click."""
+    user_id = 7718
+    thread_id = 78
+    chat_id = -10078
+    mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    mq._queued_topic_input_generations.pop((user_id, chat_id, thread_id), None)
+
+    try:
+        mq.enqueue_queued_topic_input(user_id, thread_id, "captured", chat_id, 1)
+        cutoff = mq.get_queued_topic_input_generation(user_id, thread_id, chat_id)
+        mq.enqueue_queued_topic_input(user_id, thread_id, "added later", chat_id, 2)
+
+        removed = mq.discard_queued_topic_inputs_before_generation(
+            user_id,
+            thread_id,
+            chat_id,
+            generation_cutoff=cutoff,
+        )
+
+        assert removed == 1
+        assert mq.get_queued_topic_input_snapshot(user_id, thread_id, chat_id) == [
+            ("added later", chat_id, 2)
+        ]
+    finally:
+        mq.clear_queued_topic_inputs(user_id, thread_id, chat_id)
+        mq._queued_topic_input_generations.pop((user_id, chat_id, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_cancel_topic_delivery_generation_cutoff_preserves_later_delivery():
+    """A successful interrupt removes only delivery queued at click time."""
+    user_id = 7719
+    thread_id = 79
+    chat_id = -10079
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    mq._topic_delivery_generations[(user_id, chat_id, thread_id)] = 0
+
+    try:
+        captured = mq.MessageTask(
+            task_type="content", parts=["captured"], thread_id=thread_id, chat_id=chat_id
+        )
+        mq._put_queued_task(user_id, queue, captured)
+        cutoff = mq.get_topic_delivery_generation(user_id, thread_id, chat_id)
+        later = mq.MessageTask(
+            task_type="content", parts=["added later"], thread_id=thread_id, chat_id=chat_id
+        )
+        mq._put_queued_task(user_id, queue, later)
+
+        removed = await mq.cancel_topic_delivery(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+            generation_cutoff=cutoff,
+        )
+
+        assert removed == 1
+        retained = queue.get_nowait()
+        assert retained is later
+        assert mq.is_task_delivery_current(user_id, retained) is True
+        queue.task_done()
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, chat_id, thread_id), None)
+
+
 @pytest.mark.asyncio
 async def test_progress_and_status_tracking_are_scoped_to_chat(monkeypatch):
     user_id = 7717
@@ -2411,6 +2484,195 @@ async def test_forward_topic_text_message_coco_control_tell_routes_to_target(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "caller_user_id",
+        "target_user_id",
+        "caller_is_admin",
+        "text",
+        "expected_action",
+        "send_success",
+    ),
+    [
+        (999, 999, False, "tell mine to focus on my topic", "steer", True),
+        (42, 999, True, "tell mine to focus on my topic", "steer", True),
+        (999, 999, False, "queue for mine: focus on my topic", "queue", True),
+        (999, 999, False, "tell mine to fail on my topic", "steer", False),
+    ],
+)
+async def test_general_control_actions_route_authorized_topics(
+    monkeypatch,
+    caller_user_id,
+    target_user_id,
+    caller_is_admin,
+    text,
+    expected_action,
+    send_success,
+):
+    chat_id = -100123
+    target_thread_id = 88
+    events: list[str] = []
+    replies: list[str] = []
+    activity_calls: list[dict] = []
+    started_calls: list[dict] = []
+
+    class _Chat:
+        id = chat_id
+
+        async def send_action(self, _action):
+            events.append("typing")
+
+    message = SimpleNamespace(
+        chat=_Chat(),
+        chat_id=chat_id,
+        message_id=321,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: caller_is_admin)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, chat_id),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda uid, tid, *, chat_id=None: (
+            (uid, tid) == (100, 1) and chat_id == -100123
+        ),
+    )
+    monkeypatch.setattr(bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "iter_topic_bindings",
+        lambda: iter(
+            [
+                (100, chat_id, 1, SimpleNamespace(display_name="coco-control")),
+                (
+                    target_user_id,
+                    chat_id,
+                    target_thread_id,
+                    SimpleNamespace(display_name="mine"),
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda uid, tid, **_kwargs: (
+            "@mine"
+            if (uid, tid) == (target_user_id, target_thread_id)
+            else "@control"
+            if (uid, tid) == (100, 1)
+            else pytest.fail("control routing resolved an unexpected session")
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda uid, tid, _chat_id: bot.TopicOwnership(
+            window_id="@mine" if (uid, tid) == (target_user_id, target_thread_id) else "@control",
+            codex_thread_id=(
+                "codex-mine"
+                if (uid, tid) == (target_user_id, target_thread_id)
+                else "codex-control"
+            ),
+            machine_id="local-node",
+            cwd=(
+                "/workspace/mine"
+                if (uid, tid) == (target_user_id, target_thread_id)
+                else "/workspace/control"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda uid, tid, **_kwargs: (
+            SimpleNamespace(
+                window_id="@mine" if (uid, tid) == (target_user_id, target_thread_id) else "@control",
+                codex_thread_id="codex-topic",
+                cwd="/workspace/topic",
+            )
+            if (uid, tid) in {
+                (target_user_id, target_thread_id),
+                (100, 1),
+            }
+            else pytest.fail("must resolve the target or control topic")
+        ),
+    )
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "safe_reply", _noop_async)
+    monkeypatch.setattr(bot, "_set_eyes_reaction", _noop_async)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _noop_async)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _noop_async)
+    monkeypatch.setattr(
+        bot,
+        "enqueue_queued_topic_input",
+        lambda uid, tid, *_args, **_kwargs: (
+            events.append(f"queue:{uid}:{tid}") or 1
+        ),
+    )
+
+    async def _send(**kwargs):
+        events.append(
+            f"send:{kwargs['user_id']}:{kwargs['thread_id']}:{kwargs.get('steer')}"
+        )
+        if send_success and kwargs.get("dispatch_state") is not None:
+            kwargs["dispatch_state"].mark_turn_started()
+        return send_success, "ok" if send_success else "failed"
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(
+        bot,
+        "note_run_activity",
+        lambda **kwargs: activity_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        bot,
+        "note_run_started",
+        lambda **kwargs: started_calls.append(kwargs),
+    )
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=caller_user_id,
+        thread_id=1,
+        chat_id=chat_id,
+        text=text,
+    )
+
+    if expected_action == "steer":
+        assert f"send:{target_user_id}:88:True" in events
+    else:
+        assert f"queue:{target_user_id}:88" in events
+    assert "typing" in events if expected_action == "steer" else True
+    if expected_action == "steer" and send_success:
+        assert activity_calls == []
+        assert started_calls == [
+            {
+                "user_id": target_user_id,
+                "thread_id": target_thread_id,
+                "chat_id": chat_id,
+                "window_id": "@mine",
+                "source": "steer_input",
+                "pending_text": "focus on my topic",
+                "expect_response": True,
+            }
+        ]
+    else:
+        assert activity_calls == []
+        assert started_calls == []
+    assert replies == []
+
+
+@pytest.mark.asyncio
 async def test_forward_general_message_activates_default_coco_control(monkeypatch):
     events: list[str] = []
     activated: list[tuple[int, int, int | None]] = []
@@ -2431,6 +2693,11 @@ async def test_forward_general_message_activates_default_coco_control(monkeypatc
         return binding
 
     monkeypatch.setattr(bot, "_ensure_default_coco_general_control", _activate_general)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(1147817421, 1, -100123),
+    )
     monkeypatch.setattr(
         bot.session_manager,
         "get_window_for_thread",
@@ -2493,6 +2760,727 @@ async def test_forward_general_message_activates_default_coco_control(monkeypatc
 
     assert activated == [(1147817421, 1, -100123)]
     assert events == ["send:@general:show me the active topics"]
+
+
+@pytest.mark.asyncio
+async def test_text_handler_rejects_unconfigured_general_without_caller_routing(
+    monkeypatch,
+):
+    chat_id = -100123
+    message = SimpleNamespace(
+        text="stale General prompt",
+        message_thread_id=1,
+        chat=SimpleNamespace(type="supergroup", id=chat_id, is_forum=True),
+        chat_id=chat_id,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=999),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+    routing_users: list[int] = []
+
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda uid, *_args, **_kwargs: routing_users.append(uid),
+    )
+    async def _forward(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward)
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.text_handler(update, context)
+
+    assert replies == [bot._COCO_CONTROL_UNCONFIGURED_TEXT]
+    assert routing_users == []
+
+
+@pytest.mark.asyncio
+async def test_text_handler_general_admin_routes_canonical_owner(monkeypatch):
+    chat_id = -100123
+    owner_user_id = 100
+    admin_user_id = 200
+    message = SimpleNamespace(
+        text="admin General prompt",
+        message_thread_id=1,
+        chat=SimpleNamespace(type="supergroup", id=chat_id, is_forum=True),
+        chat_id=chat_id,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=admin_user_id),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+    routing_users: list[int] = []
+
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda uid: uid == admin_user_id)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(owner_user_id, 1, chat_id),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda uid, *_args, **_kwargs: routing_users.append(uid),
+    )
+
+    async def _forward(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward)
+
+    await bot.text_handler(update, context)
+
+    assert routing_users == [owner_user_id]
+
+
+@pytest.mark.asyncio
+async def test_text_handler_allows_pending_dashboard_steer_for_caller_owned_topic(
+    monkeypatch,
+):
+    """A member's pending dashboard steer must pass the General pre-auth gate."""
+    caller_user_id = 999
+    control_owner_user_id = 100
+    target_thread_id = 88
+    chat_id = -100123
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": caller_user_id,
+                "chat_id": chat_id,
+                "thread_id": target_thread_id,
+                "created_at": bot.time.monotonic(),
+                "ownership": {
+                    "window_id": "@88",
+                    "codex_thread_id": "codex-88",
+                    "machine_id": "node-a",
+                    "cwd": "/workspace/88",
+                },
+            }
+        },
+    )
+    chat = SimpleNamespace(type="supergroup", id=chat_id, is_forum=True)
+    message = SimpleNamespace(
+        text="steer my selected topic",
+        message_thread_id=1,
+        chat=chat,
+        chat_id=chat_id,
+        message_id=1,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=caller_user_id),
+        effective_message=message,
+        effective_chat=chat,
+        message=message,
+    )
+    sends: list[dict] = []
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: False)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(control_owner_user_id, 1, chat_id),
+    )
+    monkeypatch.setattr(bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda uid, tid, **_kwargs: SimpleNamespace(window_id="@88")
+        if (uid, tid) == (caller_user_id, target_thread_id)
+        else None,
+    )
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args: True)
+
+    async def _send(**kwargs):
+        sends.append(kwargs)
+        return True, "ok"
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.text_handler(update, context)
+
+    assert sends and sends[0]["user_id"] == caller_user_id
+    assert sends[0]["thread_id"] == target_thread_id
+    assert sends[0]["steer"] is True
+    assert replies == [f"✅ Steered topic `{target_thread_id}`."]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_dashboard_steer_button_routes_the_next_general_message(monkeypatch):
+    sends: list[dict] = []
+    replies: list[str] = []
+    activity_calls: list[dict] = []
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": 200,
+                "chat_id": -100123,
+                "thread_id": 88,
+                "created_at": bot.time.monotonic(),
+                "ownership": {
+                    "window_id": "@88",
+                    "codex_thread_id": "codex-88",
+                    "machine_id": "node-a",
+                    "cwd": "/workspace/88",
+                },
+            }
+        },
+    )
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda uid, tid, **_kwargs: SimpleNamespace(window_id="@88")
+        if (uid, tid) == (200, 88)
+        else None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: bot.TopicOwnership(
+            window_id="@88",
+            codex_thread_id="codex-88",
+            machine_id="node-a",
+            cwd="/workspace/88",
+        ),
+    )
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args: True)
+
+    async def _send(**kwargs):
+        sends.append(kwargs)
+        return True, "ok"
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+    monkeypatch.setattr(
+        bot,
+        "note_run_activity",
+        lambda **kwargs: activity_calls.append(kwargs),
+    )
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=1,
+        chat_id=-100123,
+        text="ship the focused fix",
+    )
+
+    assert sends[0]["user_id"] == 200
+    assert sends[0]["thread_id"] == 88
+    assert sends[0]["steer"] is True
+    assert replies == ["✅ Steered topic `88`."]
+    assert activity_calls == [
+        {
+            "user_id": 200,
+            "thread_id": 88,
+            "chat_id": -100123,
+            "window_id": "@88",
+            "source": "steer_input",
+        }
+    ]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_dashboard_steer_initializes_watchdog_when_transport_starts_new_turn(
+    monkeypatch,
+):
+    """A steer fallback to turn/start must retain pending-response tracking."""
+    sends: list[dict] = []
+    activity_calls: list[dict] = []
+    started_calls: list[dict] = []
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": 200,
+                "chat_id": -100123,
+                "thread_id": 88,
+                "created_at": bot.time.monotonic(),
+                "ownership": {
+                    "window_id": "@88",
+                    "codex_thread_id": "codex-88",
+                    "machine_id": "node-a",
+                    "cwd": "/workspace/88",
+                },
+            }
+        },
+    )
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda uid, tid, **_kwargs: SimpleNamespace(window_id="@88")
+        if (uid, tid) == (200, 88)
+        else None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: bot.TopicOwnership(
+            window_id="@88",
+            codex_thread_id="codex-88",
+            machine_id="node-a",
+            cwd="/workspace/88",
+        ),
+    )
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args: True)
+
+    async def _send(**kwargs):
+        sends.append(kwargs)
+        dispatch_state = kwargs.get("dispatch_state")
+        if dispatch_state is not None:
+            dispatch_state.mark_turn_started()
+        return True, "ok"
+
+    async def _reply(_message, _text, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+    monkeypatch.setattr(
+        bot,
+        "note_run_activity",
+        lambda **kwargs: activity_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        bot,
+        "note_run_started",
+        lambda **kwargs: started_calls.append(kwargs),
+    )
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=1,
+        chat_id=-100123,
+        text="ship the focused fix",
+    )
+
+    assert sends[0]["steer"] is True
+    assert activity_calls == []
+    assert started_calls == [
+        {
+            "user_id": 200,
+            "thread_id": 88,
+            "chat_id": -100123,
+            "window_id": "@88",
+            "source": "steer_input",
+            "pending_text": "ship the focused fix",
+            "expect_response": True,
+        }
+    ]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_dashboard_steer_allows_single_session_caller_to_steer_own_topic(
+    monkeypatch,
+):
+    sends: list[dict] = []
+    replies: list[str] = []
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": 999,
+                "chat_id": -100123,
+                "thread_id": 88,
+                "created_at": bot.time.monotonic(),
+                "ownership": {
+                    "window_id": "@88",
+                    "codex_thread_id": "codex-88",
+                    "machine_id": "node-a",
+                    "cwd": "/workspace/88",
+                },
+            }
+        },
+    )
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: False)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda uid, tid, **_kwargs: SimpleNamespace(window_id="@88")
+        if (uid, tid) == (999, 88)
+        else None,
+    )
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args: True)
+
+    async def _send(**kwargs):
+        sends.append(kwargs)
+        return True, "ok"
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=1,
+        chat_id=-100123,
+        text="ship the focused fix",
+    )
+
+    assert sends[0]["user_id"] == 999
+    assert sends[0]["thread_id"] == 88
+    assert sends[0]["steer"] is True
+    assert replies == ["✅ Steered topic `88`."]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_dashboard_steer_waits_for_matching_general_message(monkeypatch):
+    pending = {
+        "owner_user_id": 200,
+        "chat_id": -100123,
+        "thread_id": 88,
+        "created_at": bot.time.monotonic(),
+    }
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={"_coco_dashboard_steer": dict(pending)},
+    )
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    replies: list[str] = []
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot.session_manager, "get_window_for_thread", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "_can_user_create_sessions", lambda _user_id: False)
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=55,
+        chat_id=-100123,
+        text="ordinary named-topic message",
+    )
+
+    assert context.user_data["_coco_dashboard_steer"] == pending
+    assert replies and "single-session access" in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_steer_expired_intent_is_cleared_without_general_routing(
+    monkeypatch,
+):
+    clock = {"now": 100.0}
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": 200,
+                "chat_id": -100123,
+                "thread_id": 88,
+                "created_at": clock["now"]
+                - bot._COCO_DASHBOARD_SNAPSHOT_TTL_SECONDS
+                - 1,
+            }
+        },
+    )
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    replies: list[str] = []
+    sends: list[dict] = []
+    monkeypatch.setattr(bot.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, -100123),
+    )
+
+    async def _send(**kwargs):
+        sends.append(kwargs)
+        return True, "ok"
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=bot.GENERAL_TOPIC_THREAD_ID,
+        chat_id=-100123,
+        text="do not route this after expiry",
+    )
+
+    assert sends == []
+    assert replies == ["❌ That dashboard steer expired. Refresh /coco and try again."]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_text_handler_expired_own_dashboard_steer_cannot_bypass_general_owner(
+    monkeypatch,
+):
+    clock = {"now": 100.0}
+    chat_id = -100123
+    caller_user_id = 999
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": caller_user_id,
+                "chat_id": chat_id,
+                "thread_id": 88,
+                "created_at": clock["now"]
+                - bot._COCO_DASHBOARD_SNAPSHOT_TTL_SECONDS
+                - 1,
+            }
+        },
+    )
+    chat = SimpleNamespace(type="supergroup", id=chat_id, is_forum=True)
+    message = SimpleNamespace(
+        text="expired steer must not become a General prompt",
+        message_thread_id=bot.GENERAL_TOPIC_THREAD_ID,
+        chat=chat,
+        chat_id=chat_id,
+        message_id=1,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=caller_user_id),
+        effective_message=message,
+        effective_chat=chat,
+        message=message,
+    )
+    replies: list[str] = []
+    forwarded = False
+    monkeypatch.setattr(bot.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: False)
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, chat_id),
+    )
+
+    async def _forward(**_kwargs):
+        nonlocal forwarded
+        forwarded = True
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.text_handler(update, context)
+
+    assert forwarded is False
+    assert replies == ["❌ That dashboard steer expired. Refresh /coco and try again."]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_dashboard_steer_rejects_target_rebound_after_click(monkeypatch):
+    pending = {
+        "owner_user_id": 200,
+        "chat_id": -100123,
+        "thread_id": 88,
+        "created_at": bot.time.monotonic(),
+        "ownership": {
+            "window_id": "@old",
+            "codex_thread_id": "codex-old",
+            "machine_id": "node-a",
+            "cwd": "/workspace/old",
+        },
+    }
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={"_coco_dashboard_steer": pending},
+    )
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    replies: list[str] = []
+    sends: list[dict] = []
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: SimpleNamespace(window_id="@new"),
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: bot.TopicOwnership(
+            window_id="@new",
+            codex_thread_id="codex-new",
+            machine_id="node-b",
+            cwd="/workspace/new",
+        ),
+    )
+
+    async def _send(**kwargs):
+        sends.append(kwargs)
+        return True, ""
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot.session_manager, "send_topic_text_to_window", _send)
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=1,
+        chat_id=-100123,
+        text="steer the selected target",
+    )
+
+    assert sends == []
+    assert replies == ["❌ That dashboard target changed. Refresh /coco and try again."]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_general_message_waits_when_legacy_control_migration_is_deferred(
+    monkeypatch,
+):
+    replies: list[str] = []
+    message = SimpleNamespace(chat_id=-100123, message_id=1)
+    context = SimpleNamespace(bot=object(), user_data={})
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 77, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_for_thread",
+        lambda *_args, **_kwargs: pytest.fail("must not create a competing General session"),
+    )
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+    await bot._forward_topic_text_message(
+        message=message,
+        context=context,
+        user_id=999,
+        thread_id=1,
+        chat_id=-100123,
+        text="hello General",
+    )
+
+    assert replies and "migration is still pending" in replies[0]
+
+
+def test_coco_control_target_parser_rejects_ambiguous_names(monkeypatch):
+    monkeypatch.setattr(
+        bot.session_manager,
+        "iter_topic_bindings",
+        lambda: iter(
+            [
+                (100, -100123, 88, SimpleNamespace(display_name="duplicate")),
+                (200, -100123, 99, SimpleNamespace(display_name="duplicate")),
+            ]
+        ),
+    )
+
+    action = bot._parse_coco_control_action(
+        user_id=100,
+        thread_id=1,
+        chat_id=-100123,
+        text="tell duplicate to inspect the failure",
+    )
+
+    assert action == ("ambiguous", 0, 0, "duplicate", "")
 
 
 @pytest.mark.asyncio
@@ -2689,6 +3677,115 @@ async def test_q_enqueues_internal_queue_and_updates_dock_when_in_progress(monke
     assert telemetry[0][1]["queue_size"] == 1
     assert telemetry[0][1]["used_native_queue"] is False
     assert telemetry[0][1]["native_attempts"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread_id", "expected_user_id"),
+    [
+        (1, 42),
+        (77, 999),
+    ],
+)
+async def test_q_uses_the_owner_for_general_and_sender_for_named_topics(
+    monkeypatch,
+    thread_id,
+    expected_user_id,
+):
+    owner_user_id = 42
+    sender_user_id = 999
+    chat_id = -100321
+    observed_user_ids: list[tuple[str, int]] = []
+
+    message = SimpleNamespace(
+        text="/q next task",
+        chat=SimpleNamespace(type="supergroup", id=chat_id),
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        message_id=888,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=sender_user_id),
+        effective_message=message,
+        effective_chat=message.chat,
+        message=message,
+    )
+    context = SimpleNamespace(bot=object(), user_data={})
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    # Cross-owner General queueing remains available to the admin path; a
+    # single-session sender is covered by the denial regressions.
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(owner_user_id, 1, chat_id),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda uid, *_args, **_kwargs: observed_user_ids.append(("group", uid)),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda uid, *_args, **_kwargs: (
+            observed_user_ids.append(("window", uid)) or "@control"
+        ),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda uid, *_args, **_kwargs: (
+            observed_user_ids.append(("binding", uid))
+            or SimpleNamespace(codex_thread_id="control-thread", cwd="/control")
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda uid, *_args, **_kwargs: (
+            observed_user_ids.append(("ownership", uid)) or object()
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "queued_topic_input_count",
+        lambda uid, *_args, **_kwargs: (
+            observed_user_ids.append(("count", uid)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_is_queued_topic_drain_active",
+        lambda uid, *_args, **_kwargs: (
+            observed_user_ids.append(("drain", uid)) or False
+        ),
+    )
+
+    async def _in_progress(uid, *_args, **_kwargs):
+        observed_user_ids.append(("progress", uid))
+        return True
+
+    def _enqueue(uid, *_args, **_kwargs):
+        observed_user_ids.append(("enqueue", uid))
+        return 1
+
+    async def _dock(_bot, uid, *_args, **_kwargs):
+        observed_user_ids.append(("dock", uid))
+
+    async def _hourglass(_message):
+        return None
+
+    monkeypatch.setattr(bot, "_is_window_in_progress", _in_progress)
+    monkeypatch.setattr(bot, "enqueue_queued_topic_input", _enqueue)
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _dock)
+    monkeypatch.setattr(bot, "_set_hourglass_reaction", _hourglass)
+
+    await bot.queue_command(update, context)
+
+    assert observed_user_ids
+    assert {uid for _operation, uid in observed_user_ids} == {expected_user_id}
 
 
 @pytest.mark.asyncio

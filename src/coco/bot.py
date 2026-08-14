@@ -3,17 +3,21 @@
 import asyncio
 import base64
 import errno
+import inspect
 import json
 import logging
+import math
 import os
 import random
 import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -21,6 +25,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from telegram import (
     Bot,
@@ -30,6 +35,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ReactionEmoji
+from telegram.error import BadRequest
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -43,14 +49,19 @@ from telegram.ext import (
 
 from .codex_app_server import CodexAppServerError, codex_app_server_client
 from .config import config
+from .codex_trust import ensure_codex_project_trust
 from .controller_rpc import (
     CODEX_TRANSPORT_PROTOCOL_VERSION,
     CODEX_TRANSPORT_PROTOCOL_VERSION_KEY,
     ControllerRpcServer,
     REMOTE_CODEX_MACHINE_CONTEXT_KEY,
 )
-from .agent_rpc import agent_rpc_client
-from .node_registry import NODE_STATUS_ONLINE, node_registry
+from .agent_rpc import (
+    RemoteCodexMutationDeferredError,
+    RemoteCodexMutationUncertainError,
+    agent_rpc_client,
+)
+from .node_registry import NODE_STATUS_OFFLINE, NODE_STATUS_ONLINE, node_registry
 from .handlers.callback_data import (
     CB_APP_APPROVAL_DECIDE,
     CB_APPROVAL_OPEN_DEFAULTS,
@@ -104,8 +115,14 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_COCO_CANCEL,
+    CB_COCO_DASHBOARD,
+    CB_COCO_DOCTOR,
+    CB_COCO_INSPECT,
+    CB_COCO_INTERRUPT,
+    CB_COCO_PAGE,
     CB_COCO_REFRESH,
     CB_COCO_SET,
+    CB_COCO_STEER,
     CB_MODEL_EFFORT_SET,
     CB_MODEL_REFRESH,
     CB_MODEL_SET,
@@ -166,6 +183,7 @@ from .handlers.message_queue import (
     cancel_topic_delivery,
     clear_queued_topic_dock,
     clear_queued_topic_inputs,
+    discard_queued_topic_inputs_before_generation,
     clear_status_msg_info,
     enqueue_content_message,
     enqueue_progress_finalize,
@@ -175,6 +193,8 @@ from .handlers.message_queue import (
     enqueue_queued_topic_input,
     enqueue_status_update,
     get_progress_text,
+    get_queued_topic_input_generation,
+    get_topic_delivery_generation,
     get_message_queue,
     is_topic_ownership_current,
     is_progress_active,
@@ -192,6 +212,7 @@ from .handlers.message_sender import (
 )
 from .handlers.response_builder import build_response_parts
 from .handlers.run_watchdog import (
+    clear_run_watch_state,
     get_immediate_auto_retry_candidate,
     note_auto_retry_attempt,
     note_auto_retry_result,
@@ -215,7 +236,7 @@ from .session import (
 from .session_monitor import NewMessage, SessionMonitor
 from .self_update import resolve_coco_tool_update_argv as _resolve_coco_tool_update_argv
 from .skills import resolve_skill_identifier
-from .telemetry import emit_telemetry
+from .telemetry import emit_telemetry, get_recent_failures
 from .telegram_memory import log_incoming_message
 from .telegram_sender import split_message
 from .transcription import (
@@ -241,6 +262,7 @@ _COCO_CONTROL_QUEUE_RE = re.compile(
     r"^\s*queue(?:\s+for)?\s+(?P<target>.+?)\s*:\s*(?P<message>.+?)\s*$",
     re.IGNORECASE,
 )
+_COCO_DASHBOARD_PAGE_SIZE = 6
 
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
@@ -249,6 +271,10 @@ session_monitor: SessionMonitor | None = None
 _status_poll_task: asyncio.Task | None = None
 _controller_rpc_server: ControllerRpcServer | None = None
 _update_check_task: asyncio.Task | None = None
+_coco_control_retry_task: asyncio.Task | None = None
+# Keep a strong reference to doctor callback tasks when tests or an alternate
+# dispatcher do not expose python-telegram-bot's Application.create_task().
+_coco_doctor_tasks: set[asyncio.Task] = set()
 
 
 @dataclass
@@ -334,6 +360,224 @@ _pending_transient_app_server_errors: dict[
 # the marker.
 _interrupted_codex_threads: set[_CodexThreadStateKey] = set()
 _interrupted_codex_turns: dict[_CodexThreadStateKey, str] = {}
+# Assistant items arriving while an interrupt outcome is uncertain are held
+# until the matching terminal event can either release them (natural
+# completion) or discard them (confirmed interruption).
+_uncertain_interrupted_items: dict[
+    _CodexThreadStateKey, list[tuple[str, dict[str, object]]]
+] = {}
+_UNCERTAIN_INTERRUPTED_ITEM_BUFFER_LIMIT = 16
+# Dashboard interrupts discard queued guidance only after the matching terminal
+# event confirms that the interrupted turn has actually stopped.
+@dataclass
+class _DashboardInterruptRecord:
+    """Two-phase dashboard interrupt bookkeeping.
+
+    The record is installed before the RPC so a terminal notification can
+    remember that it raced the request.  Captured queue cutoffs are committed
+    only by a successful RPC or a matching terminal notification that confirms
+    the interrupt.
+    """
+
+    turn_id: str
+    owner_user_id: int
+    chat_id: int | None
+    thread_id: int
+    queued_input_generation_cutoff: int
+    delivery_generation_cutoff: int
+    committed: bool = False
+    terminal_seen: bool = False
+    terminal_status: str = ""
+    uncertain: bool = False
+    terminal_resolved_without_interrupt: bool = False
+
+
+_discard_queued_on_interrupts: dict[
+    _CodexThreadStateKey, _DashboardInterruptRecord | str
+] = {}
+# Callback queries can arrive more than once while the first interrupt RPC is
+# still awaiting a response.  Reserve the state key before Telegram
+# acknowledgement so a second click cannot replace the first request's
+# two-phase record during that window.
+_dashboard_interrupt_claims: set[_CodexThreadStateKey] = set()
+
+
+def _dashboard_interrupt_outcome_is_uncertain(exc: BaseException) -> bool:
+    """Return whether an interrupt may have reached the Codex transport."""
+    if isinstance(exc, RemoteCodexMutationDeferredError):
+        return False
+    if isinstance(exc, RemoteCodexMutationUncertainError):
+        return True
+    if isinstance(exc, CodexAppServerError):
+        return getattr(exc, "request_dispatched", None) is not False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    # ClusterRpcError instances are wrapped by AgentRpcClient for remote
+    # interrupts, but retain a conservative attribute check for direct test
+    # doubles and rolling-upgrade callers.
+    dispatched = getattr(exc, "request_dispatched", False)
+    return dispatched is True or dispatched is None and hasattr(
+        exc, "request_dispatched"
+    )
+
+
+@dataclass(frozen=True)
+class _CocoDashboardTargetSnapshot:
+    """Server-side state rendered into one dashboard control button."""
+
+    chat_id: int
+    owner_user_id: int
+    thread_id: int
+    ownership: TopicOwnership
+    active_turn_id: str
+    created_at: float
+
+
+@dataclass(frozen=True)
+class _TopicTextForwardResult:
+    """Outcome and routed scope of a text message accepted by a session."""
+
+    accepted: bool
+    trigger_looper: bool
+    user_id: int
+    thread_id: int
+    chat_id: int | None
+    window_id: str
+
+
+@dataclass(frozen=True)
+class _PendingDashboardSteerTarget:
+    """Read-only target scope captured by a pending dashboard Steer."""
+
+    owner_user_id: int
+    thread_id: int
+    ownership: TopicOwnership
+
+
+_COCO_DASHBOARD_SNAPSHOT_TTL_SECONDS = 10 * 60
+# A dashboard Steer is a one-shot intent. Keep its lifetime aligned with the
+# server-side snapshot that produced the button so a forgotten General prompt
+# cannot be redirected hours later.
+_COCO_DASHBOARD_STEER_TTL_SECONDS = _COCO_DASHBOARD_SNAPSHOT_TTL_SECONDS
+_COCO_DASHBOARD_STEER_EXPIRED_TEXT = (
+    "❌ That dashboard steer expired. Refresh /coco and try again."
+)
+_coco_dashboard_snapshots: dict[str, _CocoDashboardTargetSnapshot] = {}
+
+
+def _dashboard_steer_intent_expired(
+    pending_steer: object,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Fail closed for malformed or over-age dashboard Steer metadata."""
+    if not isinstance(pending_steer, dict):
+        return False
+    try:
+        created_at = float(pending_steer.get("created_at"))
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(created_at):
+        return True
+    current = time.monotonic() if now is None else now
+    age = current - created_at
+    # A monotonic value should never move backwards. Treat a persisted value
+    # from a prior process (or other malformed timestamp) as stale as well.
+    return age < 0 or age > _COCO_DASHBOARD_STEER_TTL_SECONDS
+
+
+def _consume_expired_dashboard_steer(
+    user_data: dict | None,
+    pending_steer: object | None = None,
+) -> bool:
+    """Clear one expired dashboard Steer intent and report whether it expired."""
+    if not isinstance(user_data, dict):
+        return False
+    pending = (
+        user_data.get("_coco_dashboard_steer")
+        if pending_steer is None
+        else pending_steer
+    )
+    if not _dashboard_steer_intent_expired(pending):
+        return False
+    user_data.pop("_coco_dashboard_steer", None)
+    return True
+
+
+def _dashboard_steer_matches_chat(
+    pending_steer: object,
+    chat_id: int | None,
+) -> bool:
+    """Scope one pending Steer to its originating group chat."""
+    if not isinstance(pending_steer, dict):
+        return False
+    try:
+        return int(pending_steer.get("chat_id", 0) or 0) == int(chat_id or 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _prune_coco_dashboard_snapshots(*, now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    expired = [
+        token
+        for token, snapshot in _coco_dashboard_snapshots.items()
+        if current - snapshot.created_at > _COCO_DASHBOARD_SNAPSHOT_TTL_SECONDS
+    ]
+    for token in expired:
+        _coco_dashboard_snapshots.pop(token, None)
+
+
+def _register_coco_dashboard_snapshot(
+    *,
+    chat_id: int,
+    owner_user_id: int,
+    thread_id: int,
+    binding: TopicBinding,
+    active_turn_id: str,
+) -> str:
+    """Register immutable rendered target state and return a short token."""
+    _prune_coco_dashboard_snapshots()
+    ownership = TopicOwnership(
+        window_id=str(getattr(binding, "window_id", "") or "").strip(),
+        codex_thread_id=str(getattr(binding, "codex_thread_id", "") or "").strip(),
+        machine_id=str(getattr(binding, "machine_id", "") or "").strip(),
+        cwd=str(getattr(binding, "cwd", "") or "").strip(),
+    )
+    for _attempt in range(8):
+        token = secrets.token_urlsafe(6)
+        if token not in _coco_dashboard_snapshots:
+            _coco_dashboard_snapshots[token] = _CocoDashboardTargetSnapshot(
+                chat_id=int(chat_id),
+                owner_user_id=int(owner_user_id),
+                thread_id=int(thread_id),
+                ownership=ownership,
+                active_turn_id=str(active_turn_id or "").strip(),
+                created_at=time.monotonic(),
+            )
+            return token
+    raise RuntimeError("failed allocating CoCo dashboard snapshot token")
+
+
+def _resolve_coco_dashboard_snapshot(
+    *,
+    token: str,
+    chat_id: int | None,
+    owner_user_id: int,
+    thread_id: int,
+) -> _CocoDashboardTargetSnapshot | None:
+    """Resolve and scope one rendered dashboard target token."""
+    _prune_coco_dashboard_snapshots()
+    snapshot = _coco_dashboard_snapshots.get(token)
+    if snapshot is None:
+        return None
+    if (
+        snapshot.chat_id != int(chat_id or 0)
+        or snapshot.owner_user_id != int(owner_user_id)
+        or snapshot.thread_id != int(thread_id)
+    ):
+        return None
+    return snapshot
 
 # A host writer can outlive its final transcript event by a short interval.
 # Retry only deterministic, pre-dispatch writer conflicts; uncertain sends must
@@ -416,6 +660,9 @@ STATE_APPS_LOOPER_INTERVAL = "apps_looper_interval"
 STATE_APPS_LOOPER_LIMIT = "apps_looper_limit"
 APPS_PENDING_THREAD_KEY = "_apps_pending_thread_id"
 APPS_PENDING_WINDOW_ID_KEY = "_apps_pending_window_id"
+APPS_PENDING_USER_KEY = "_apps_pending_user_id"
+APPS_PENDING_CHAT_KEY = "_apps_pending_chat_id"
+APPS_PENDING_OWNERSHIP_KEY = "_apps_pending_ownership"
 APPS_LOOPER_CONFIG_KEY = "_apps_looper_config"
 
 # /resume interactive picker state
@@ -2472,12 +2719,194 @@ def _default_coco_control_workspace(
     thread_id: int,
     chat_id: int | None,
 ) -> Path:
-    base = (config.browse_root / "_coco").resolve()
+    _ = thread_id
+    config_root = _canonical_control_workspace_root(config.config_dir)
+    base = config_root / "_coco"
     if chat_id not in {None, 0}:
-        scope = f"chat-{abs(int(chat_id))}-thread-{thread_id}"
+        scope = Path(f"chat-{abs(int(chat_id))}") / "control"
     else:
-        scope = f"user-{user_id}-thread-{thread_id}"
-    return (base / scope).resolve()
+        scope = Path(f"user-{user_id}") / "control"
+    workspace_path = base / scope
+    _validate_local_control_workspace_path(workspace_path)
+    return workspace_path
+
+
+def _absolute_control_workspace_path(path: Path) -> Path:
+    """Normalize a workspace path lexically without following symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _canonical_control_workspace_root(path: Path) -> Path:
+    """Resolve the configured root; its symlink chain defines the boundary."""
+    configured_root = _absolute_control_workspace_path(path)
+    try:
+        canonical_root = configured_root.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        _raise_local_control_workspace_path_error(str(exc))
+    try:
+        mode = os.lstat(canonical_root).st_mode
+    except FileNotFoundError:
+        return canonical_root
+    except OSError as exc:
+        _raise_local_control_workspace_path_error(str(exc))
+    if not stat.S_ISDIR(mode):
+        _raise_local_control_workspace_path_error(
+            f"path component is not a directory: {canonical_root}"
+        )
+    return canonical_root
+
+
+def _raise_local_control_workspace_path_error(message: str) -> None:
+    raise RuntimeError(f"invalid local control workspace path: {message}")
+
+
+def _validate_local_control_workspace_components(path: Path) -> None:
+    """Reject existing symlinks and non-directories in a workspace path."""
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _raise_local_control_workspace_path_error(str(exc))
+        if stat.S_ISLNK(mode):
+            _raise_local_control_workspace_path_error(
+                f"symlink component is not allowed: {current}"
+            )
+        if not stat.S_ISDIR(mode):
+            _raise_local_control_workspace_path_error(
+                f"path component is not a directory: {current}"
+            )
+
+
+def _validate_local_control_workspace_path(workspace_path: Path) -> Path:
+    """Validate a generated local control workspace before it is created."""
+    config_root = _canonical_control_workspace_root(config.config_dir)
+    internal_root = config_root / "_coco"
+    candidate = _absolute_control_workspace_path(workspace_path)
+    try:
+        candidate.relative_to(internal_root)
+    except ValueError:
+        _raise_local_control_workspace_path_error(
+            "workspace path escapes internal control root"
+        )
+
+    # Validate only generated descendants lexically. The configured root and its
+    # parent chain are already the canonicalized trust boundary.
+    _validate_local_control_workspace_components(candidate)
+    try:
+        resolved_root = config_root.resolve(strict=False)
+        resolved_workspace = candidate.resolve(strict=False)
+        resolved_workspace.relative_to(resolved_root)
+    except ValueError:
+        _raise_local_control_workspace_path_error(
+            "workspace path escapes config directory"
+        )
+    except (OSError, RuntimeError) as exc:
+        _raise_local_control_workspace_path_error(str(exc))
+    return candidate
+
+
+def _ensure_local_control_workspace_directory(path: Path) -> None:
+    """Create one workspace directory and reject symlink/file races."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        try:
+            path.mkdir()
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            _raise_local_control_workspace_path_error(str(exc))
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError as exc:
+            _raise_local_control_workspace_path_error(str(exc))
+    except OSError as exc:
+        _raise_local_control_workspace_path_error(str(exc))
+    if stat.S_ISLNK(mode):
+        _raise_local_control_workspace_path_error(
+            f"symlink component is not allowed: {path}"
+        )
+    if not stat.S_ISDIR(mode):
+        _raise_local_control_workspace_path_error(
+            f"path component is not a directory: {path}"
+        )
+
+
+def _probe_local_control_workspace_write_access(
+    workspace_path: Path,
+) -> tuple[bool, str | None]:
+    """Probe the workspace with a unique temporary file and remove it."""
+    probe_path: Path | None = None
+    file_descriptor = -1
+    try:
+        file_descriptor, raw_probe_path = tempfile.mkstemp(
+            prefix=".coco-write-probe-",
+            dir=str(workspace_path),
+        )
+        probe_path = Path(raw_probe_path)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as probe:
+            file_descriptor = -1
+            probe.write("ok")
+            probe.flush()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if file_descriptor >= 0:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _ensure_local_coco_control_workspace(workspace_path: Path) -> Path:
+    """Create and trust one validated local CoCo control workspace."""
+    candidate = _validate_local_control_workspace_path(workspace_path)
+    config_root = _canonical_control_workspace_root(config.config_dir)
+    try:
+        config_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _raise_local_control_workspace_path_error(str(exc))
+
+    _ensure_local_control_workspace_directory(config_root)
+    current = config_root
+    for component in candidate.relative_to(config_root).parts:
+        current /= component
+        _validate_local_control_workspace_components(current)
+        _ensure_local_control_workspace_directory(current)
+
+    try:
+        resolved_root = config_root.resolve(strict=True)
+        resolved_workspace = candidate.resolve(strict=True)
+        resolved_workspace.relative_to(resolved_root)
+    except ValueError:
+        _raise_local_control_workspace_path_error(
+            "workspace path escapes config directory"
+        )
+    except (OSError, RuntimeError) as exc:
+        _raise_local_control_workspace_path_error(str(exc))
+
+    can_write, write_error = _probe_local_control_workspace_write_access(candidate)
+    if not can_write:
+        _raise_local_control_workspace_path_error(
+            f"workspace is not writable: {write_error or 'write probe failed'}"
+        )
+
+    trust_ok, trust_error = _ensure_codex_project_trust(candidate)
+    if not trust_ok:
+        _raise_local_control_workspace_path_error(
+            f"failed to trust control workspace: {trust_error or 'unknown error'}"
+        )
+    return candidate
 
 
 def _ensure_coco_control_workspace_binding(
@@ -2490,13 +2919,45 @@ def _ensure_coco_control_workspace_binding(
     if binding is None:
         return None, ""
 
-    changed = False
-    workspace_path = _default_coco_control_workspace(
-        user_id=user_id,
-        thread_id=thread_id,
-        chat_id=chat_id,
+    # A migrated/existing General transcript owns its original cwd. Rewriting it
+    # would resume old history in an unrelated directory and is unsafe, especially
+    # when the binding lives on a remote node.
+    window_id = str(binding.window_id or "").strip()
+    state = session_manager.get_window_state(window_id) if window_id else None
+    canonical_thread = str(getattr(binding, "codex_thread_id", "") or "").strip() or (
+        str(state.codex_thread_id or "").strip() if state is not None else ""
     )
-    workspace_path.mkdir(parents=True, exist_ok=True)
+    existing_cwd = str(binding.cwd or "").strip() or (
+        str(state.cwd or "").strip() if state is not None else ""
+    )
+    if canonical_thread and existing_cwd:
+        return binding, existing_cwd
+
+    local_machine_id, _local_machine_name = _local_machine_identity()
+    machine_id = str(getattr(binding, "machine_id", "") or "").strip()
+    if machine_id and machine_id != local_machine_id:
+        # Remote workspace creation is asynchronous and is performed by the
+        # authenticated agent RPC during startup migration/bootstrap.
+        return binding, existing_cwd
+
+    changed = False
+    try:
+        workspace_path = _ensure_local_coco_control_workspace(
+            _default_coco_control_workspace(
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed ensuring General control workspace for user=%d thread=%d chat=%s: %s",
+            user_id,
+            thread_id,
+            chat_id,
+            exc,
+        )
+        return binding, ""
     workspace_dir = str(workspace_path)
     if str(binding.cwd or "").strip() != workspace_dir:
         binding.cwd = workspace_dir
@@ -2506,9 +2967,8 @@ def _ensure_coco_control_workspace_binding(
         binding.display_name = "coco-control"
         changed = True
 
-    window_id = str(binding.window_id or "").strip()
     if window_id:
-        state = session_manager.get_window_state(window_id)
+        assert state is not None
         if state.cwd != workspace_dir:
             state.cwd = workspace_dir
             changed = True
@@ -2531,40 +2991,66 @@ def _ensure_default_coco_general_control(
     if thread_id != GENERAL_TOPIC_THREAD_ID or chat_id is None:
         return None
 
-    current_control = session_manager.get_coco_control_topic()
+    current_control = session_manager.get_coco_control_topic(chat_id)
+    if current_control is not None:
+        owner_user_id = current_control.user_id
+    else:
+        admin_ids = sorted(_get_allowed_admins())
+        if not admin_ids:
+            logger.warning(
+                "Cannot initialize CoCo General control without a configured "
+                "allowlist admin (chat=%d, sender=%d)",
+                chat_id,
+                user_id,
+            )
+            return None
+        owner_user_id = admin_ids[0]
+
+    # Legacy named controls are migrated by the async startup/retry path. Do not
+    # create a competing General binding from an incoming message while a remote
+    # workspace may still be unavailable.
+    if (
+        current_control is not None
+        and current_control.thread_id != GENERAL_TOPIC_THREAD_ID
+    ):
+        return None
+
+    if current_control is None:
+        binding = session_manager.set_coco_control_topic(
+            owner_user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if binding is None:
+            return None
+        current_control = session_manager.get_coco_control_topic(chat_id)
+
+    # General can have legacy bindings for several users in one chat. Fence
+    # every occupied non-canonical binding before activation; the archive keeps
+    # its history while removing it from normal output/monitoring resolution.
+    # The canonical owner is preserved by the existing collision policy.
+    session_manager.archive_general_topic_bindings(
+        chat_id,
+        preserve_control_user_id=owner_user_id,
+    )
+
     binding, workspace_dir = _ensure_coco_control_workspace_binding(
-        user_id=user_id,
+        user_id=owner_user_id,
         thread_id=thread_id,
         chat_id=chat_id,
     )
     if binding is None:
         return None
 
-    if (
-        current_control is not None
-        and current_control.user_id == user_id
-        and current_control.chat_id == chat_id
-        and current_control.thread_id != GENERAL_TOPIC_THREAD_ID
-    ):
-        session_manager.migrate_coco_control_to_general(
-            workspace_dir=workspace_dir,
-            general_thread_id=GENERAL_TOPIC_THREAD_ID,
-        )
-        binding = session_manager.resolve_topic_binding(
-            user_id,
-            thread_id,
-            chat_id=chat_id,
-        )
-        if binding is None:
-            return None
-
     if not str(binding.window_id or "").strip():
+        if not workspace_dir:
+            return None
         window_id = session_manager.allocate_virtual_window_id()
         state = session_manager.get_window_state(window_id)
         state.cwd = workspace_dir
         state.window_name = "coco-control"
         session_manager.bind_thread(
-            user_id,
+            owner_user_id,
             thread_id,
             window_id,
             window_name="coco-control",
@@ -2575,87 +3061,312 @@ def _ensure_default_coco_general_control(
             "fresh_start",
         )
         binding = session_manager.resolve_topic_binding(
-            user_id,
+            owner_user_id,
             thread_id,
             chat_id=chat_id,
         )
 
-    if current_control is None:
-        binding = session_manager.set_coco_control_topic(
-            user_id,
-            thread_id,
-            chat_id=chat_id,
-        )
+    if current_control is not None and current_control.user_id == owner_user_id:
         logger.info(
             "Defaulted forum General to CoCo control (user=%d chat=%d)",
-            user_id,
+            owner_user_id,
             chat_id,
         )
     return binding
 
 
-async def _migrate_coco_control_to_general(bot: Bot) -> CocoControlMigration | None:
-    """Move a legacy named control topic to General and announce the change."""
-    current = session_manager.get_coco_control_topic()
-    if current is None or not current.chat_id:
-        return None
-    if current.thread_id == GENERAL_TOPIC_THREAD_ID:
-        _ensure_default_coco_general_control(
-            user_id=current.user_id,
-            thread_id=GENERAL_TOPIC_THREAD_ID,
-            chat_id=current.chat_id,
-        )
-        return None
+def _coco_control_owner_user_id(user_id: int, chat_id: int | None) -> int:
+    """Route a group-shared General message through its canonical owner session."""
+    if not int(chat_id or 0):
+        return user_id
+    control = session_manager.get_coco_control_topic(int(chat_id or 0))
+    if control is None or control.thread_id != GENERAL_TOPIC_THREAD_ID:
+        return user_id
+    return control.user_id
 
-    workspace_path = _default_coco_control_workspace(
-        user_id=current.user_id,
-        thread_id=GENERAL_TOPIC_THREAD_ID,
-        chat_id=current.chat_id,
-    )
-    workspace_path.mkdir(parents=True, exist_ok=True)
-    migration = session_manager.migrate_coco_control_to_general(
-        workspace_dir=str(workspace_path),
-        general_thread_id=GENERAL_TOPIC_THREAD_ID,
-    )
-    if migration is None:
-        return None
 
-    old_notice = (
-        "ℹ️ CoCo control has moved permanently to General. "
-        "Its Codex history was migrated there. This topic is no longer the "
-        "control channel."
+_COCO_CONTROL_PERMISSION_DENIED_TEXT = (
+    "Only the CoCo control owner or an admin can control another user's topic."
+)
+_COCO_CONTROL_UNCONFIGURED_TEXT = (
+    "⚠️ CoCo's General control is not configured for this group. "
+    "An allowlist admin must be configured before General can be used; ask an "
+    "admin to update `/allowed`, then retry."
+)
+_COCO_CONTROL_MIGRATION_PENDING_TEXT = (
+    "⏳ CoCo's General control migration is still pending. The legacy "
+    "control history was preserved; retry after the remote machine is online."
+)
+_COCO_CONTROL_WORKSPACE_RPC_TIMEOUT_SECONDS = 5.0
+
+
+def _can_coco_control_target(
+    *,
+    caller_user_id: int,
+    target_user_id: int,
+    chat_id: int | None,
+) -> bool:
+    """Authorize cross-owner mutations originating from General.
+
+    General is shared by every allowlisted group member, but a single-session
+    member must not gain control of another member's binding merely because the
+    target is discoverable in the shared dashboard. Only current allowlist
+    admins retain cross-owner authority; callers may always operate on their own
+    binding. A persisted legacy control owner is not an admin grant.
+    """
+    if int(caller_user_id) == int(target_user_id):
+        return True
+    return _is_admin_user(caller_user_id)
+
+
+async def _control_workspace_for_migration(control: CocoControlTopic) -> str:
+    """Allocate the immutable workspace on the machine that owns the control."""
+    binding = session_manager.resolve_topic_binding(
+        control.user_id,
+        control.thread_id,
+        chat_id=control.chat_id,
     )
-    general_notice = (
-        "✅ General is now the permanent CoCo control channel. "
-        "The previous control history was migrated here."
-    )
-    for thread_id, text in (
-        (migration.previous_thread_id, old_notice),
-        (migration.general_thread_id, general_notice),
-    ):
+    local_machine_id, _local_machine_name = _local_machine_identity()
+    machine_id = str(binding.machine_id or "").strip() if binding is not None else ""
+    if machine_id and machine_id != local_machine_id:
+        node = node_registry.get_node(machine_id)
+        if node is not None and getattr(node, "status", "") == NODE_STATUS_OFFLINE:
+            raise RuntimeError(f"control workspace machine is offline: {machine_id}")
         try:
-            await safe_send(
-                bot,
-                migration.chat_id,
-                text,
-                message_thread_id=thread_id,
+            payload = await asyncio.wait_for(
+                agent_rpc_client.ensure_control_workspace(
+                    machine_id,
+                    chat_id=control.chat_id,
+                ),
+                timeout=_COCO_CONTROL_WORKSPACE_RPC_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "timed out waiting for control workspace machine "
+                f"{machine_id}"
+            ) from exc
+        return str(payload.get("workspace_path", "")).strip()
+    workspace_path = _ensure_local_coco_control_workspace(
+        _default_coco_control_workspace(
+            user_id=control.user_id,
+            thread_id=GENERAL_TOPIC_THREAD_ID,
+            chat_id=control.chat_id,
+        )
+    )
+    return str(workspace_path)
+
+
+def _coco_control_binding_fingerprint(
+    control: CocoControlTopic,
+) -> tuple[str, str, str, str] | None:
+    """Capture the identity that a remote workspace allocation must remain bound to."""
+    binding = session_manager.resolve_topic_binding(
+        control.user_id,
+        control.thread_id,
+        chat_id=control.chat_id,
+    )
+    if binding is None:
+        return None
+    return (
+        str(binding.machine_id or "").strip(),
+        str(binding.window_id or "").strip(),
+        str(binding.codex_thread_id or "").strip(),
+        str(binding.cwd or "").strip(),
+    )
+
+
+def _coco_control_binding_is_current(
+    control: CocoControlTopic,
+    fingerprint: tuple[str, str, str, str] | None,
+) -> bool:
+    return bool(
+        session_manager.get_coco_control_topic(control.chat_id) == control
+        and _coco_control_binding_fingerprint(control) == fingerprint
+    )
+
+
+def _occupied_general_workspace_hint(control: CocoControlTopic) -> str:
+    """Return a harmless workspace hint when General is already occupied."""
+    for _user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
+        if (
+            int(chat_id or 0) != control.chat_id
+            or thread_id != GENERAL_TOPIC_THREAD_ID
+        ):
+            continue
+        if not (
+            str(binding.codex_thread_id or "").strip()
+            or str(binding.cwd or "").strip()
+            or str(binding.window_id or "").strip()
+        ):
+            continue
+        return str(binding.cwd or "").strip() or str(config.config_dir)
+    return ""
+
+
+async def _flush_coco_control_notices(bot: Bot) -> int:
+    """Deliver pending migration notices and acknowledge only confirmed sends."""
+    delivered = 0
+    now = time.time()
+    for notice in list(session_manager.iter_pending_coco_control_notices()):
+        if notice.next_attempt_at > now:
+            continue
+        try:
+            result = await safe_send(
+                bot,
+                notice.chat_id,
+                notice.text,
+                message_thread_id=notice.thread_id,
+                raise_on_failure=True,
+            )
+            if result is None:
+                raise RuntimeError("Telegram send returned no message")
         except Exception as exc:
+            normalized_error = str(exc).strip().lower()
+            permanently_undeliverable = isinstance(exc, BadRequest) and any(
+                marker in normalized_error
+                for marker in (
+                    "topic_id_invalid",
+                    "topic_deleted",
+                    "message thread not found",
+                    "chat not found",
+                )
+            )
+            if permanently_undeliverable:
+                session_manager.acknowledge_coco_control_notice(notice.notice_id)
+                emit_telemetry(
+                    "coco.control_notice.dead_lettered",
+                    notice_id=notice.notice_id,
+                    chat_id=notice.chat_id,
+                    thread_id=notice.thread_id,
+                    error=str(exc),
+                )
+                logger.warning(
+                    "Dropping permanently undeliverable CoCo migration notice "
+                    "(chat=%s thread=%s): %s",
+                    notice.chat_id,
+                    notice.thread_id,
+                    exc,
+                )
+                continue
+            session_manager.record_coco_control_notice_failure(
+                notice.notice_id,
+                str(exc),
+                now=now,
+            )
             logger.warning(
                 "Failed to announce CoCo General migration "
                 "(chat=%s thread=%s): %s",
-                migration.chat_id,
-                thread_id,
+                notice.chat_id,
+                notice.thread_id,
                 exc,
             )
-    emit_telemetry(
-        "coco.control.migrated_to_general",
-        user_id=migration.user_id,
-        chat_id=migration.chat_id,
-        previous_thread_id=migration.previous_thread_id,
-        moved_history=migration.moved_history,
-    )
-    return migration
+            continue
+        session_manager.acknowledge_coco_control_notice(notice.notice_id)
+        delivered += 1
+    return delivered
+
+
+async def _migrate_coco_control_to_general(bot: Bot) -> CocoControlMigration | None:
+    """Migrate every legacy group control and retry its durable notice outbox."""
+    first_migration: CocoControlMigration | None = None
+    for current in list(session_manager.iter_coco_control_topics()):
+        if not current.chat_id:
+            continue
+        if current.thread_id == GENERAL_TOPIC_THREAD_ID:
+            binding = session_manager.resolve_topic_binding(
+                current.user_id,
+                GENERAL_TOPIC_THREAD_ID,
+                chat_id=current.chat_id,
+            )
+            canonical_thread = (
+                str(binding.codex_thread_id or "").strip()
+                if binding is not None
+                else ""
+            )
+            conflict = session_manager.coco_control_migration_conflicts.get(
+                current.chat_id,
+                "",
+            )
+            occupied_window = bool(
+                binding is not None and str(binding.window_id or "").strip()
+            )
+            if not canonical_thread and not conflict and not occupied_window:
+                fingerprint = _coco_control_binding_fingerprint(current)
+                try:
+                    workspace_dir = await _control_workspace_for_migration(current)
+                except Exception as exc:
+                    logger.warning(
+                        "Control workspace allocation deferred (chat=%s): %s",
+                        current.chat_id,
+                        exc,
+                    )
+                    continue
+                if not _coco_control_binding_is_current(current, fingerprint):
+                    logger.warning(
+                        "Control workspace allocation discarded after binding changed "
+                        "(chat=%s)",
+                        current.chat_id,
+                    )
+                    continue
+                if binding is not None and not str(binding.cwd or "").strip():
+                    session_manager.set_topic_binding_cwd(
+                        current.user_id,
+                        GENERAL_TOPIC_THREAD_ID,
+                        workspace_dir,
+                        chat_id=current.chat_id,
+                    )
+                _ensure_default_coco_general_control(
+                    user_id=current.user_id,
+                    thread_id=GENERAL_TOPIC_THREAD_ID,
+                    chat_id=current.chat_id,
+                )
+            continue
+        fingerprint = _coco_control_binding_fingerprint(current)
+        try:
+            workspace_dir = await _control_workspace_for_migration(current)
+            if not _coco_control_binding_is_current(current, fingerprint):
+                raise RuntimeError(
+                    "control binding changed during workspace allocation"
+                )
+            session_manager.archive_general_topic_bindings(current.chat_id)
+            migration = session_manager.migrate_coco_control_to_general(
+                workspace_dir=workspace_dir,
+                chat_id=current.chat_id,
+                general_thread_id=GENERAL_TOPIC_THREAD_ID,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Control migration deferred (chat=%s): %s",
+                current.chat_id,
+                exc,
+            )
+            continue
+        if migration is None:
+            continue
+        if first_migration is None:
+            first_migration = migration
+        emit_telemetry(
+            "coco.control.migrated_to_general",
+            user_id=migration.user_id,
+            chat_id=migration.chat_id,
+            previous_thread_id=migration.previous_thread_id,
+            moved_history=migration.moved_history,
+            conflict=migration.conflict,
+        )
+    await _flush_coco_control_notices(bot)
+    return first_migration
+
+
+async def _coco_control_retry_loop(bot: Bot) -> None:
+    """Retry deferred remote migrations and their Telegram notice outbox."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _migrate_coco_control_to_general(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("CoCo control migration retry failed")
 
 
 def _format_coco_topic_label(
@@ -2723,13 +3434,13 @@ def _build_coco_control_text(
     if is_current:
         lines.extend(
             [
-                "This topic is currently the singleton CoCo control topic.",
+                "This topic is this group's permanent CoCo control topic.",
                 "It should be used as the management layer for other topics.",
             ]
         )
     else:
         if current_control is None:
-            lines.append("This will designate this topic as the singleton CoCo control topic.")
+            lines.append("This will designate General as this group's CoCo control topic.")
         else:
             lines.append("This will replace the current CoCo control topic.")
         lines.extend(
@@ -2746,6 +3457,331 @@ def _build_coco_control_keyboard(*, is_current: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Refresh", callback_data=CB_COCO_REFRESH)]]
     )
+
+
+def _coco_group_topic_rows(
+    chat_id: int,
+) -> list[tuple[int, int, TopicBinding]]:
+    rows: list[tuple[int, int, TopicBinding]] = []
+    for (
+        owner_user_id,
+        binding_chat_id,
+        thread_id,
+        binding,
+    ) in session_manager.iter_topic_bindings():
+        if int(binding_chat_id or 0) != int(chat_id):
+            continue
+        rows.append((owner_user_id, thread_id, binding))
+    return sorted(rows, key=lambda row: (row[1] == GENERAL_TOPIC_THREAD_ID, row[1]))
+
+
+def _telegram_topic_url(chat_id: int, thread_id: int) -> str | None:
+    raw = str(abs(int(chat_id)))
+    if not raw.startswith("100") or len(raw) <= 3:
+        return None
+    return f"https://t.me/c/{raw[3:]}/{thread_id}"
+
+
+_COCO_DASHBOARD_MARKDOWN_RE = re.compile(r"([\\`*_\[\]{}()<>#+\-!|])")
+
+
+def _escape_coco_dashboard_text(value: object) -> str:
+    """Render one dynamic dashboard value as literal standard Markdown text."""
+    return _COCO_DASHBOARD_MARKDOWN_RE.sub(r"\\\1", str(value))
+
+
+def _build_coco_dashboard(
+    *,
+    chat_id: int,
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build a compact, read-only control-plane snapshot for one group."""
+    control = session_manager.get_coco_control_topic(chat_id)
+    topic_rows = _coco_group_topic_rows(chat_id)
+    nodes = {node.machine_id: node for node in node_registry.iter_nodes()}
+    running = 0
+    queued = 0
+    topic_lines: list[str] = []
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    managed_rows = [
+        row for row in topic_rows if row[1] != GENERAL_TOPIC_THREAD_ID
+    ]
+    page_count = max(
+        1,
+        (len(managed_rows) + _COCO_DASHBOARD_PAGE_SIZE - 1)
+        // _COCO_DASHBOARD_PAGE_SIZE,
+    )
+    resolved_page = min(max(0, int(page)), page_count - 1)
+    page_start = resolved_page * _COCO_DASHBOARD_PAGE_SIZE
+    visible_rows = managed_rows[page_start : page_start + _COCO_DASHBOARD_PAGE_SIZE]
+    for owner_user_id, thread_id, binding in managed_rows:
+        active_turn = ""
+        if binding.window_id:
+            active_turn = session_manager.get_window_codex_active_turn_id(
+                binding.window_id
+            )
+        topic_queue = queued_topic_input_count(
+            owner_user_id,
+            thread_id,
+            chat_id,
+        )
+        queued += topic_queue
+        if active_turn:
+            running += 1
+    for owner_user_id, thread_id, binding in visible_rows:
+        label = str(binding.display_name or "").strip() or f"thread-{thread_id}"
+        active_turn = ""
+        if binding.window_id:
+            active_turn = session_manager.get_window_codex_active_turn_id(
+                binding.window_id
+            )
+        topic_queue = queued_topic_input_count(
+            owner_user_id,
+            thread_id,
+            chat_id,
+        )
+        machine_id = str(binding.machine_id or "").strip()
+        node = nodes.get(machine_id)
+        machine = (
+            str(getattr(node, "display_name", "") or "").strip()
+            or machine_id
+            or "local"
+        )
+        safe_label = _escape_coco_dashboard_text(label)
+        safe_machine = _escape_coco_dashboard_text(machine)
+        status = "running" if active_turn else "idle"
+        queue_label = f" · q{topic_queue}" if topic_queue else ""
+        topic_lines.append(
+            f"• `{thread_id}` {safe_label} · {safe_machine} · {status}{queue_label}"
+        )
+        snapshot_token = _register_coco_dashboard_snapshot(
+            chat_id=chat_id,
+            owner_user_id=owner_user_id,
+            thread_id=thread_id,
+            binding=binding,
+            active_turn_id=active_turn,
+        )
+        ident = f"{owner_user_id}:{thread_id}:{snapshot_token}"
+        buttons = [
+            InlineKeyboardButton("Inspect", callback_data=f"{CB_COCO_INSPECT}{ident}"),
+            InlineKeyboardButton("Steer", callback_data=f"{CB_COCO_STEER}{ident}"),
+            InlineKeyboardButton(
+                "Interrupt",
+                callback_data=f"{CB_COCO_INTERRUPT}{ident}",
+            ),
+        ]
+        topic_url = _telegram_topic_url(chat_id, thread_id)
+        if topic_url:
+            buttons.append(InlineKeyboardButton("Open", url=topic_url))
+        keyboard_rows.append(buttons)
+
+    online = sum(
+        1 for node in nodes.values() if str(getattr(node, "status", "")) == "online"
+    )
+    failures = get_recent_failures(limit=3)
+    control_ok = bool(control and control.thread_id == GENERAL_TOPIC_THREAD_ID)
+    health = (
+        "✅"
+        if control_ok
+        and not session_manager.coco_control_migration_conflicts.get(chat_id)
+        else "⚠️"
+    )
+    lines = [
+        f"CoCo dashboard {health}",
+        f"Topics: `{len(managed_rows)}` · running: `{running}` · queued: `{queued}` · page `{resolved_page + 1}/{page_count}`",
+        f"Machines: `{online}/{len(nodes)}` online",
+        "",
+        *(topic_lines or ["(no managed topics in this group)"]),
+    ]
+    if control is None:
+        lines.extend(["", _COCO_CONTROL_UNCONFIGURED_TEXT])
+    if failures:
+        lines.extend(["", "Recent failures:"])
+        for failure in failures:
+            event = _escape_coco_dashboard_text(failure.get("event", "failure"))
+            lines.append(f"• `{event}`")
+    pending = sum(
+        1
+        for notice in session_manager.iter_pending_coco_control_notices()
+        if notice.chat_id == chat_id
+    )
+    if pending:
+        lines.extend(["", f"Migration notices pending: `{pending}`"])
+    if page_count > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if resolved_page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    "Previous",
+                    callback_data=f"{CB_COCO_PAGE}{resolved_page - 1}",
+                )
+            )
+        if resolved_page + 1 < page_count:
+            navigation.append(
+                InlineKeyboardButton(
+                    "Next",
+                    callback_data=f"{CB_COCO_PAGE}{resolved_page + 1}",
+                )
+            )
+        keyboard_rows.append(navigation)
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton("Doctor", callback_data=CB_COCO_DOCTOR),
+            InlineKeyboardButton(
+                "Refresh",
+                callback_data=f"{CB_COCO_PAGE}{resolved_page}",
+            ),
+        ]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
+
+
+async def _build_coco_doctor_text(chat_id: int) -> str:
+    """Validate the immutable General control binding without mutating it."""
+    checks: list[tuple[bool, str]] = []
+    control = session_manager.get_coco_control_topic(chat_id)
+    checks.append(
+        (
+            control is not None,
+            "per-group General reservation"
+            if control is not None
+            else "per-group General reservation (not configured)",
+        )
+    )
+    binding: TopicBinding | None = None
+    if control is not None:
+        checks.append(
+            (control.thread_id == GENERAL_TOPIC_THREAD_ID, "General thread identity")
+        )
+        binding = session_manager.resolve_topic_binding(
+            control.user_id,
+            GENERAL_TOPIC_THREAD_ID,
+            chat_id=chat_id,
+        )
+    checks.append((binding is not None, "canonical control binding"))
+    if binding is not None:
+        checks.append((bool(str(binding.window_id or "").strip()), "control window"))
+        checks.append((bool(str(binding.cwd or "").strip()), "internal workspace"))
+        if binding.window_id and binding.cwd:
+            (
+                checked_path,
+                can_write,
+                write_error,
+            ) = await _probe_workspace_write_access_for_window(
+                binding.window_id,
+                workspace_dir=binding.cwd,
+            )
+            detail = f"workspace writable (`{checked_path}`)"
+            if write_error:
+                detail += f": {write_error}"
+            checks.append((can_write, detail))
+        machine_id = str(binding.machine_id or "").strip()
+        local_machine_id, _ = _local_machine_identity()
+        node = node_registry.get_node(machine_id) if machine_id else None
+        machine_ok = (
+            not machine_id
+            or machine_id == local_machine_id
+            or bool(node and node.status == "online")
+        )
+        checks.append(
+            (machine_ok, f"machine `{machine_id or local_machine_id}` reachable")
+        )
+        checks.append(
+            (
+                bool(
+                    str(binding.codex_thread_id or "").strip()
+                    or session_manager.peek_window_pending_session_start_reason(
+                        binding.window_id
+                    )
+                ),
+                "Codex thread or fresh-start marker",
+            )
+        )
+        codex_thread_id = str(binding.codex_thread_id or "").strip()
+        if codex_thread_id:
+            thread_ok = False
+            thread_error = ""
+            try:
+                if machine_id and machine_id != local_machine_id:
+                    thread_ids, thread_error = await agent_rpc_client.list_threads(
+                        machine_id,
+                        max_items=1000,
+                    )
+                    thread_ok = codex_thread_id in thread_ids
+                else:
+                    payload = await codex_app_server_client.thread_read(
+                        thread_id=codex_thread_id,
+                        timeout=5.0,
+                        include_turns=False,
+                    )
+                    raw_thread = payload.get("thread") if isinstance(payload, dict) else None
+                    thread_ok = bool(
+                        isinstance(raw_thread, dict)
+                        and str(raw_thread.get("id", "")).strip() == codex_thread_id
+                    )
+            except Exception as exc:
+                thread_error = str(exc)
+            thread_detail = "Codex thread resolves"
+            if thread_error:
+                thread_detail += f": {thread_error}"
+            checks.append((thread_ok, thread_detail))
+    pending = [
+        notice
+        for notice in session_manager.iter_pending_coco_control_notices()
+        if notice.chat_id == chat_id
+    ]
+    checks.append((not pending, f"migration notice outbox ({len(pending)} pending)"))
+    conflict = session_manager.coco_control_migration_conflicts.get(chat_id, "")
+    checks.append(
+        (not conflict, f"migration collision{f': {conflict}' if conflict else ''}")
+    )
+    stale = sum(
+        1
+        for _uid, _thread_id, topic in _coco_group_topic_rows(chat_id)
+        if not topic.window_id or (not topic.cwd and not topic.codex_thread_id)
+    )
+    checks.append((stale == 0, f"stale bindings ({stale})"))
+    lines = ["CoCo doctor", ""]
+    lines.extend(f"{'✅' if ok else '⚠️'} {detail}" for ok, detail in checks)
+    if control is None:
+        lines.extend(
+            [
+                "",
+                "General control is not configured. Configure an allowlist admin, then retry `/coco`.",
+            ]
+        )
+    elif all(ok for ok, _detail in checks):
+        lines.extend(["", "Control health is good."])
+    else:
+        lines.extend(
+            [
+                "",
+                "Restart CoCo after resolving any machine/workspace issue; General will not be silently replaced.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _schedule_coco_doctor_task(
+    coroutine,
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    update: Update,
+) -> asyncio.Task:
+    """Schedule one doctor refresh while retaining it until completion."""
+    application = getattr(context, "application", None)
+    create_task = getattr(application, "create_task", None)
+    if callable(create_task):
+        task = create_task(
+            coroutine,
+            update=update,
+            name="coco-doctor",
+        )
+    else:
+        task = asyncio.create_task(coroutine, name="coco-doctor")
+    _coco_doctor_tasks.add(task)
+    task.add_done_callback(_coco_doctor_tasks.discard)
+    return task
 
 
 def _resolve_workspace_dir_for_window(
@@ -2982,7 +4018,102 @@ def _clear_apps_flow_state(user_data: dict | None) -> None:
         user_data.pop(STATE_KEY, None)
     user_data.pop(APPS_PENDING_THREAD_KEY, None)
     user_data.pop(APPS_PENDING_WINDOW_ID_KEY, None)
+    user_data.pop(APPS_PENDING_USER_KEY, None)
+    user_data.pop(APPS_PENDING_CHAT_KEY, None)
+    user_data.pop(APPS_PENDING_OWNERSHIP_KEY, None)
     user_data.pop(APPS_LOOPER_CONFIG_KEY, None)
+
+
+def _serialize_apps_pending_ownership(
+    ownership: TopicOwnership | None,
+) -> dict[str, str] | None:
+    if ownership is None:
+        return None
+    return {
+        "window_id": ownership.window_id,
+        "codex_thread_id": ownership.codex_thread_id,
+        "machine_id": ownership.machine_id,
+        "cwd": ownership.cwd,
+    }
+
+
+def _deserialize_apps_pending_ownership(raw: object) -> TopicOwnership | None:
+    if not isinstance(raw, dict):
+        return None
+    return TopicOwnership(
+        window_id=str(raw.get("window_id", "") or "").strip(),
+        codex_thread_id=str(raw.get("codex_thread_id", "") or "").strip(),
+        machine_id=str(raw.get("machine_id", "") or "").strip(),
+        cwd=str(raw.get("cwd", "") or "").strip(),
+    )
+
+
+def _store_apps_pending_scope(
+    user_data: dict | None,
+    *,
+    user_id: int,
+    chat_id: int | None,
+    thread_id: int,
+) -> None:
+    """Persist the full topic identity for an interactive app prompt."""
+    if user_data is None:
+        return
+    ownership = capture_topic_ownership(user_id, thread_id, chat_id)
+    user_data[APPS_PENDING_USER_KEY] = int(user_id)
+    user_data[APPS_PENDING_CHAT_KEY] = int(chat_id or 0)
+    user_data[APPS_PENDING_THREAD_KEY] = int(thread_id)
+    user_data[APPS_PENDING_OWNERSHIP_KEY] = _serialize_apps_pending_ownership(ownership)
+
+
+def _validate_apps_pending_scope(
+    user_data: dict,
+    *,
+    caller_user_id: int | None = None,
+    user_id: int,
+    chat_id: int | None,
+    thread_id: int,
+) -> tuple[int, int, int] | None:
+    """Validate pending app input against owner, chat, thread, and binding."""
+    if thread_id is None:
+        return None
+    try:
+        pending_user_id = int(user_data[APPS_PENDING_USER_KEY])
+        pending_chat_id = int(user_data[APPS_PENDING_CHAT_KEY])
+        pending_thread_id = int(user_data[APPS_PENDING_THREAD_KEY])
+    except (KeyError, TypeError, ValueError):
+        return None
+    current_owner_id = (
+        _coco_control_owner_user_id(user_id, chat_id)
+        if thread_id == GENERAL_TOPIC_THREAD_ID
+        else int(user_id)
+    )
+    current_chat_id = int(chat_id or 0)
+    if (
+        pending_user_id != current_owner_id
+        or pending_chat_id != current_chat_id
+        or pending_thread_id != int(thread_id)
+    ):
+        return None
+    if caller_user_id is None or not _can_coco_control_target(
+        caller_user_id=int(caller_user_id),
+        target_user_id=pending_user_id,
+        chat_id=pending_chat_id,
+    ):
+        return None
+    ownership = _deserialize_apps_pending_ownership(
+        user_data.get(APPS_PENDING_OWNERSHIP_KEY)
+    )
+    if ownership is None or not is_topic_ownership_current(
+        pending_user_id,
+        pending_thread_id,
+        pending_chat_id,
+        ownership,
+    ):
+        return None
+    pending_window_id = user_data.get(APPS_PENDING_WINDOW_ID_KEY)
+    if pending_window_id is not None and str(pending_window_id).strip() != ownership.window_id:
+        return None
+    return pending_user_id, pending_chat_id, pending_thread_id
 
 
 def _list_markdown_plan_candidates(
@@ -3984,6 +5115,7 @@ async def _create_worktree_from_topic(
         note_run_started(
             user_id=user_id,
             thread_id=new_thread_id,
+            chat_id=resolved_chat_id,
             window_id=created_wid,
             source="worktree_handoff",
             expect_response=False,
@@ -5000,6 +6132,7 @@ async def _dispatch_next_queued_input(
     note_run_started(
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         source="queued_dispatch",
         pending_text=queued_text,
@@ -5309,9 +6442,18 @@ async def _build_autoresearch_panel_payload_for_topic(
         thread_id=thread_id,
         chat_id=chat_id,
     )
-    state = get_autoresearch_state(user_id=user_id, thread_id=thread_id)
+    state = get_autoresearch_state(
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
     if isinstance(user_data, dict):
-        user_data[APPS_PENDING_THREAD_KEY] = thread_id
+        _store_apps_pending_scope(
+            user_data,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
     return (
         True,
         _build_autoresearch_panel_text(state=state, scheduled=scheduled),
@@ -5354,7 +6496,11 @@ async def _build_looper_panel_payload_for_topic(
         )
 
     candidates = _list_markdown_plan_candidates(Path(workspace_dir))
-    active_state = get_looper_state(user_id=user_id, thread_id=thread_id)
+    active_state = get_looper_state(
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
     existing = user_data.get(APPS_LOOPER_CONFIG_KEY) if isinstance(user_data, dict) else None
     config_data = _normalize_looper_panel_config(
         existing,
@@ -5363,7 +6509,12 @@ async def _build_looper_panel_payload_for_topic(
     )
     if isinstance(user_data, dict):
         user_data[APPS_LOOPER_CONFIG_KEY] = config_data
-        user_data[APPS_PENDING_THREAD_KEY] = thread_id
+        _store_apps_pending_scope(
+            user_data,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
         user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
     text = _build_looper_panel_text(
         config_data=config_data,
@@ -8253,72 +9404,16 @@ def _ensure_codex_project_trust(
     *,
     trust_level: str = "trusted",
 ) -> tuple[bool, str]:
-    """Ensure Codex marks project_path as trusted in ~/.codex/config.toml.
+    """Ensure Codex marks project_path as trusted in the active Codex config.
 
     This is required for Codex tool execution (file writes, git, outbound
     network) in app-server mode. Without it, Codex may sandbox operations and
     surface confusing "Permission denied" / DNS failures.
     """
-    config_path = Path.home() / ".codex" / "config.toml"
-    try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        content = (
-            config_path.read_text(encoding="utf-8")
-            if config_path.exists()
-            else ""
-        )
-    except OSError as e:
-        return False, f"Failed to read config: {e}"
-
-    project_key = str(project_path)
-    section_header = f"[projects.{_toml_string(project_key)}]"
-    desired_line = f"trust_level = {_toml_string(trust_level)}"
-
-    lines = content.splitlines()
-
-    # Find the target table and its boundaries.
-    start = None
-    end = len(lines)
-    for i, line in enumerate(lines):
-        if line.strip() == section_header:
-            start = i
-            for j in range(i + 1, len(lines)):
-                maybe_header = lines[j].strip()
-                if maybe_header.startswith("[") and maybe_header.endswith("]"):
-                    end = j
-                    break
-            break
-
-    if start is None:
-        # Append a new table at the end.
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(section_header)
-        lines.append(desired_line)
-    else:
-        # Update or insert trust_level within the existing table.
-        updated = False
-        for k in range(start + 1, end):
-            stripped = lines[k].strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            left, sep, _right = lines[k].partition("=")
-            if sep and left.strip() == "trust_level":
-                indent = lines[k][: len(lines[k]) - len(lines[k].lstrip())]
-                lines[k] = f"{indent}{desired_line}"
-                updated = True
-                break
-        if not updated:
-            lines.insert(start + 1, desired_line)
-
-    new_content = "\n".join(lines)
-    if lines:
-        new_content += "\n"
-    try:
-        config_path.write_text(new_content, encoding="utf-8")
-    except OSError as e:
-        return False, f"Failed to write config: {e}"
-    return True, ""
+    return ensure_codex_project_trust(
+        project_path,
+        trust_level=trust_level,
+    )
 
 
 def _ensure_codex_trust_for_runtime() -> None:
@@ -8387,6 +9482,14 @@ async def topic_closed_handler(
     chat_id = _group_chat_id(chat)
     if thread_id is None:
         return
+    if session_manager.is_coco_control_topic(user.id, thread_id, chat_id=chat_id):
+        logger.warning(
+            "General control topic closure observed; preserving binding "
+            "(chat=%s user=%s)",
+            chat_id,
+            user.id,
+        )
+        return
 
     wid = session_manager.get_window_for_thread(
         user.id,
@@ -8403,7 +9506,13 @@ async def topic_closed_handler(
         )
         session_manager.unbind_thread(user.id, thread_id, chat_id=chat_id)
         # Clean up all memory state for this topic
-        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+        await clear_topic_state(
+            user.id,
+            thread_id,
+            context.bot,
+            context.user_data,
+            chat_id=chat_id,
+        )
     else:
         logger.debug(
             "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
@@ -8429,12 +9538,6 @@ async def forward_command_handler(
     thread_id = _get_thread_id(update)
     chat_id = _group_chat_id(chat)
 
-    # Capture group chat_id for supergroup forum topic routing.
-    # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
-    if chat_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
-
     cmd_text = update.message.text or ""
     # The full text is already a slash command like "/clear" or "/compact foo"
     cc_slash = cmd_text.split("@")[0]  # strip bot mention
@@ -8447,8 +9550,47 @@ async def forward_command_handler(
         )
         return
 
+    # General must be materialized and validated in this chat before any
+    # canonical-owner alias or session lookup. Otherwise a stale binding under
+    # the caller can receive a slash command while control is unconfigured or
+    # awaiting legacy migration.
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        _ensure_default_coco_general_control(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if control is None:
+            await safe_reply(update.message, _COCO_CONTROL_UNCONFIGURED_TEXT)
+            return
+        if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await safe_reply(update.message, _COCO_CONTROL_MIGRATION_PENDING_TEXT)
+            return
+
+    # General is routed explicitly to the group's immutable control owner only
+    # after the original caller passes the cross-owner authorization check.
+    target_user_id = (
+        _coco_control_owner_user_id(user.id, chat_id)
+        if thread_id == GENERAL_TOPIC_THREAD_ID
+        else user.id
+    )
+    if not _can_coco_control_target(
+        caller_user_id=user.id,
+        target_user_id=target_user_id,
+        chat_id=chat_id,
+    ):
+        await safe_reply(update.message, _COCO_CONTROL_PERMISSION_DENIED_TEXT)
+        return
+
+    # Capture group routing only for the accepted canonical target. Recording
+    # the caller before authorization would create a shadow General mapping for
+    # denied users and could influence later ambiguous-scope resolution.
+    if chat_id is not None:
+        session_manager.set_group_chat_id(target_user_id, thread_id, chat_id)
+
     wid = session_manager.resolve_window_for_thread(
-        user.id,
+        target_user_id,
         thread_id,
         chat_id=chat_id,
     )
@@ -8457,7 +9599,7 @@ async def forward_command_handler(
         return
 
     binding = session_manager.resolve_topic_binding(
-        user.id,
+        target_user_id,
         thread_id,
         chat_id=chat_id,
     )
@@ -8469,7 +9611,10 @@ async def forward_command_handler(
         return
     display = session_manager.get_display_name(wid)
     logger.info(
-        "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
+        "Forwarding command %s to window %s (user=%d)",
+        cc_slash,
+        display,
+        target_user_id,
     )
     await update.message.chat.send_action(ChatAction.TYPING)
     success, message = await session_manager.send_to_window(wid, cc_slash)
@@ -8477,10 +9622,16 @@ async def forward_command_handler(
         if cc_slash.strip().lower() == "/clear":
             from .handlers.run_watchdog import clear_run_watch_state
 
-            clear_run_watch_state(user.id, thread_id, window_id=wid)
+            clear_run_watch_state(
+                target_user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=wid,
+            )
         note_run_started(
-            user_id=user.id,
+            user_id=target_user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=wid,
             source=f"slash:{cmd_name}",
             expect_response=False,
@@ -8530,6 +9681,216 @@ _DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 # --- Video directory for incoming videos ---
 _VIDEOS_DIR = coco_dir() / "videos"
 _VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+
+_REMOTE_ATTACHMENT_INGRESS_UNSUPPORTED_TEXT = (
+    "❌ Attachments to remote sessions are not supported yet. "
+    "Send this attachment in a local topic."
+)
+
+
+def _remote_attachment_ingress_error(
+    topic_ownership: TopicOwnership | None,
+    *,
+    attachment_type: str,
+) -> str | None:
+    """Reject local Telegram media before sending a path to a remote session."""
+    if topic_ownership is None:
+        return None
+    machine_id = topic_ownership.machine_id.strip()
+    local_machine_id, _local_machine_name = _local_machine_identity()
+    if not machine_id or machine_id == local_machine_id:
+        return None
+    logger.warning(
+        "Rejecting remote Telegram attachment ingress (type=%s machine=%s window=%s)",
+        attachment_type,
+        machine_id,
+        topic_ownership.window_id,
+    )
+    emit_telemetry(
+        "telegram.attachment.remote_ingress_rejected",
+        attachment_type=attachment_type,
+        machine_id=machine_id,
+        window_id=topic_ownership.window_id,
+    )
+    return _REMOTE_ATTACHMENT_INGRESS_UNSUPPORTED_TEXT
+
+
+def _resolve_pending_dashboard_steer_target(
+    *,
+    pending_steer: object,
+    caller_user_id: int,
+    chat_id: int | None,
+) -> _PendingDashboardSteerTarget | None:
+    """Resolve an authorized pending Steer without consuming its intent.
+
+    Attachments are downloaded before ``_forward_topic_text_message`` can
+    consume a pending dashboard intent. Resolve only the immutable target
+    metadata here so General authorization and remote-ingress checks use the
+    selected topic rather than the canonical General binding. The forwarding
+    path remains responsible for consuming the intent and revalidating its
+    TTL, binding ownership, and target window.
+    """
+    if not _dashboard_steer_matches_chat(pending_steer, chat_id):
+        return None
+    if _dashboard_steer_intent_expired(pending_steer):
+        return None
+    if not isinstance(pending_steer, dict):
+        return None
+    try:
+        owner_user_id = int(pending_steer.get("owner_user_id", 0) or 0)
+        thread_id = int(pending_steer.get("thread_id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if owner_user_id <= 0 or thread_id <= 0:
+        return None
+    if not _can_coco_control_target(
+        caller_user_id=caller_user_id,
+        target_user_id=owner_user_id,
+        chat_id=chat_id,
+    ):
+        return None
+    raw_ownership = pending_steer.get("ownership")
+    if not isinstance(raw_ownership, dict):
+        return None
+    ownership = TopicOwnership(
+        window_id=str(raw_ownership.get("window_id", "") or "").strip(),
+        codex_thread_id=str(raw_ownership.get("codex_thread_id", "") or "").strip(),
+        machine_id=str(raw_ownership.get("machine_id", "") or "").strip(),
+        cwd=str(raw_ownership.get("cwd", "") or "").strip(),
+    )
+    return _PendingDashboardSteerTarget(
+        owner_user_id=owner_user_id,
+        thread_id=thread_id,
+        ownership=ownership,
+    )
+
+
+def _resolve_pending_dashboard_steer_attachment_target(
+    *,
+    pending_steer: object,
+    caller_user_id: int,
+    chat_id: int | None,
+) -> tuple[_PendingDashboardSteerTarget | None, str | None]:
+    """Resolve and fence one pending media Steer before download.
+
+    The normal text forwarding path performs the same checks after it has the
+    message body. Attachments need the checks up front so stale intents and
+    remote targets cannot trigger Telegram downloads first. A ``None`` error
+    means the intent belongs to another chat and should be ignored normally.
+    """
+    if not _dashboard_steer_matches_chat(pending_steer, chat_id):
+        return None, None
+    if _dashboard_steer_intent_expired(pending_steer):
+        return None, _COCO_DASHBOARD_STEER_EXPIRED_TEXT
+
+    target = _resolve_pending_dashboard_steer_target(
+        pending_steer=pending_steer,
+        caller_user_id=caller_user_id,
+        chat_id=chat_id,
+    )
+    if target is None:
+        target_user_id = 0
+        if isinstance(pending_steer, dict):
+            try:
+                target_user_id = int(pending_steer.get("owner_user_id", 0) or 0)
+            except (TypeError, ValueError):
+                target_user_id = 0
+        if not _can_coco_control_target(
+            caller_user_id=caller_user_id,
+            target_user_id=target_user_id,
+            chat_id=chat_id,
+        ):
+            return None, f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}"
+        return None, "❌ That dashboard target changed. Refresh /coco and try again."
+
+    if not is_topic_ownership_current(
+        target.owner_user_id,
+        target.thread_id,
+        chat_id,
+        target.ownership,
+    ):
+        return None, "❌ That dashboard target changed. Refresh /coco and try again."
+    if not target.ownership.window_id:
+        return None, "❌ That dashboard target is stale. Refresh /coco."
+    return target, None
+
+
+async def _dispatch_pending_dashboard_steer(
+    *,
+    message,
+    chat_id: int | None,
+    text: str,
+    target: _PendingDashboardSteerTarget,
+) -> None:
+    """Dispatch an already-consumed dashboard Steer to its immutable target.
+
+    Media handlers must consume the one-shot intent before Telegram download,
+    archive extraction, or transcription.  They pass this explicit snapshot
+    here so forwarding never falls back to the General control binding after a
+    fallible operation.  Revalidate the snapshot immediately before send in
+    case the target was rebound while that operation was in flight.
+    """
+    target_user_id = target.owner_user_id
+    target_thread_id = target.thread_id
+    if not is_topic_ownership_current(
+        target_user_id,
+        target_thread_id,
+        chat_id,
+        target.ownership,
+    ):
+        await safe_reply(
+            message,
+            "❌ That dashboard target changed. Refresh /coco and try again.",
+        )
+        return
+
+    target_binding = session_manager.resolve_topic_binding(
+        target_user_id,
+        target_thread_id,
+        chat_id=chat_id,
+    )
+    target_wid = (
+        str(target_binding.window_id or "").strip()
+        if target_binding is not None
+        else ""
+    )
+    if not target_wid or target_wid != target.ownership.window_id:
+        await safe_reply(message, "❌ That dashboard target is stale. Refresh /coco.")
+        return
+
+    dispatch_state = TopicSendDispatchState()
+    success, send_msg = await session_manager.send_topic_text_to_window(
+        user_id=target_user_id,
+        thread_id=target_thread_id,
+        chat_id=chat_id,
+        window_id=target_wid,
+        text=text,
+        steer=True,
+        dispatch_state=dispatch_state,
+        topic_ownership=target.ownership,
+    )
+    if not success:
+        await safe_reply(message, f"❌ {send_msg}")
+        return
+    if dispatch_state.started_new_turn:
+        note_run_started(
+            user_id=target_user_id,
+            thread_id=target_thread_id,
+            chat_id=chat_id,
+            window_id=target_wid,
+            source="steer_input",
+            pending_text=text,
+            expect_response=True,
+        )
+    else:
+        note_run_activity(
+            user_id=target_user_id,
+            thread_id=target_thread_id,
+            chat_id=chat_id,
+            window_id=target_wid,
+            source="steer_input",
+        )
+    await safe_reply(message, f"✅ Steered topic `{target_thread_id}`.")
 
 # Per-topic lock for Codex image resume submissions: (user_id, thread_id) -> lock
 _photo_resume_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -8898,7 +10259,7 @@ async def _submit_image_to_codex_session(
             session_manager.mark_topic_telegram_live(
                 user_id=user_id,
                 thread_id=thread_id,
-                chat_id=None,
+                chat_id=chat_id,
                 window_id=window_id,
             )
             return True, ""
@@ -8955,7 +10316,7 @@ async def _submit_image_to_codex_session(
         session_manager.mark_topic_telegram_live(
             user_id=user_id,
             thread_id=thread_id,
-            chat_id=None,
+            chat_id=chat_id,
             window_id=window_id,
         )
         return True, ""
@@ -9023,6 +10384,7 @@ async def _run_photo_bridge_task(
                 note_run_started(
                     user_id=user_id,
                     thread_id=thread_id,
+                    chat_id=chat_id,
                     window_id=window_id,
                     source="photo_fallback",
                     pending_text=fallback_text,
@@ -9066,7 +10428,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     thread_id = _get_thread_id(update)
     chat_id = _group_chat_id(chat)
-    if chat_id is not None and thread_id is not None:
+    is_general_control = (
+        thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0)
+    )
+    if chat_id is not None and thread_id is not None and not is_general_control:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
 
     # Must be in a named topic
@@ -9082,36 +10447,139 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         thread_id=thread_id,
         chat_id=chat_id,
     )
-
-    wid = session_manager.get_window_for_thread(
-        user.id,
-        thread_id,
-        chat_id=chat_id,
+    control = (
+        session_manager.get_coco_control_topic(int(chat_id or 0))
+        if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0)
+        else None
     )
-    if wid is None:
-        await safe_reply(
-            update.message,
-            "❌ No session bound to this topic. Send a text message first to create one.",
-        )
+    if (
+        thread_id == GENERAL_TOPIC_THREAD_ID
+        and int(chat_id or 0)
+        and control is None
+    ):
+        await safe_reply(update.message, _COCO_CONTROL_UNCONFIGURED_TEXT)
         return
-
-    binding = session_manager.resolve_topic_binding(
-        user.id,
-        thread_id,
-        chat_id=chat_id,
+    pending_steer = (
+        context.user_data.get("_coco_dashboard_steer")
+        if context.user_data is not None
+        else None
     )
-    if binding is None or (not binding.codex_thread_id and not binding.cwd):
-        await safe_reply(
-            update.message,
-            "❌ Session binding is incomplete. Send a normal message to reinitialize.",
+    pending_steer_target = None
+    binding = None
+    topic_ownership = None
+
+    # General photos honor the same one-shot dashboard target as text,
+    # documents, and videos. Resolve and fence the target before Telegram
+    # downloads the attachment so stale/remote paths fail closed.
+    if (
+        is_general_control
+        and isinstance(pending_steer, dict)
+        and _dashboard_steer_matches_chat(pending_steer, chat_id)
+    ):
+        pending_steer_target, pending_steer_error = (
+            _resolve_pending_dashboard_steer_attachment_target(
+                pending_steer=pending_steer,
+                caller_user_id=user.id,
+                chat_id=chat_id,
+            )
         )
-        return
-    topic_ownership = capture_topic_ownership(user.id, thread_id, chat_id)
-    if topic_ownership is None:
-        await safe_reply(
-            update.message,
-            "❌ The topic binding changed before this image could be accepted. Retry it.",
+        if pending_steer_error:
+            if context.user_data is not None:
+                context.user_data.pop("_coco_dashboard_steer", None)
+            await safe_reply(update.message, pending_steer_error)
+            return
+        if pending_steer_target is None:
+            context.user_data.pop("_coco_dashboard_steer", None)
+            await safe_reply(
+                update.message,
+                "❌ That dashboard target changed. Refresh /coco and try again.",
+            )
+            return
+
+        target_user_id = pending_steer_target.owner_user_id
+        target_thread_id = pending_steer_target.thread_id
+        target_ownership = pending_steer_target.ownership
+
+        # Consume before any await that could fail (including Telegram's file
+        # download), so a rejected/failed attachment cannot capture following
+        # text as an unintended steer.
+        context.user_data.pop("_coco_dashboard_steer", None)
+        session_user_id = target_user_id
+        thread_id = target_thread_id
+        wid = target_ownership.window_id
+        topic_ownership = target_ownership
+        if chat_id is not None:
+            session_manager.set_group_chat_id(session_user_id, thread_id, chat_id)
+    else:
+        if control is not None and control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await safe_reply(
+                update.message,
+                "⏳ CoCo's General control migration is still pending. The legacy "
+                "control history was preserved; retry after the remote machine is online.",
+            )
+            return
+        if (
+            control is not None
+            and control.thread_id == GENERAL_TOPIC_THREAD_ID
+            and not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=control.user_id,
+                chat_id=chat_id,
+            )
+        ):
+            await safe_reply(
+                update.message,
+                f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+            )
+            return
+        session_user_id = (
+            control.user_id
+            if control is not None and control.thread_id == GENERAL_TOPIC_THREAD_ID
+            else user.id
         )
+        if is_general_control and chat_id is not None:
+            session_manager.set_group_chat_id(session_user_id, thread_id, chat_id)
+
+        wid = session_manager.get_window_for_thread(
+            session_user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if wid is None:
+            await safe_reply(
+                update.message,
+                "❌ No session bound to this topic. Send a text message first to create one.",
+            )
+            return
+
+        binding = session_manager.resolve_topic_binding(
+            session_user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if binding is None or (not binding.codex_thread_id and not binding.cwd):
+            await safe_reply(
+                update.message,
+                "❌ Session binding is incomplete. Send a normal message to reinitialize.",
+            )
+            return
+        topic_ownership = capture_topic_ownership(session_user_id, thread_id, chat_id)
+        if topic_ownership is None:
+            await safe_reply(
+                update.message,
+                "❌ The topic binding changed before this image could be accepted. Retry it.",
+            )
+            return
+    remote_attachment_error = (
+        _remote_attachment_ingress_error(
+            topic_ownership,
+            attachment_type="photo",
+        )
+        if is_general_control
+        else None
+    )
+    if remote_attachment_error:
+        await safe_reply(update.message, remote_attachment_error)
         return
 
     # Download the highest-resolution photo
@@ -9126,13 +10594,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     prompt = _pick_image_prompt(update.message.caption)
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id, chat_id)
+    clear_status_msg_info(session_user_id, thread_id, chat_id)
 
     if config.session_provider == "codex":
         asyncio.create_task(
             _run_photo_bridge_task(
                 bot=context.bot,
-                user_id=user.id,
+                user_id=session_user_id,
                 thread_id=thread_id,
                 chat_id=chat_id,
                 window_id=wid,
@@ -9147,7 +10615,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Non-Codex providers: keep existing path-hint behavior.
     text_to_send = f"{prompt}\n\n(image attached: {file_path})"
     success, message = await session_manager.send_topic_text_to_window(
-        user_id=user.id,
+        user_id=session_user_id,
         thread_id=thread_id,
         chat_id=chat_id,
         window_id=wid,
@@ -9158,8 +10626,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"❌ {message}")
         return
     note_run_started(
-        user_id=user.id,
+        user_id=session_user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=wid,
         source="photo_direct",
         pending_text=text_to_send,
@@ -9205,8 +10674,90 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     thread_id = _get_thread_id(update)
     chat_id = _group_chat_id(chat)
-    if chat_id is not None and thread_id is not None:
+    session_user_id = user.id
+    is_general_control = (
+        thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0)
+    )
+    if chat_id is not None and thread_id is not None and not is_general_control:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+
+    pending_steer_target = None
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        _ensure_default_coco_general_control(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if control is None:
+            await safe_reply(message, _COCO_CONTROL_UNCONFIGURED_TEXT)
+            return
+        pending_steer = (
+            context.user_data.get("_coco_dashboard_steer")
+            if context.user_data is not None
+            else None
+        )
+        pending_steer_target, pending_steer_error = (
+            _resolve_pending_dashboard_steer_attachment_target(
+                pending_steer=pending_steer,
+                caller_user_id=user.id,
+                chat_id=chat_id,
+            )
+        )
+        if pending_steer_error:
+            if context.user_data is not None:
+                context.user_data.pop("_coco_dashboard_steer", None)
+            await safe_reply(message, pending_steer_error)
+            return
+        if pending_steer_target is None:
+            if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+                await safe_reply(
+                    message,
+                    "⏳ CoCo's General control migration is still pending. The legacy "
+                    "control history was preserved; retry after the remote machine is online.",
+                )
+                return
+            if not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=control.user_id,
+                chat_id=chat_id,
+            ):
+                await safe_reply(
+                    message,
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+                )
+                return
+            session_manager.set_group_chat_id(control.user_id, thread_id, chat_id)
+            session_user_id = control.user_id
+        else:
+            session_user_id = pending_steer_target.owner_user_id
+            if context.user_data is not None:
+                # This one-shot intent is accepted once its target has passed
+                # auth/fencing; consume it before Telegram download/extraction.
+                context.user_data.pop("_coco_dashboard_steer", None)
+            if chat_id is not None:
+                session_manager.set_group_chat_id(
+                    session_user_id,
+                    pending_steer_target.thread_id,
+                    chat_id,
+                )
+
+    topic_ownership = (
+        pending_steer_target.ownership
+        if pending_steer_target is not None
+        else capture_topic_ownership(session_user_id, thread_id, chat_id)
+    )
+    remote_attachment_error = (
+        _remote_attachment_ingress_error(
+            topic_ownership,
+            attachment_type="archive" if is_archive else "document",
+        )
+        if is_general_control
+        else None
+    )
+    if remote_attachment_error:
+        await safe_reply(message, remote_attachment_error)
+        return
 
     tg_file = await document.get_file()
     file_path = _DOCUMENTS_DIR / f"{int(time.time())}_{document.file_unique_id}{suffix}"
@@ -9218,10 +10769,23 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _forward_topic_text_message(
             message=message,
             context=context,
-            user_id=user.id,
-            thread_id=thread_id,
+            user_id=(
+                pending_steer_target.owner_user_id
+                if pending_steer_target is not None
+                else user.id
+            ),
+            thread_id=(
+                pending_steer_target.thread_id
+                if pending_steer_target is not None
+                else thread_id
+            ),
             chat_id=chat_id,
             text=prompt_text,
+            **(
+                {"pending_steer_target": pending_steer_target}
+                if pending_steer_target is not None
+                else {}
+            ),
         )
         return
 
@@ -9231,10 +10795,23 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _forward_topic_text_message(
             message=message,
             context=context,
-            user_id=user.id,
-            thread_id=thread_id,
+            user_id=(
+                pending_steer_target.owner_user_id
+                if pending_steer_target is not None
+                else user.id
+            ),
+            thread_id=(
+                pending_steer_target.thread_id
+                if pending_steer_target is not None
+                else thread_id
+            ),
             chat_id=chat_id,
             text=text_to_send,
+            **(
+                {"pending_steer_target": pending_steer_target}
+                if pending_steer_target is not None
+                else {}
+            ),
         )
         return
 
@@ -9243,10 +10820,23 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _forward_topic_text_message(
             message=message,
             context=context,
-            user_id=user.id,
-            thread_id=thread_id,
+            user_id=(
+                pending_steer_target.owner_user_id
+                if pending_steer_target is not None
+                else user.id
+            ),
+            thread_id=(
+                pending_steer_target.thread_id
+                if pending_steer_target is not None
+                else thread_id
+            ),
             chat_id=chat_id,
             text=prompt_text,
+            **(
+                {"pending_steer_target": pending_steer_target}
+                if pending_steer_target is not None
+                else {}
+            ),
         )
         return
 
@@ -9276,10 +10866,23 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _forward_topic_text_message(
         message=message,
         context=context,
-        user_id=user.id,
-        thread_id=thread_id,
+        user_id=(
+            pending_steer_target.owner_user_id
+            if pending_steer_target is not None
+            else user.id
+        ),
+        thread_id=(
+            pending_steer_target.thread_id
+            if pending_steer_target is not None
+            else thread_id
+        ),
         chat_id=chat_id,
         text=prompt_text,
+        **(
+            {"pending_steer_target": pending_steer_target}
+            if pending_steer_target is not None
+            else {}
+        ),
     )
 
 
@@ -9307,8 +10910,93 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     thread_id = _get_thread_id(update)
     chat_id = _group_chat_id(chat)
-    if chat_id is not None and thread_id is not None:
+    session_user_id = user.id
+    is_general_control = (
+        thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0)
+    )
+    if chat_id is not None and thread_id is not None and not is_general_control:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+
+    pending_steer_target = None
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        _ensure_default_coco_general_control(
+            user_id=user.id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if control is None:
+            await safe_reply(
+                message,
+                _COCO_CONTROL_UNCONFIGURED_TEXT,
+            )
+            return
+        pending_steer = (
+            context.user_data.get("_coco_dashboard_steer")
+            if context.user_data is not None
+            else None
+        )
+        pending_steer_target, pending_steer_error = (
+            _resolve_pending_dashboard_steer_attachment_target(
+                pending_steer=pending_steer,
+                caller_user_id=user.id,
+                chat_id=chat_id,
+            )
+        )
+        if pending_steer_error:
+            if context.user_data is not None:
+                context.user_data.pop("_coco_dashboard_steer", None)
+            await safe_reply(message, pending_steer_error)
+            return
+        if pending_steer_target is None:
+            if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+                await safe_reply(
+                    message,
+                    "⏳ CoCo's General control migration is still pending. The legacy "
+                    "control history was preserved; retry after the remote machine is online.",
+                )
+                return
+            if not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=control.user_id,
+                chat_id=chat_id,
+            ):
+                await safe_reply(
+                    message,
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+                )
+                return
+            session_manager.set_group_chat_id(control.user_id, thread_id, chat_id)
+            session_user_id = control.user_id
+        else:
+            session_user_id = pending_steer_target.owner_user_id
+            if context.user_data is not None:
+                # Consume before Telegram download so a failed video cannot
+                # capture a later General message.
+                context.user_data.pop("_coco_dashboard_steer", None)
+            if chat_id is not None:
+                session_manager.set_group_chat_id(
+                    session_user_id,
+                    pending_steer_target.thread_id,
+                    chat_id,
+                )
+
+    topic_ownership = (
+        pending_steer_target.ownership
+        if pending_steer_target is not None
+        else capture_topic_ownership(session_user_id, thread_id, chat_id)
+    )
+    remote_attachment_error = (
+        _remote_attachment_ingress_error(
+            topic_ownership,
+            attachment_type="video",
+        )
+        if is_general_control
+        else None
+    )
+    if remote_attachment_error:
+        await safe_reply(message, remote_attachment_error)
+        return
 
     tg_file = await video.get_file()
     file_path = _VIDEOS_DIR / f"{int(time.time())}_{video.file_unique_id}{_pick_video_suffix(video)}"
@@ -9319,10 +11007,23 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _forward_topic_text_message(
         message=message,
         context=context,
-        user_id=user.id,
-        thread_id=thread_id,
+        user_id=(
+            pending_steer_target.owner_user_id
+            if pending_steer_target is not None
+            else user.id
+        ),
+        thread_id=(
+            pending_steer_target.thread_id
+            if pending_steer_target is not None
+            else thread_id
+        ),
         chat_id=chat_id,
         text=prompt_text,
+        **(
+            {"pending_steer_target": pending_steer_target}
+            if pending_steer_target is not None
+            else {}
+        ),
     )
 
 
@@ -9336,8 +11037,15 @@ async def _forward_topic_text_message(
     text: str,
     response_mode: str = "text",
     persist_response_mode: bool = True,
-) -> None:
-    """Forward one text prompt through the normal topic/session path."""
+    anonymous_fallback: bool = False,
+    pending_steer_target: _PendingDashboardSteerTarget | None = None,
+) -> _TopicTextForwardResult | None:
+    """Forward one text prompt through the normal topic/session path.
+
+    A result is returned only after a normal prompt is accepted by the target
+    session; rejection, queueing, and explicit steer/control actions return
+    ``None`` so callers cannot trigger user-message side effects prematurely.
+    """
     if thread_id is None:
         await safe_reply(
             message,
@@ -9345,11 +11053,136 @@ async def _forward_topic_text_message(
         )
         return
 
-    _ensure_default_coco_general_control(
-        user_id=user_id,
-        thread_id=thread_id,
-        chat_id=chat_id,
+    # A topic binding identifies a session, not the sender. Without an explicit
+    # trusted sender policy, never let an anonymous/unallowlisted fallback
+    # impersonate the bound owner in any topic (including General control).
+    if anonymous_fallback:
+        await safe_reply(message, "You are not authorized to use this bot.")
+        return
+
+    caller_user_id = user_id
+
+    pending_steer = (
+        context.user_data.get("_coco_dashboard_steer")
+        if context.user_data is not None
+        else None
     )
+    # Resolve and consume context-backed intents before any control-owner gate.
+    # Media handlers pass ``pending_steer_target`` explicitly because they have
+    # already consumed the intent before their fallible download/processing.
+    if (
+        pending_steer_target is None
+        and thread_id == GENERAL_TOPIC_THREAD_ID
+        and isinstance(pending_steer, dict)
+        and _dashboard_steer_matches_chat(pending_steer, chat_id)
+    ):
+        pending_steer_target, pending_steer_error = (
+            _resolve_pending_dashboard_steer_attachment_target(
+                pending_steer=pending_steer,
+                caller_user_id=caller_user_id,
+                chat_id=chat_id,
+            )
+        )
+        if context.user_data is not None:
+            context.user_data.pop("_coco_dashboard_steer", None)
+        if pending_steer_error:
+            await safe_reply(message, pending_steer_error)
+            return
+        if pending_steer_target is None:
+            await safe_reply(
+                message,
+                "❌ That dashboard target changed. Refresh /coco and try again.",
+            )
+            return
+
+    if pending_steer_target is not None:
+        return await _dispatch_pending_dashboard_steer(
+            message=message,
+            chat_id=chat_id,
+            text=text,
+            target=pending_steer_target,
+        )
+
+    # General is a group-wide control channel.  Do not let an unconfigured
+    # allowlist fall through to the caller's own binding (including a stale
+    # General binding) before the canonical control can be established.
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        _ensure_default_coco_general_control(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        initial_control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if initial_control is None:
+            await safe_reply(message, _COCO_CONTROL_UNCONFIGURED_TEXT)
+            return
+
+    control = (
+        session_manager.get_coco_control_topic(int(chat_id or 0))
+        if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0)
+        else None
+    )
+    if control is not None and control.thread_id != GENERAL_TOPIC_THREAD_ID:
+        await safe_reply(message, _COCO_CONTROL_MIGRATION_PENDING_TEXT)
+        return
+    if control is not None and control.thread_id == GENERAL_TOPIC_THREAD_ID:
+        control_action = _parse_coco_control_action(
+            user_id=caller_user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=text,
+        )
+        if control_action is not None:
+            (
+                action,
+                target_user_id,
+                target_thread_id,
+                target_label,
+                payload_text,
+            ) = control_action
+            if action == "ambiguous":
+                await safe_reply(
+                    message,
+                    f"❌ Ambiguous target topic `{target_label}`; use the dashboard controls.",
+                )
+                return
+            if not _can_coco_control_target(
+                caller_user_id=caller_user_id,
+                target_user_id=target_user_id,
+                chat_id=chat_id,
+            ):
+                await safe_reply(
+                    message,
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+                )
+                return
+            await _dispatch_coco_control_action(
+                message=message,
+                context=context,
+                chat_id=chat_id,
+                action=action,
+                target_user_id=target_user_id,
+                target_thread_id=target_thread_id,
+                target_label=target_label,
+                payload_text=payload_text,
+            )
+            return
+    if (
+        control is not None
+        and control.thread_id == GENERAL_TOPIC_THREAD_ID
+        and not _can_coco_control_target(
+            caller_user_id=caller_user_id,
+            target_user_id=control.user_id,
+            chat_id=chat_id,
+        )
+    ):
+        await safe_reply(
+            message,
+            f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+        )
+        return
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        user_id = _coco_control_owner_user_id(user_id, chat_id)
 
     wid = session_manager.get_window_for_thread(
         user_id,
@@ -9357,6 +11190,13 @@ async def _forward_topic_text_message(
         chat_id=chat_id,
     )
     if wid is None:
+        if session_manager.is_coco_control_topic(user_id, thread_id, chat_id=chat_id):
+            await safe_reply(
+                message,
+                "🔒 CoCo's General control session is unavailable and was not "
+                "replaced. Run `/coco doctor` or restart CoCo.",
+            )
+            return
         if not _can_user_create_sessions(user_id):
             await safe_reply(
                 message,
@@ -9403,6 +11243,13 @@ async def _forward_topic_text_message(
         chat_id=chat_id,
     )
     if binding is None or (not binding.codex_thread_id and not binding.cwd):
+        if session_manager.is_coco_control_topic(user_id, thread_id, chat_id=chat_id):
+            await safe_reply(
+                message,
+                "🔒 CoCo's General control session is incomplete and was not "
+                "replaced. Run `/coco doctor` or restart CoCo.",
+            )
+            return
         display = session_manager.get_display_name(wid)
         logger.info(
             "Incomplete binding for %s (user=%d, thread=%d); unbinding",
@@ -9452,67 +11299,39 @@ async def _forward_topic_text_message(
             text=text,
         )
         if control_action is not None:
-            action, target_thread_id, target_label, payload_text = control_action
-            target_wid = session_manager.get_window_for_thread(
-                user_id,
+            (
+                action,
+                target_user_id,
                 target_thread_id,
-                chat_id=chat_id,
-            )
-            if target_wid is None:
+                target_label,
+                payload_text,
+            ) = control_action
+            if action == "ambiguous":
                 await safe_reply(
                     message,
-                    f"❌ Topic `{target_label}` is not bound to a session yet.",
+                    f"❌ Ambiguous target topic `{target_label}`; use the dashboard controls.",
                 )
                 return
-            target_ownership = capture_topic_ownership(
-                user_id,
-                target_thread_id,
-                chat_id,
-            )
-            if target_ownership is None:
+            if not _can_coco_control_target(
+                caller_user_id=caller_user_id,
+                target_user_id=target_user_id,
+                chat_id=chat_id,
+            ):
                 await safe_reply(
                     message,
-                    "❌ The target topic binding changed before this request "
-                    "could be accepted. Retry it.",
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
                 )
                 return
-            if action == "queue":
-                source_chat_id = getattr(message, "chat_id", None)
-                chat = getattr(message, "chat", None)
-                if source_chat_id is None and chat is not None:
-                    source_chat_id = getattr(chat, "id", None)
-                enqueue_queued_topic_input(
-                    user_id,
-                    target_thread_id,
-                    payload_text,
-                    source_chat_id,
-                    message.message_id,
-                    topic_ownership=target_ownership,
-                )
-                await _set_hourglass_reaction(message)
-                await sync_queued_topic_dock(
-                    context.bot,
-                    user_id,
-                    target_thread_id,
-                    window_id=target_wid,
-                    chat_id=source_chat_id,
-                )
-                return
-
-            await message.chat.send_action(ChatAction.TYPING)
-            success, send_msg = await session_manager.send_topic_text_to_window(
-                user_id=user_id,
-                thread_id=target_thread_id,
+            await _dispatch_coco_control_action(
+                message=message,
+                context=context,
                 chat_id=chat_id,
-                window_id=target_wid,
-                text=payload_text,
-                steer=True,
-                topic_ownership=target_ownership,
+                action=action,
+                target_user_id=target_user_id,
+                target_thread_id=target_thread_id,
+                target_label=target_label,
+                payload_text=payload_text,
             )
-            if not success:
-                await safe_reply(message, f"❌ {send_msg}")
-                return
-            await _set_eyes_reaction(message)
             return
 
     if session_manager.get_window_mention_only(wid):
@@ -9684,6 +11503,7 @@ async def _forward_topic_text_message(
         note_run_activity(
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=wid,
             source="steer_input",
         )
@@ -9698,12 +11518,21 @@ async def _forward_topic_text_message(
         note_run_started(
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=wid,
             source="user_input",
             pending_text=text,
             expect_response=True,
         )
     await asyncio.gather(*ack_tasks, return_exceptions=True)
+    return _TopicTextForwardResult(
+        accepted=True,
+        trigger_looper=not is_steer_message,
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        window_id=wid,
+    )
 
 
 def _resolve_coco_control_target_topic(
@@ -9712,27 +11541,29 @@ def _resolve_coco_control_target_topic(
     current_thread_id: int,
     current_chat_id: int | None,
     raw_target: str,
-) -> tuple[int, str] | None:
+) -> list[tuple[int, int, str]]:
     normalized = raw_target.strip()
     if not normalized:
-        return None
+        return []
     by_thread_id: int | None
     try:
         by_thread_id = int(normalized)
     except ValueError:
         by_thread_id = None
     lowered = normalized.lower()
+    matches: list[tuple[int, int, str]] = []
     for user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
-        if user_id != current_user_id or chat_id != current_chat_id:
+        if chat_id != current_chat_id:
             continue
         if thread_id == current_thread_id:
             continue
         label = str(getattr(binding, "display_name", "") or "").strip() or f"thread-{thread_id}"
-        if by_thread_id is not None and thread_id == by_thread_id:
-            return thread_id, label
-        if label.lower() == lowered:
-            return thread_id, label
-    return None
+        if (
+            (by_thread_id is not None and thread_id == by_thread_id)
+            or label.lower() == lowered
+        ):
+            matches.append((user_id, thread_id, label))
+    return matches
 
 
 def _parse_coco_control_action(
@@ -9741,7 +11572,7 @@ def _parse_coco_control_action(
     thread_id: int,
     chat_id: int | None,
     text: str,
-) -> tuple[str, int, str, str] | None:
+) -> tuple[str, int, int, str, str] | None:
     for action, pattern in (
         ("queue", _COCO_CONTROL_QUEUE_RE),
         ("steer", _COCO_CONTROL_TELL_RE),
@@ -9757,17 +11588,114 @@ def _parse_coco_control_action(
         payload_text = str(match.group("message") or "").strip()
         if not target_raw or not payload_text:
             return None
-        resolved = _resolve_coco_control_target_topic(
+        matches = _resolve_coco_control_target_topic(
             current_user_id=user_id,
             current_thread_id=thread_id,
             current_chat_id=chat_id,
             raw_target=target_raw,
         )
-        if resolved is None:
+        if not matches:
             return None
-        target_thread_id, target_label = resolved
-        return action, target_thread_id, target_label, payload_text
+        if len(matches) > 1:
+            return "ambiguous", 0, 0, target_raw, ""
+        resolved = matches[0]
+        target_user_id, target_thread_id, target_label = resolved
+        return action, target_user_id, target_thread_id, target_label, payload_text
     return None
+
+
+async def _dispatch_coco_control_action(
+    *,
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int | None,
+    action: str,
+    target_user_id: int,
+    target_thread_id: int,
+    target_label: str,
+    payload_text: str,
+) -> None:
+    """Dispatch an already-authorized General action to its target topic."""
+    target_wid = session_manager.get_window_for_thread(
+        target_user_id,
+        target_thread_id,
+        chat_id=chat_id,
+    )
+    if target_wid is None:
+        await safe_reply(
+            message,
+            f"❌ Topic `{target_label}` is not bound to a session yet.",
+        )
+        return
+    target_ownership = capture_topic_ownership(
+        target_user_id,
+        target_thread_id,
+        chat_id,
+    )
+    if target_ownership is None:
+        await safe_reply(
+            message,
+            "❌ The target topic binding changed before this request "
+            "could be accepted. Retry it.",
+        )
+        return
+    if action == "queue":
+        source_chat_id = getattr(message, "chat_id", None)
+        chat = getattr(message, "chat", None)
+        if source_chat_id is None and chat is not None:
+            source_chat_id = getattr(chat, "id", None)
+        enqueue_queued_topic_input(
+            target_user_id,
+            target_thread_id,
+            payload_text,
+            source_chat_id,
+            message.message_id,
+            topic_ownership=target_ownership,
+        )
+        await _set_hourglass_reaction(message)
+        await sync_queued_topic_dock(
+            context.bot,
+            target_user_id,
+            target_thread_id,
+            window_id=target_wid,
+            chat_id=source_chat_id,
+        )
+        return
+
+    await message.chat.send_action(ChatAction.TYPING)
+    dispatch_state = TopicSendDispatchState()
+    success, send_msg = await session_manager.send_topic_text_to_window(
+        user_id=target_user_id,
+        thread_id=target_thread_id,
+        chat_id=chat_id,
+        window_id=target_wid,
+        text=payload_text,
+        steer=True,
+        dispatch_state=dispatch_state,
+        topic_ownership=target_ownership,
+    )
+    if not success:
+        await safe_reply(message, f"❌ {send_msg}")
+        return
+    if dispatch_state.started_new_turn:
+        note_run_started(
+            user_id=target_user_id,
+            thread_id=target_thread_id,
+            chat_id=chat_id,
+            window_id=target_wid,
+            source="steer_input",
+            pending_text=payload_text,
+            expect_response=True,
+        )
+    else:
+        note_run_activity(
+            user_id=target_user_id,
+            thread_id=target_thread_id,
+            chat_id=chat_id,
+            window_id=target_wid,
+            source="steer_input",
+        )
+    await _set_eyes_reaction(message)
 
 
 async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9794,14 +11722,84 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     thread_id = _get_thread_id(update)
     chat_id = _group_chat_id(chat)
-    if chat_id is not None and thread_id is not None:
+    is_general_control = (
+        thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0)
+    )
+    if chat_id is not None and thread_id is not None and not is_general_control:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+    control = None
     if thread_id is not None:
         _ensure_default_coco_general_control(
             user_id=user.id,
             thread_id=thread_id,
             chat_id=chat_id,
         )
+    pending_steer_target = None
+    pending_steer_voice = False
+    audio_session_user_id = user.id
+    audio_session_thread_id = thread_id
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if control is None:
+            await safe_reply(message, _COCO_CONTROL_UNCONFIGURED_TEXT)
+            return
+        if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await safe_reply(
+                message,
+                "⏳ CoCo's General control migration is still pending. The legacy "
+                "control history was preserved; retry after the remote machine is online.",
+            )
+            return
+
+        pending_steer = (
+            context.user_data.get("_coco_dashboard_steer")
+            if context.user_data is not None
+            else None
+        )
+        if (
+            isinstance(pending_steer, dict)
+            and _dashboard_steer_matches_chat(pending_steer, chat_id)
+        ):
+            pending_steer_target, pending_steer_error = (
+                _resolve_pending_dashboard_steer_attachment_target(
+                    pending_steer=pending_steer,
+                    caller_user_id=user.id,
+                    chat_id=chat_id,
+                )
+            )
+            if context.user_data is not None:
+                # Consume before Telegram download or local transcription.
+                context.user_data.pop("_coco_dashboard_steer", None)
+            if pending_steer_error:
+                await safe_reply(message, pending_steer_error)
+                return
+            if pending_steer_target is None:
+                await safe_reply(
+                    message,
+                    "❌ That dashboard target changed. Refresh /coco and try again.",
+                )
+                return
+            pending_steer_voice = True
+            audio_session_user_id = pending_steer_target.owner_user_id
+            audio_session_thread_id = pending_steer_target.thread_id
+            session_manager.set_group_chat_id(
+                audio_session_user_id,
+                audio_session_thread_id,
+                chat_id,
+            )
+        else:
+            if not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=control.user_id,
+                chat_id=chat_id,
+            ):
+                await safe_reply(
+                    message,
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+                )
+                return
+            session_manager.set_group_chat_id(control.user_id, thread_id, chat_id)
+            audio_session_user_id = control.user_id
     selected_profile = get_default_transcription_profile()
 
     tg_file = await media.get_file()
@@ -9857,14 +11855,15 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.debug("Failed to delete temporary audio file %s", file_path)
 
     is_coco_control_voice = bool(
-        thread_id is not None
+        not pending_steer_voice
+        and audio_session_thread_id is not None
         and session_manager.is_coco_control_topic(
-            user.id,
-            thread_id,
+            audio_session_user_id,
+            audio_session_thread_id,
             chat_id=chat_id,
         )
     )
-    if not is_coco_control_voice:
+    if not is_coco_control_voice and not pending_steer_voice:
         for transcript_chunk in split_message(transcript, max_length=3000):
             try:
                 await safe_reply(message, transcript_chunk)
@@ -9904,12 +11903,25 @@ async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _forward_topic_text_message(
         message=message,
         context=context,
-        user_id=user.id,
-        thread_id=thread_id,
+        user_id=(
+            pending_steer_target.owner_user_id
+            if pending_steer_target is not None
+            else user.id
+        ),
+        thread_id=(
+            pending_steer_target.thread_id
+            if pending_steer_target is not None
+            else thread_id
+        ),
         chat_id=chat_id,
         text=prompt,
         response_mode="voice",
         persist_response_mode=not is_coco_control_voice,
+        **(
+            {"pending_steer_target": pending_steer_target}
+            if pending_steer_target is not None
+            else {}
+        ),
     )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9925,6 +11937,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(message, "❌ This group is not allowed to use this bot.")
         return
     user_id: int | None = user.id if (user and is_user_allowed(user.id)) else None
+    anonymous_fallback = False
 
     # Support anonymous admin messages in supergroup topics by resolving the
     # bound thread owner when sender user is unavailable/unallowed.
@@ -9956,6 +11969,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         if len(candidate_user_ids) == 1:
             user_id = next(iter(candidate_user_ids))
+            anonymous_fallback = True
             logger.info(
                 "Resolved anonymous topic message to user %d (sender=%s, thread=%s, chat=%s)",
                 user_id,
@@ -9968,6 +11982,80 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(message, "You are not authorized to use this bot.")
         return
 
+    # A synthesized owner identity is not authentication. Reject every
+    # anonymous fallback before stateful text flows, routing, or forwarding.
+    if anonymous_fallback:
+        await safe_reply(message, "You are not authorized to use this bot.")
+        return
+
+    routing_user_id = user_id
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        _ensure_default_coco_general_control(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+        )
+        pending_steer = (
+            context.user_data.get("_coco_dashboard_steer")
+            if context.user_data is not None
+            else None
+        )
+        if (
+            isinstance(pending_steer, dict)
+            and _dashboard_steer_matches_chat(pending_steer, chat_id)
+            and _consume_expired_dashboard_steer(
+                context.user_data,
+                pending_steer,
+            )
+        ):
+            await safe_reply(message, _COCO_DASHBOARD_STEER_EXPIRED_TEXT)
+            return
+        control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if control is None:
+            await safe_reply(message, _COCO_CONTROL_UNCONFIGURED_TEXT)
+            return
+        if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await safe_reply(message, _COCO_CONTROL_MIGRATION_PENDING_TEXT)
+            return
+        pending_steer_for_caller = False
+        if isinstance(pending_steer, dict):
+            try:
+                pending_steer_for_caller = (
+                    _dashboard_steer_matches_chat(pending_steer, chat_id)
+                    and int(pending_steer.get("owner_user_id", 0) or 0)
+                    == int(user_id)
+                    and int(pending_steer.get("thread_id", 0) or 0) > 0
+                )
+            except (TypeError, ValueError):
+                pending_steer_for_caller = False
+        parsed_control_action = _parse_coco_control_action(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            text=message.text,
+        )
+        self_target_control_action = bool(
+            parsed_control_action is not None
+            and parsed_control_action[0] in {"queue", "steer"}
+            and int(parsed_control_action[1]) == int(user_id)
+        )
+        if not _can_coco_control_target(
+            caller_user_id=user_id,
+            target_user_id=control.user_id,
+            chat_id=chat_id,
+        ) and not pending_steer_for_caller and not self_target_control_action:
+            # A pending app prompt is held in per-user Telegram context. If
+            # cross-owner authority was revoked after the prompt opened, clear
+            # that capability before rejecting the reply so it cannot linger
+            # and be replayed after a later role change.
+            _clear_apps_flow_state(context.user_data)
+            await safe_reply(
+                message,
+                f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+            )
+            return
+        routing_user_id = int(control.user_id)
+
     logger.info(
         "Text message received (user=%d, thread=%s, chat_type=%s, text=%r)",
         user_id,
@@ -9976,13 +12064,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         (message.text or "")[:120],
     )
 
-    # Capture group chat_id for supergroup forum topic routing.
-    # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
-    if chat_id is not None:
-        session_manager.set_group_chat_id(user_id, thread_id, chat_id)
-
     text = message.text
+
+    apps_flow_states = {
+        STATE_APPS_AUTORESEARCH_OUTCOME,
+        STATE_APPS_LOOPER_PLAN_PATH,
+        STATE_APPS_LOOPER_KEYWORD,
+        STATE_APPS_LOOPER_INSTRUCTIONS,
+        STATE_APPS_LOOPER_INTERVAL,
+        STATE_APPS_LOOPER_LIMIT,
+    }
+    apps_flow_active = bool(
+        context.user_data
+        and context.user_data.get(STATE_KEY) in apps_flow_states
+    )
+    # Capture group chat_id for supergroup forum topic routing unless an app
+    # prompt is pending. Prompt scope validation below must reject stale or
+    # cross-chat replies before mutating routing state.
+    if chat_id is not None and not apps_flow_active:
+        session_manager.set_group_chat_id(routing_user_id, thread_id, chat_id)
 
     # /allowed add-flow text capture (legacy state cleanup only).
     if context.user_data:
@@ -9998,10 +12098,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # /apps autoresearch panel text capture.
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_APPS_AUTORESEARCH_OUTCOME:
-        pending_tid = context.user_data.get(APPS_PENDING_THREAD_KEY)
-        if pending_tid is None or pending_tid != thread_id:
+        pending_scope = _validate_apps_pending_scope(
+            context.user_data,
+            caller_user_id=getattr(user, "id", None),
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if pending_scope is None:
             _clear_apps_flow_state(context.user_data)
+            await safe_reply(
+                message,
+                "❌ Auto research prompt expired or belongs to another topic. Re-open `/apps` and try again.",
+            )
+            return
         else:
+            pending_user_id, pending_chat_id, pending_thread_id = pending_scope
             outcome = text.strip()
             if not outcome:
                 await safe_reply(
@@ -10009,18 +12121,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "Outcome cannot be empty. Send a short sentence describing what you want.",
                 )
                 return
+            if pending_chat_id:
+                session_manager.set_group_chat_id(
+                    pending_user_id,
+                    pending_thread_id,
+                    pending_chat_id,
+                )
             set_autoresearch_outcome(
-                user_id=user_id,
-                thread_id=thread_id,
+                user_id=pending_user_id,
+                chat_id=pending_chat_id,
+                thread_id=pending_thread_id,
                 outcome=outcome,
             )
             context.user_data[STATE_KEY] = ""
             await safe_reply(message, "✅ Auto research outcome updated.")
             ok, panel_text, panel_keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
-                user_id=user_id,
-                thread_id=thread_id,
+                user_id=pending_user_id,
+                thread_id=pending_thread_id,
                 user_data=context.user_data,
-                chat_id=chat_id,
+                chat_id=pending_chat_id,
             )
             if ok:
                 await safe_reply(
@@ -10042,18 +12161,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             STATE_APPS_LOOPER_INTERVAL,
             STATE_APPS_LOOPER_LIMIT,
         }:
-            pending_tid = context.user_data.get(APPS_PENDING_THREAD_KEY)
+            pending_scope = _validate_apps_pending_scope(
+                context.user_data,
+                caller_user_id=getattr(user, "id", None),
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
             pending_wid = context.user_data.get(APPS_PENDING_WINDOW_ID_KEY)
-            if pending_tid is None or pending_tid != thread_id:
-                _clear_apps_flow_state(context.user_data)
-            elif not isinstance(pending_wid, str) or not pending_wid:
+            if pending_scope is None or not isinstance(pending_wid, str) or not pending_wid:
                 _clear_apps_flow_state(context.user_data)
                 await safe_reply(
                     message,
-                    "❌ Looper panel expired. Open `/apps` and configure Looper again.",
+                    "❌ Looper prompt expired or belongs to another topic. Re-open `/apps` and try again.",
                 )
                 return
             else:
+                pending_user_id, pending_chat_id, pending_thread_id = pending_scope
+                if pending_chat_id:
+                    session_manager.set_group_chat_id(
+                        pending_user_id,
+                        pending_thread_id,
+                        pending_chat_id,
+                    )
                 raw_cfg = context.user_data.get(APPS_LOOPER_CONFIG_KEY)
                 cfg = (
                     dict(raw_cfg)
@@ -10079,8 +12209,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     if not os.path.isabs(plan_path):
                         base_dir = (
                             _resolve_workspace_dir_for_window(
-                                user_id=user_id,
-                                thread_id=thread_id,
+                                user_id=pending_user_id,
+                                thread_id=pending_thread_id,
+                                chat_id=pending_chat_id,
                                 window_id=pending_wid,
                             )
                             or ""
@@ -10175,10 +12306,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 context.user_data[APPS_LOOPER_CONFIG_KEY] = cfg
                 ok, panel_text, panel_keyboard, _wid = await _build_looper_panel_payload_for_topic(
-                    user_id=user_id,
-                    thread_id=thread_id,
+                    user_id=pending_user_id,
+                    thread_id=pending_thread_id,
                     user_data=context.user_data,
-                    chat_id=chat_id,
+                    chat_id=pending_chat_id,
                 )
                 if ok:
                     await safe_reply(
@@ -10323,16 +12454,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
 
-    await _forward_topic_text_message(
+    forward_result = await _forward_topic_text_message(
         message=message,
         context=context,
         user_id=user_id,
         thread_id=thread_id,
         chat_id=chat_id,
         text=text,
+        anonymous_fallback=anonymous_fallback,
     )
-    if thread_id is not None:
-        looper_state = get_looper_state(user_id=user_id, thread_id=thread_id)
+    routed_user_id = getattr(forward_result, "user_id", None)
+    routed_thread_id = getattr(forward_result, "thread_id", None)
+    routed_chat_id = getattr(forward_result, "chat_id", None)
+    if (
+        getattr(forward_result, "accepted", False)
+        and getattr(forward_result, "trigger_looper", False)
+        and routed_user_id is not None
+        and routed_thread_id is not None
+    ):
+        looper_state = get_looper_state(
+            user_id=routed_user_id,
+            chat_id=routed_chat_id,
+            thread_id=routed_thread_id,
+        )
         if (
             looper_state is not None
             and getattr(looper_state, "trigger_on_user_message", False)
@@ -10340,10 +12484,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ):
             await emit_looper_tick(
                 context.bot,
-                user_id=user_id,
-                thread_id=thread_id,
+                user_id=routed_user_id,
+                thread_id=routed_thread_id,
                 window_id=looper_state.window_id,
-                chat_id=chat_id,
+                chat_id=routed_chat_id,
                 force=True,
             )
 
@@ -10429,6 +12573,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not user or not is_user_allowed(user.id):
         await query.answer("Not authorized")
         return
+    callback_caller_user_id = int(user.id)
 
     data = query.data
     send_bot = getattr(context, "bot", None)
@@ -10438,8 +12583,114 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # messages with message_thread_id. Do NOT remove — see session.py docs.
     cb_thread_id = _get_thread_id(update)
     cb_chat_id = _group_chat_id(chat)
-    if cb_chat_id is not None:
-        session_manager.set_group_chat_id(user.id, cb_thread_id, cb_chat_id)
+    reserved_general = bool(
+        cb_thread_id == GENERAL_TOPIC_THREAD_ID
+        and int(cb_chat_id or 0)
+    )
+    callback_topic_user_id = user.id
+    if reserved_general and (
+        data.startswith(("md:", "am:")) or data == CB_COCO_DOCTOR
+    ):
+        control = session_manager.get_coco_control_topic(int(cb_chat_id or 0))
+        if control is None:
+            await query.answer(_COCO_CONTROL_UNCONFIGURED_TEXT, show_alert=True)
+            return
+        if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await query.answer(
+                "CoCo's General control migration is still pending.",
+                show_alert=True,
+            )
+            return
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=control.user_id,
+            chat_id=cb_chat_id,
+        ):
+            await query.answer(
+                _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                show_alert=True,
+            )
+            return
+        callback_topic_user_id = control.user_id
+    reserved_mutation = data.startswith(
+        ("db:", "se:", "wt:")
+    ) or data in {CB_COCO_SET, CB_COCO_CANCEL}
+    if reserved_general and reserved_mutation:
+        clear_browse_state(context.user_data)
+        _clear_worktree_flow_state(context.user_data)
+        await query.answer(
+            "General is CoCo's permanent control channel; this control is disabled.",
+            show_alert=True,
+        )
+        return
+    is_dashboard_target_callback = data.startswith(
+        (CB_COCO_INSPECT, CB_COCO_STEER, CB_COCO_INTERRUPT)
+    )
+    # Dashboard paging and return/refresh controls are read-only shared
+    # navigation. They must bypass General's canonical-owner gate just like
+    # target controls; target controls still perform their own ownership and
+    # snapshot checks below.
+    is_dashboard_navigation_callback = data in {
+        CB_COCO_REFRESH,
+        CB_COCO_DASHBOARD,
+    } or data.startswith(CB_COCO_PAGE)
+    is_dashboard_callback = (
+        is_dashboard_target_callback or is_dashboard_navigation_callback
+    )
+    if reserved_general and is_dashboard_navigation_callback:
+        # Navigation is shared and read-only, but it still requires a valid
+        # General reservation before a forged/stale callback can render data.
+        control = session_manager.get_coco_control_topic(int(cb_chat_id or 0))
+        if control is None:
+            await query.answer(_COCO_CONTROL_UNCONFIGURED_TEXT, show_alert=True)
+            return
+        if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await query.answer(
+                _COCO_CONTROL_MIGRATION_PENDING_TEXT,
+                show_alert=True,
+            )
+            return
+    if (
+        reserved_general
+        and not is_dashboard_callback
+        and not reserved_mutation
+        and not data.startswith(("md:", "am:"))
+        and data != CB_COCO_DOCTOR
+    ):
+        control = session_manager.get_coco_control_topic(int(cb_chat_id or 0))
+        if control is None:
+            await query.answer(_COCO_CONTROL_UNCONFIGURED_TEXT, show_alert=True)
+            return
+        if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+            await query.answer(
+                _COCO_CONTROL_MIGRATION_PENDING_TEXT,
+                show_alert=True,
+            )
+            return
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=control.user_id,
+            chat_id=cb_chat_id,
+        ):
+            await query.answer(
+                _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                show_alert=True,
+            )
+            return
+        callback_topic_user_id = control.user_id
+    if cb_chat_id is not None and not is_dashboard_callback:
+        session_manager.set_group_chat_id(
+            callback_topic_user_id,
+            cb_thread_id,
+            cb_chat_id,
+        )
+
+    # Model/apps callbacks below consistently consume ``user.id`` for topic
+    # storage. Once the original caller has passed the General authorization
+    # gate, expose the canonical control owner to those mutation paths without
+    # changing the caller identity used for authorization above.
+    if callback_topic_user_id != user.id:
+        user = SimpleNamespace(id=callback_topic_user_id)
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
@@ -10450,7 +12701,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    elif data in {CB_COCO_SET, CB_COCO_CANCEL, CB_COCO_REFRESH}:
+    elif data in {
+        CB_COCO_SET,
+        CB_COCO_CANCEL,
+        CB_COCO_REFRESH,
+        CB_COCO_DASHBOARD,
+        CB_COCO_DOCTOR,
+    } or data.startswith(
+        (CB_COCO_INSPECT, CB_COCO_STEER, CB_COCO_INTERRUPT, CB_COCO_PAGE)
+    ):
         if cb_thread_id is None:
             await query.answer("Open CoCo from General.", show_alert=True)
             return
@@ -10462,77 +12721,573 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             await query.answer("CoCo is fixed to General.", show_alert=True)
             return
-        if data == CB_COCO_CANCEL:
-            await safe_edit(query, "CoCo control-topic assignment canceled.", reply_markup=None)
-            await query.answer("Canceled")
-            return
-
-        _ensure_default_coco_general_control(
-            user_id=user.id,
-            thread_id=cb_thread_id,
-            chat_id=cb_chat_id,
-        )
-
-        binding, suggested_workspace = _ensure_coco_control_workspace_binding(
-            user_id=user.id,
-            thread_id=cb_thread_id,
-            chat_id=cb_chat_id,
-        )
-        current_control = session_manager.get_coco_control_topic()
-        current_binding = None
-        if current_control is not None:
-            current_binding = session_manager.resolve_topic_binding(
-                current_control.user_id,
-                current_control.thread_id,
-                chat_id=current_control.chat_id or None,
-            )
-
-        if data == CB_COCO_SET:
-            binding = session_manager.set_coco_control_topic(
-                user.id,
-                cb_thread_id,
+        if not is_dashboard_callback:
+            _ensure_default_coco_general_control(
+                user_id=user.id,
+                thread_id=cb_thread_id,
                 chat_id=cb_chat_id,
             )
-            current_control = session_manager.get_coco_control_topic()
-            current_binding = binding
-            await safe_edit(
-                query,
-                _build_coco_control_text(
-                    current_user_id=user.id,
-                    current_thread_id=cb_thread_id,
-                    current_chat_id=cb_chat_id,
-                    binding=binding,
-                    current_control=current_control,
-                    current_control_binding=current_binding,
-                    suggested_workspace=suggested_workspace,
-                    is_current=True,
-                ),
-                reply_markup=_build_coco_control_keyboard(is_current=True),
-            )
-            await query.answer("CoCo control topic set")
-            return
 
-        is_current = session_manager.is_coco_control_topic(
-            user.id,
-            cb_thread_id,
-            chat_id=cb_chat_id,
-        )
-        await safe_edit(
-            query,
-            _build_coco_control_text(
-                current_user_id=user.id,
-                current_thread_id=cb_thread_id,
-                current_chat_id=cb_chat_id,
-                binding=binding,
-                current_control=current_control,
-                current_control_binding=current_binding,
-                suggested_workspace=suggested_workspace,
-                is_current=is_current,
-            ),
-            reply_markup=_build_coco_control_keyboard(is_current=is_current),
-        )
-        await query.answer("Refreshed")
-        return
+        if data == CB_COCO_DOCTOR:
+            await query.answer("Doctor running…")
+
+            async def _finish_coco_doctor() -> None:
+                try:
+                    doctor_text = await _build_coco_doctor_text(
+                        int(cb_chat_id or 0)
+                    )
+                    await safe_edit(
+                        query,
+                        doctor_text,
+                        reply_markup=InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "Dashboard", callback_data=CB_COCO_DASHBOARD
+                                    )
+                                ]
+                            ]
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "CoCo doctor callback failed (chat=%s user=%s)",
+                        cb_chat_id,
+                        callback_caller_user_id,
+                    )
+
+            _schedule_coco_doctor_task(
+                _finish_coco_doctor(),
+                context=context,
+                update=update,
+            )
+            return
+        if data in {CB_COCO_REFRESH, CB_COCO_DASHBOARD} or data.startswith(
+            CB_COCO_PAGE
+        ):
+            page = 0
+            if data.startswith(CB_COCO_PAGE):
+                try:
+                    page = max(0, int(data[len(CB_COCO_PAGE) :]))
+                except (TypeError, ValueError):
+                    await query.answer("This dashboard page is stale.", show_alert=True)
+                    return
+            text, keyboard = _build_coco_dashboard(
+                chat_id=int(cb_chat_id or 0),
+                page=page,
+            )
+            await safe_edit(query, text, reply_markup=keyboard)
+            await query.answer("Refreshed")
+            return
+        if data.startswith((CB_COCO_INSPECT, CB_COCO_STEER, CB_COCO_INTERRUPT)):
+            prefix = next(
+                candidate
+                for candidate in (CB_COCO_INSPECT, CB_COCO_STEER, CB_COCO_INTERRUPT)
+                if data.startswith(candidate)
+            )
+            try:
+                raw_target_parts = data[len(prefix) :].split(":", 2)
+                if len(raw_target_parts) != 3:
+                    raise ValueError("missing dashboard snapshot token")
+                owner_user_id = int(raw_target_parts[0])
+                target_thread_id = int(raw_target_parts[1])
+                snapshot_token = raw_target_parts[2].strip()
+                if not snapshot_token:
+                    raise ValueError("missing dashboard snapshot token")
+            except (TypeError, ValueError):
+                await query.answer("This dashboard control is stale.", show_alert=True)
+                return
+            snapshot = _resolve_coco_dashboard_snapshot(
+                token=snapshot_token,
+                chat_id=cb_chat_id,
+                owner_user_id=owner_user_id,
+                thread_id=target_thread_id,
+            )
+            if snapshot is None:
+                await query.answer(
+                    "This dashboard control is stale. Refresh /coco.",
+                    show_alert=True,
+                )
+                return
+            if not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=owner_user_id,
+                chat_id=cb_chat_id,
+            ):
+                await query.answer(
+                    _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                    show_alert=True,
+                )
+                return
+            binding = session_manager.resolve_topic_binding(
+                owner_user_id,
+                target_thread_id,
+                chat_id=cb_chat_id,
+            )
+            if binding is None:
+                await query.answer("This topic binding is stale.", show_alert=True)
+                return
+            current_ownership = capture_topic_ownership(
+                owner_user_id,
+                target_thread_id,
+                cb_chat_id,
+            )
+            if current_ownership is None or current_ownership != snapshot.ownership:
+                await query.answer(
+                    "This dashboard control is stale. Refresh /coco.",
+                    show_alert=True,
+                )
+                return
+            current_turn_id = (
+                session_manager.get_window_codex_active_turn_id(binding.window_id)
+                if binding.window_id
+                else ""
+            )
+            if prefix == CB_COCO_INTERRUPT and (
+                not snapshot.active_turn_id
+                or current_turn_id != snapshot.active_turn_id
+            ):
+                await query.answer(
+                    "This dashboard control is stale. Refresh /coco.",
+                    show_alert=True,
+                )
+                return
+            def _prepare_dashboard_target_routing() -> None:
+                """Record routing for the selected topic, never owner's General slot."""
+                _ensure_default_coco_general_control(
+                    user_id=user.id,
+                    thread_id=cb_thread_id,
+                    chat_id=cb_chat_id,
+                )
+                if cb_chat_id is not None:
+                    session_manager.set_group_chat_id(
+                        owner_user_id,
+                        target_thread_id,
+                        cb_chat_id,
+                    )
+
+            label = str(binding.display_name or target_thread_id)
+            if prefix == CB_COCO_STEER:
+                _prepare_dashboard_target_routing()
+                target_ownership = capture_topic_ownership(
+                    owner_user_id,
+                    target_thread_id,
+                    cb_chat_id,
+                )
+                if target_ownership is None:
+                    await query.answer(
+                        "This topic binding is stale.",
+                        show_alert=True,
+                    )
+                    return
+                if context.user_data is not None:
+                    context.user_data["_coco_dashboard_steer"] = {
+                        "owner_user_id": owner_user_id,
+                        "chat_id": int(cb_chat_id or 0),
+                        "thread_id": target_thread_id,
+                        "created_at": time.monotonic(),
+                        "ownership": {
+                            "window_id": target_ownership.window_id,
+                            "codex_thread_id": target_ownership.codex_thread_id,
+                            "machine_id": target_ownership.machine_id,
+                            "cwd": target_ownership.cwd,
+                        },
+                    }
+                await query.answer(
+                    f"Send the next General message to steer {label}.",
+                    show_alert=True,
+                )
+                return
+            if prefix == CB_COCO_INTERRUPT:
+                codex_thread_id = str(binding.codex_thread_id or "").strip()
+                turn_id = snapshot.active_turn_id
+                if not codex_thread_id or not turn_id:
+                    await query.answer("No active turn to interrupt.", show_alert=True)
+                    return
+                state_key = _codex_thread_state_key(
+                    codex_thread_id,
+                    str(binding.machine_id or "").strip(),
+                )
+                # Reserve the key before acknowledging Telegram.  This closes
+                # the only scheduling window in which two callbacks could both
+                # pass validation and then overwrite the first request's
+                # two-phase record while its RPC is pending.
+                if (
+                    state_key in _dashboard_interrupt_claims
+                    or state_key in _discard_queued_on_interrupts
+                ):
+                    await query.answer(
+                        "Interrupt already in progress.",
+                        show_alert=True,
+                    )
+                    return
+                _dashboard_interrupt_claims.add(state_key)
+                try:
+                    await query.answer(f"Interrupting {label[:120]}…")
+                except BaseException:
+                    _dashboard_interrupt_claims.discard(state_key)
+                    raise
+                # Telegram acknowledgement yields to the event loop. Recheck
+                # the rendered turn before creating any interrupt bookkeeping so
+                # a turn that advanced during the acknowledgement cannot be
+                # interrupted by this old button.
+                latest_turn_id = (
+                    session_manager.get_window_codex_active_turn_id(binding.window_id)
+                    if binding.window_id
+                    else ""
+                )
+                if latest_turn_id != turn_id:
+                    _dashboard_interrupt_claims.discard(state_key)
+                    await safe_edit(
+                        query,
+                        "This dashboard control is stale. Refresh /coco.",
+                        reply_markup=None,
+                    )
+                    return
+                try:
+                    _prepare_dashboard_target_routing()
+                    local_machine_id, _ = _local_machine_identity()
+                    queued_guidance = queued_topic_input_count(
+                        owner_user_id,
+                        target_thread_id,
+                        cb_chat_id,
+                    )
+                    interrupt_record = _DashboardInterruptRecord(
+                        turn_id=turn_id,
+                        owner_user_id=owner_user_id,
+                        chat_id=cb_chat_id,
+                        thread_id=target_thread_id,
+                        queued_input_generation_cutoff=get_queued_topic_input_generation(
+                            owner_user_id,
+                            target_thread_id,
+                            cb_chat_id,
+                        ),
+                        delivery_generation_cutoff=get_topic_delivery_generation(
+                            owner_user_id,
+                            target_thread_id,
+                            cb_chat_id,
+                        ),
+                    )
+                    # Pending is observable by terminal handling, but not yet a
+                    # deletion intent.  It becomes committed only after RPC success.
+                    _discard_queued_on_interrupts[state_key] = interrupt_record
+                finally:
+                    # The precise record now owns duplicate detection for the
+                    # remainder of this request, including uncertain outcomes.
+                    _dashboard_interrupt_claims.discard(state_key)
+
+                async def _reconcile_confirmed_terminal() -> None:
+                    """Commit the captured queue cutoffs after terminal proof."""
+                    await cancel_topic_delivery(
+                        owner_user_id,
+                        target_thread_id,
+                        chat_id=cb_chat_id,
+                        generation_cutoff=interrupt_record.delivery_generation_cutoff,
+                    )
+                    discard_queued_topic_inputs_before_generation(
+                        owner_user_id,
+                        target_thread_id,
+                        cb_chat_id,
+                        generation_cutoff=(
+                            interrupt_record.queued_input_generation_cutoff
+                        ),
+                    )
+                    remaining_guidance = queued_topic_input_count(
+                        owner_user_id,
+                        target_thread_id,
+                        cb_chat_id,
+                    )
+                    if send_bot is not None and remaining_guidance:
+                        try:
+                            await sync_queued_topic_dock(
+                                send_bot,
+                                owner_user_id,
+                                target_thread_id,
+                                window_id=binding.window_id,
+                                chat_id=cb_chat_id,
+                            )
+                        except Exception as dock_exc:
+                            logger.warning(
+                                "Failed refreshing retained dashboard queue dock: %s",
+                                dock_exc,
+                            )
+                    elif send_bot is not None:
+                        try:
+                            await clear_queued_topic_dock(
+                                send_bot,
+                                owner_user_id,
+                                target_thread_id,
+                                cb_chat_id,
+                            )
+                        except Exception as dock_exc:
+                            logger.warning(
+                                "Failed clearing confirmed dashboard queue dock: %s",
+                                dock_exc,
+                            )
+                    if remaining_guidance and send_bot is not None:
+                        try:
+                            await _dispatch_next_queued_input(
+                                bot=send_bot,
+                                user_id=owner_user_id,
+                                thread_id=target_thread_id,
+                                window_id=binding.window_id,
+                                chat_id=cb_chat_id,
+                                preserve_coalesced_wakeup=True,
+                            )
+                        except Exception as dispatch_exc:
+                            logger.warning(
+                                "Failed dispatching retained guidance after "
+                                "dashboard interrupt: %s",
+                                dispatch_exc,
+                            )
+                    _discard_queued_on_interrupts.pop(state_key, None)
+
+                try:
+                    if binding.machine_id and binding.machine_id != local_machine_id:
+                        await agent_rpc_client.turn_interrupt(
+                            binding.machine_id,
+                            thread_id=codex_thread_id,
+                            turn_id=turn_id,
+                        )
+                    else:
+                        await codex_app_server_client.turn_interrupt(
+                            thread_id=codex_thread_id,
+                            turn_id=turn_id,
+                        )
+                except Exception as exc:
+                    if _dashboard_interrupt_outcome_is_uncertain(exc):
+                        # The request frame may already have reached the
+                        # remote app-server.  Keep both the queue cutoffs and
+                        # the output fence until a matching terminal event
+                        # tells us whether the interrupt actually took effect;
+                        # replaying guidance here could start a duplicate
+                        # turn on a still-running remote transport.
+                        interrupt_record.uncertain = True
+                        _interrupted_codex_threads.add(state_key)
+                        _interrupted_codex_turns[state_key] = turn_id
+                        terminal_status = interrupt_record.terminal_status
+                        emit_telemetry(
+                            "dashboard.interrupt.outcome_uncertain",
+                            machine_id=str(binding.machine_id or local_machine_id),
+                            thread_id=codex_thread_id,
+                            turn_id=turn_id,
+                            terminal_seen=interrupt_record.terminal_seen,
+                            error=str(exc),
+                        )
+                        terminal_confirmed = False
+                        terminal_not_interrupted = False
+                        if interrupt_record.terminal_seen and terminal_status in {
+                            "interrupted",
+                            "cancelled",
+                            "canceled",
+                        }:
+                            interrupt_record.committed = True
+                            terminal_confirmed = True
+                            await _reconcile_confirmed_terminal()
+                        elif interrupt_record.terminal_seen:
+                            # The matching terminal completed without an
+                            # interruption.  Release the fence and let the
+                            # preserved queue proceed now that the turn is
+                            # definitely over.
+                            interrupt_record.terminal_resolved_without_interrupt = True
+                            terminal_not_interrupted = True
+                            _interrupted_codex_threads.discard(state_key)
+                            _interrupted_codex_turns.pop(state_key, None)
+                            _discard_queued_on_interrupts.pop(state_key, None)
+                            if send_bot is not None:
+                                try:
+                                    await _dispatch_next_queued_input(
+                                        bot=send_bot,
+                                        user_id=owner_user_id,
+                                        thread_id=target_thread_id,
+                                        window_id=binding.window_id,
+                                        chat_id=cb_chat_id,
+                                        preserve_coalesced_wakeup=True,
+                                    )
+                                except Exception as dispatch_exc:
+                                    logger.warning(
+                                        "Failed dispatching preserved guidance "
+                                        "after uncertain dashboard interrupt: %s",
+                                        dispatch_exc,
+                                    )
+                        if terminal_confirmed:
+                            status_text = (
+                                f"Interrupt confirmed for "
+                                f"{_escape_coco_dashboard_text(label)}"
+                            )
+                            preserved = (
+                                f"; {queued_guidance} queued guidance item(s) "
+                                "remain preserved"
+                                if queued_guidance
+                                else ""
+                            )
+                        elif terminal_not_interrupted:
+                            status_text = (
+                                f"Interrupt did not stop "
+                                f"{_escape_coco_dashboard_text(label)}"
+                            )
+                            preserved = (
+                                f"; {queued_guidance} queued guidance item(s) "
+                                "were preserved"
+                                if queued_guidance
+                                else ""
+                            )
+                        else:
+                            status_text = f"Interrupt outcome uncertain: {exc}"
+                            preserved = (
+                                f"; {queued_guidance} queued guidance item(s) remain "
+                                "preserved until completion confirms the outcome"
+                                if queued_guidance
+                                else "; awaiting completion confirmation"
+                            )
+                        await safe_edit(
+                            query,
+                            f"{status_text}{preserved}.",
+                            reply_markup=InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            "Dashboard",
+                                            callback_data=CB_COCO_DASHBOARD,
+                                        )
+                                    ]
+                                ]
+                            ),
+                        )
+                        return
+                    terminal_seen = interrupt_record.terminal_seen
+                    _interrupted_codex_threads.discard(state_key)
+                    _interrupted_codex_turns.pop(state_key, None)
+                    _discard_queued_on_interrupts.pop(state_key, None)
+                    _uncertain_interrupted_items.pop(state_key, None)
+                    if send_bot is not None and queued_guidance:
+                        try:
+                            await sync_queued_topic_dock(
+                                send_bot,
+                                owner_user_id,
+                                target_thread_id,
+                                window_id=binding.window_id,
+                                chat_id=cb_chat_id,
+                            )
+                        except Exception as dock_exc:
+                            logger.warning(
+                                "Failed restoring dashboard queue dock: %s",
+                                dock_exc,
+                            )
+                    preserved = (
+                        f"; {queued_guidance} queued guidance item(s) were preserved"
+                        if queued_guidance
+                        else ""
+                    )
+                    await safe_edit(
+                        query,
+                        f"Interrupt failed: {exc}{preserved}.",
+                        reply_markup=InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "Dashboard",
+                                        callback_data=CB_COCO_DASHBOARD,
+                                    )
+                                ]
+                            ]
+                        ),
+                    )
+                    if terminal_seen and send_bot is not None:
+                        try:
+                            await _dispatch_next_queued_input(
+                                bot=send_bot,
+                                user_id=owner_user_id,
+                                thread_id=target_thread_id,
+                                window_id=binding.window_id,
+                                chat_id=cb_chat_id,
+                                preserve_coalesced_wakeup=True,
+                            )
+                        except Exception as dispatch_exc:
+                            logger.warning(
+                                "Failed dispatching preserved guidance after "
+                                "dashboard interrupt failure: %s",
+                                dispatch_exc,
+                            )
+                    return
+                # The transport accepted the interrupt.  Only now fence late
+                # app-server output; while the RPC was pending a natural
+                # completion must continue through the normal delivery path so
+                # a later RPC failure cannot lose its final response.
+                _interrupted_codex_threads.add(state_key)
+                _interrupted_codex_turns[state_key] = turn_id
+                interrupt_record.committed = True
+                # Keep queued assistant/status delivery transactional with the
+                # interrupt: a failed transport must leave pending output
+                # available for delivery.  Once the interrupt succeeds, discard
+                # only work captured at click time; later additions and in-flight
+                # sends cannot be recalled by this precise queue cutoff.
+                if interrupt_record.terminal_seen:
+                    await _reconcile_confirmed_terminal()
+                else:
+                    await cancel_topic_delivery(
+                        owner_user_id,
+                        target_thread_id,
+                        chat_id=cb_chat_id,
+                        generation_cutoff=interrupt_record.delivery_generation_cutoff,
+                    )
+                suffix = (
+                    f"; {queued_guidance} queued guidance item(s) will be discarded "
+                    "when completion is confirmed"
+                    if queued_guidance
+                    else "; awaiting completion confirmation"
+                )
+                await safe_edit(
+                    query,
+                    f"Interrupt requested for "
+                    f"{_escape_coco_dashboard_text(label)}{suffix}.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "Dashboard",
+                                    callback_data=CB_COCO_DASHBOARD,
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                return
+            _prepare_dashboard_target_routing()
+            detail = (
+                f"{label}\nthread: {target_thread_id}\n"
+                f"machine: {binding.machine_display_name or binding.machine_id or 'local'}\n"
+                f"window: {binding.window_id or '(none)'}\n"
+                f"codex: {binding.codex_thread_id or '(pending)'}\n"
+                f"cwd: {binding.cwd or '(none)'}"
+            )
+            if len(detail) > 200:
+                def _compact_identifier(value: object, fallback: str) -> str:
+                    normalized = str(value or "").strip() or fallback
+                    if len(normalized) <= 32:
+                        return normalized
+                    return f"{normalized[:31]}…"
+
+                compact_window = _compact_identifier(binding.window_id, "(none)")
+                compact_codex = _compact_identifier(
+                    binding.codex_thread_id,
+                    "(pending)",
+                )
+                compact_machine = _compact_identifier(binding.machine_id, "local")
+                compact_cwd = _compact_identifier(binding.cwd, "(none)")
+                detail = (
+                    f"thread: {target_thread_id}\n"
+                    f"window: {compact_window}\n"
+                    f"codex: {compact_codex}\n"
+                    f"machine: {compact_machine}\n"
+                    f"cwd: {compact_cwd}"
+                )
+            # Keep Telegram's callback-answer limit as a final invariant. The
+            # compact form contains only plain identifiers, so this guard
+            # cannot split rendered Markdown from the detailed path above.
+            detail = detail[:200]
+            await query.answer(detail, show_alert=True)
+            return
 
     # Directory browser handlers
     elif data.startswith(CB_DIR_MACHINE_SELECT):
@@ -10849,8 +13604,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.pop(BROWSE_MACHINE_NAME_KEY, None)
         _clear_directory_session_picker_state(context.user_data)
         if machine_id != local_machine_id:
-            from .agent_rpc import agent_rpc_client
-
             prior_sessions = await agent_rpc_client.folder_sessions(
                 machine_id,
                 cwd=selected_path,
@@ -10967,6 +13720,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         note_run_started(
                             user_id=user.id,
                             thread_id=pending_thread_id,
+                            chat_id=cb_chat_id,
                             window_id=created_wid,
                             source="pending_text_new_window",
                             pending_text=pending_text,
@@ -11184,6 +13938,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 note_run_started(
                     user_id=user.id,
                     thread_id=pending_thread_id,
+                    chat_id=cb_chat_id,
                     window_id=created_wid,
                     source="pending_text_new_window",
                     pending_text=pending_text,
@@ -11215,9 +13970,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
+        session_manager.ensure_topic_binding(
+            callback_topic_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         catalog = _resolve_topic_model_catalog(
-            user_id=user.id,
+            user_id=callback_topic_user_id,
             thread_id=cb_thread_id,
             chat_id=cb_chat_id,
         )
@@ -11233,10 +13992,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
+        session_manager.ensure_topic_binding(
+            callback_topic_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         selected_slug = data[len(CB_MODEL_SET) :]
         catalog = _resolve_topic_model_catalog(
-            user_id=user.id,
+            user_id=callback_topic_user_id,
             thread_id=cb_thread_id,
             chat_id=cb_chat_id,
         )
@@ -11253,14 +14016,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             default_effort = str(selected.get("default_effort", ""))
             adjusted_effort = default_effort if default_effort in levels else levels[0]
         session_manager.set_topic_model_selection(
-            user.id,
+            callback_topic_user_id,
             cb_thread_id,
             chat_id=cb_chat_id,
             model_slug=selected_slug,
             reasoning_effort=adjusted_effort or current_effort,
         )
         updated_catalog = _resolve_topic_model_catalog(
-            user_id=user.id,
+            user_id=callback_topic_user_id,
             thread_id=cb_thread_id,
             chat_id=cb_chat_id,
         )
@@ -11279,10 +14042,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        session_manager.ensure_topic_binding(user.id, cb_thread_id, chat_id=cb_chat_id)
+        session_manager.ensure_topic_binding(
+            callback_topic_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         selected_effort = data[len(CB_MODEL_EFFORT_SET) :]
         catalog = _resolve_topic_model_catalog(
-            user_id=user.id,
+            user_id=callback_topic_user_id,
             thread_id=cb_thread_id,
             chat_id=cb_chat_id,
         )
@@ -11302,14 +14069,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         session_manager.set_topic_model_selection(
-            user.id,
+            callback_topic_user_id,
             cb_thread_id,
             chat_id=cb_chat_id,
             model_slug=current_slug,
             reasoning_effort=selected_effort,
         )
         updated_catalog = _resolve_topic_model_catalog(
-            user_id=user.id,
+            user_id=callback_topic_user_id,
             thread_id=cb_thread_id,
             chat_id=cb_chat_id,
         )
@@ -11322,7 +14089,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Update panel: refresh status
     elif data == CB_UPDATE_REFRESH:
-        can_trigger_upgrade = _is_admin_user(user.id)
+        can_trigger_upgrade = _is_admin_user(callback_caller_user_id)
         text, keyboard = await _build_update_panel_payload(
             can_trigger_upgrade=can_trigger_upgrade,
         )
@@ -11336,7 +14103,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         CB_UPDATE_RUN_COCO,
         CB_UPDATE_RUN_BOTH,
     }:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can run updates.", show_alert=True)
             return
         message_chat_id = getattr(query.message, "chat_id", None)
@@ -11370,7 +14137,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Update failed", show_alert=True)
 
     elif data.startswith(CB_UPDATE_RUN_NODE) or data == CB_UPDATE_ROLL_AGENTS:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can run updates.", show_alert=True)
             return
         message_chat_id = getattr(query.message, "chat_id", None)
@@ -11414,7 +14181,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # App-server approval: admin selects accept/decline decision.
     elif data.startswith(CB_APP_APPROVAL_DECIDE):
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can approve actions.", show_alert=True)
             return
         parsed = _parse_app_server_approval_callback(data)
@@ -11446,7 +14213,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Session approvals: open/refresh window override panel
     elif data in {CB_APPROVAL_REFRESH, CB_APPROVAL_OPEN_WINDOW}:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can change approvals.", show_alert=True)
             return
         if config.session_provider != "codex":
@@ -11458,14 +14225,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        wid = session_manager.resolve_window_for_thread(user.id, cb_thread_id, chat_id=cb_chat_id)
+        approval_user_id = (
+            _coco_control_owner_user_id(user.id, cb_chat_id)
+            if cb_thread_id == GENERAL_TOPIC_THREAD_ID
+            else user.id
+        )
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=approval_user_id,
+            chat_id=cb_chat_id,
+        ):
+            await query.answer(
+                _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                show_alert=True,
+            )
+            return
+        wid = session_manager.resolve_window_for_thread(
+            approval_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         if not wid:
             await query.answer("No session bound to this topic.", show_alert=True)
             return
-        can_use_dangerous = _is_admin_user(user.id)
+        can_use_dangerous = _is_admin_user(callback_caller_user_id)
         workspace_dir = _resolve_workspace_dir_for_window(
-            user_id=user.id,
+            user_id=approval_user_id,
             thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
             window_id=wid,
         )
         workspace_probe = await _probe_workspace_write_access_for_window(
@@ -11475,7 +14262,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(
             query,
             _build_approvals_text(
-                user.id,
+                approval_user_id,
                 wid,
                 workspace_dir=workspace_dir,
                 workspace_probe=workspace_probe,
@@ -11491,7 +14278,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Session approvals: open/refresh app default panel
     elif data in {CB_APPROVAL_REFRESH_DEFAULT, CB_APPROVAL_OPEN_DEFAULTS}:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can change approvals.", show_alert=True)
             return
         if config.session_provider != "codex":
@@ -11503,14 +14290,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        wid = session_manager.resolve_window_for_thread(user.id, cb_thread_id, chat_id=cb_chat_id)
+        approval_user_id = (
+            _coco_control_owner_user_id(user.id, cb_chat_id)
+            if cb_thread_id == GENERAL_TOPIC_THREAD_ID
+            else user.id
+        )
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=approval_user_id,
+            chat_id=cb_chat_id,
+        ):
+            await query.answer(
+                _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                show_alert=True,
+            )
+            return
+        wid = session_manager.resolve_window_for_thread(
+            approval_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         if not wid:
             await query.answer("No session bound to this topic.", show_alert=True)
             return
-        can_use_dangerous = _is_admin_user(user.id)
+        can_use_dangerous = _is_admin_user(callback_caller_user_id)
         workspace_dir = _resolve_workspace_dir_for_window(
-            user_id=user.id,
+            user_id=approval_user_id,
             thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
             window_id=wid,
         )
         workspace_probe = await _probe_workspace_write_access_for_window(
@@ -11520,7 +14327,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(
             query,
             _build_approvals_text(
-                user.id,
+                approval_user_id,
                 wid,
                 workspace_dir=workspace_dir,
                 workspace_probe=workspace_probe,
@@ -11538,7 +14345,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Session approvals: set mode and restart assistant in current window
     elif data.startswith(CB_APPROVAL_SET):
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can change approvals.", show_alert=True)
             return
         if config.session_provider != "codex":
@@ -11552,7 +14359,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if normalized_mode is None:
             await query.answer("Unknown approval mode.", show_alert=True)
             return
-        can_use_dangerous = _is_admin_user(user.id)
+        can_use_dangerous = _is_admin_user(callback_caller_user_id)
         if normalized_mode == APPROVAL_MODE_DANGEROUS and not can_use_dangerous:
             await query.answer(
                 "Only admins can set Dangerous mode.",
@@ -11562,7 +14369,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        wid = session_manager.resolve_window_for_thread(user.id, cb_thread_id, chat_id=cb_chat_id)
+        approval_user_id = (
+            _coco_control_owner_user_id(user.id, cb_chat_id)
+            if cb_thread_id == GENERAL_TOPIC_THREAD_ID
+            else user.id
+        )
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=approval_user_id,
+            chat_id=cb_chat_id,
+        ):
+            await query.answer(
+                _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                show_alert=True,
+            )
+            return
+        wid = session_manager.resolve_window_for_thread(
+            approval_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         if not wid:
             await query.answer("No session bound to this topic.", show_alert=True)
             return
@@ -11573,8 +14399,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         workspace_dir = _resolve_workspace_dir_for_window(
-            user_id=user.id,
+            user_id=approval_user_id,
             thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
             window_id=wid,
         )
         workspace_probe = await _probe_workspace_write_access_for_window(
@@ -11584,7 +14411,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(
             query,
             _build_approvals_text(
-                user.id,
+                approval_user_id,
                 wid,
                 workspace_dir=workspace_dir,
                 workspace_probe=workspace_probe,
@@ -11600,7 +14427,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Session approvals: set app-wide default
     elif data.startswith(CB_APPROVAL_SET_DEFAULT):
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can change approvals.", show_alert=True)
             return
         if config.session_provider != "codex":
@@ -11614,7 +14441,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if normalized_mode is None:
             await query.answer("Unknown approval mode.", show_alert=True)
             return
-        can_use_dangerous = _is_admin_user(user.id)
+        can_use_dangerous = _is_admin_user(callback_caller_user_id)
         if normalized_mode == APPROVAL_MODE_DANGEROUS and not can_use_dangerous:
             await query.answer(
                 "Only admins can set Dangerous mode.",
@@ -11624,15 +14451,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        wid = session_manager.resolve_window_for_thread(user.id, cb_thread_id, chat_id=cb_chat_id)
+        approval_user_id = (
+            _coco_control_owner_user_id(user.id, cb_chat_id)
+            if cb_thread_id == GENERAL_TOPIC_THREAD_ID
+            else user.id
+        )
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=approval_user_id,
+            chat_id=cb_chat_id,
+        ):
+            await query.answer(
+                _COCO_CONTROL_PERMISSION_DENIED_TEXT,
+                show_alert=True,
+            )
+            return
+        wid = session_manager.resolve_window_for_thread(
+            approval_user_id,
+            cb_thread_id,
+            chat_id=cb_chat_id,
+        )
         if not wid:
             await query.answer("No session bound to this topic.", show_alert=True)
             return
 
         _set_app_default_approval_mode(normalized_mode)
         workspace_dir = _resolve_workspace_dir_for_window(
-            user_id=user.id,
+            user_id=approval_user_id,
             thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
             window_id=wid,
         )
         workspace_probe = await _probe_workspace_write_access_for_window(
@@ -11642,7 +14489,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(
             query,
             _build_approvals_text(
-                user.id,
+                approval_user_id,
                 wid,
                 workspace_dir=workspace_dir,
                 workspace_probe=workspace_probe,
@@ -11737,8 +14584,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         try:
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
-
                 result = await agent_rpc_client.fork_thread(
                     machine_id,
                     window_id=wid,
@@ -11805,8 +14650,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         try:
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
-
                 result = await agent_rpc_client.rollback_thread(
                     machine_id,
                     window_id=wid,
@@ -11876,8 +14719,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         try:
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
-
                 result = await agent_rpc_client.resume_latest(
                     machine_id,
                     window_id=wid,
@@ -11996,8 +14837,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         try:
             if machine_id and machine_id != local_machine_id:
-                from .agent_rpc import agent_rpc_client
-
                 result = await agent_rpc_client.resume_thread(
                     machine_id,
                     window_id=wid,
@@ -12172,7 +15011,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Unknown app.", show_alert=True)
             return
         if canonical == "autoresearch":
-            state = get_autoresearch_state(user_id=user.id, thread_id=cb_thread_id)
+            state = get_autoresearch_state(
+                user_id=user.id,
+                chat_id=cb_chat_id,
+                thread_id=cb_thread_id,
+            )
             outcome = str(getattr(state, "outcome", "") or "").strip()
             if not outcome:
                 await query.answer("Set an outcome first.", show_alert=True)
@@ -12189,7 +15032,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             digest_text = run_autoresearch_now(
                 user_id=user.id,
-                chat_id=resolved_chat_id,
+                chat_id=cb_chat_id,
                 thread_id=cb_thread_id,
             )
             ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
@@ -12243,7 +15086,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        state = get_autoresearch_state(user_id=user.id, thread_id=cb_thread_id)
+        state = get_autoresearch_state(
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         outcome = str(getattr(state, "outcome", "") or "").strip()
         if not outcome:
             await query.answer("Set an outcome first.", show_alert=True)
@@ -12260,7 +15107,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         digest_text = run_autoresearch_now(
             user_id=user.id,
-            chat_id=resolved_chat_id,
+            chat_id=cb_chat_id,
             thread_id=cb_thread_id,
         )
         ok, text, keyboard, _wid = await _build_autoresearch_panel_payload_for_topic(
@@ -12289,7 +15136,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        state = get_autoresearch_state(user_id=user.id, thread_id=cb_thread_id)
+        state = get_autoresearch_state(
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         outcome = str(getattr(state, "outcome", "") or "").strip()
         if not outcome:
             await query.answer("Set an outcome first.", show_alert=True)
@@ -12388,7 +15239,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("State unavailable.", show_alert=True)
             return
         context.user_data[STATE_KEY] = STATE_APPS_AUTORESEARCH_OUTCOME
-        context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+        _store_apps_pending_scope(
+            context.user_data,
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         await query.answer(
             "Send the outcome you want this research to optimize for.",
             show_alert=True,
@@ -12430,7 +15286,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("State unavailable.", show_alert=True)
             return
         context.user_data[STATE_KEY] = STATE_APPS_LOOPER_PLAN_PATH
-        context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+        _store_apps_pending_scope(
+            context.user_data,
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         context.user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
         await query.answer("Send a `.md` plan path in this topic.", show_alert=True)
 
@@ -12502,7 +15363,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         raw_value = data[len(CB_APPS_LOOPER_INTERVAL) :].strip().lower()
         if raw_value == "custom":
             context.user_data[STATE_KEY] = STATE_APPS_LOOPER_INTERVAL
-            context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+            _store_apps_pending_scope(
+                context.user_data,
+                user_id=user.id,
+                chat_id=cb_chat_id,
+                thread_id=cb_thread_id,
+            )
             context.user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
             await safe_edit(query, panel_text, reply_markup=panel_keyboard)
             await query.answer("Send interval like `10m` or `1h`.", show_alert=True)
@@ -12565,7 +15431,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         raw_value = data[len(CB_APPS_LOOPER_LIMIT) :].strip().lower()
         if raw_value == "custom":
             context.user_data[STATE_KEY] = STATE_APPS_LOOPER_LIMIT
-            context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+            _store_apps_pending_scope(
+                context.user_data,
+                user_id=user.id,
+                chat_id=cb_chat_id,
+                thread_id=cb_thread_id,
+            )
             context.user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
             await safe_edit(query, panel_text, reply_markup=panel_keyboard)
             await query.answer("Send limit like `1h`, `2h`, or `none`.", show_alert=True)
@@ -12611,7 +15482,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("State unavailable.", show_alert=True)
             return
         context.user_data[STATE_KEY] = STATE_APPS_LOOPER_KEYWORD
-        context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+        _store_apps_pending_scope(
+            context.user_data,
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         context.user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
         await query.answer("Send a single-word completion keyword.", show_alert=True)
 
@@ -12634,7 +15510,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("State unavailable.", show_alert=True)
             return
         context.user_data[STATE_KEY] = STATE_APPS_LOOPER_INSTRUCTIONS
-        context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+        _store_apps_pending_scope(
+            context.user_data,
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         context.user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
         await query.answer("Send optional custom instructions, or `-` to clear.", show_alert=True)
 
@@ -12650,6 +15531,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         workspace_dir = _resolve_workspace_dir_for_window(
             user_id=user.id,
             thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
             window_id=wid,
         )
         if not workspace_dir:
@@ -12717,6 +15599,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             state = start_looper(
                 user_id=user.id,
+                chat_id=cb_chat_id,
                 thread_id=cb_thread_id,
                 window_id=wid,
                 plan_path=plan_path,
@@ -12765,7 +15648,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ),
         }
         context.user_data[STATE_KEY] = ""
-        context.user_data[APPS_PENDING_THREAD_KEY] = cb_thread_id
+        _store_apps_pending_scope(
+            context.user_data,
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+        )
         context.user_data[APPS_PENDING_WINDOW_ID_KEY] = wid
         ok, text, keyboard, _wid = await _build_looper_panel_payload_for_topic(
             user_id=user.id,
@@ -12783,7 +15671,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        stopped = stop_looper(user_id=user.id, thread_id=cb_thread_id, reason="manual_stop")
+        stopped = stop_looper(
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+            reason="manual_stop",
+        )
         if context.user_data is not None:
             context.user_data[STATE_KEY] = ""
         ok, text, keyboard, _wid = await _build_looper_panel_payload_for_topic(
@@ -12799,7 +15692,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if cb_thread_id is None:
             await query.answer("Use this inside a named topic.", show_alert=True)
             return
-        stop_looper(user_id=user.id, thread_id=cb_thread_id, reason="manual_disable")
+        stop_looper(
+            user_id=user.id,
+            chat_id=cb_chat_id,
+            thread_id=cb_thread_id,
+            reason="manual_disable",
+        )
         _set_topic_app_enabled(
             user_id=user.id,
             thread_id=cb_thread_id,
@@ -12823,14 +15721,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _clear_allowed_flow_state(context.user_data)
         await safe_edit(
             query,
-            _build_allowed_overview_text(user.id),
-            reply_markup=_build_allowed_overview_keyboard(user.id),
+            _build_allowed_overview_text(callback_caller_user_id),
+            reply_markup=_build_allowed_overview_keyboard(callback_caller_user_id),
         )
         await query.answer("Refreshed")
 
     # Allowed users menu: open member picker for batch add.
     elif data == CB_ALLOWED_ADD:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         if cb_chat_id is None:
@@ -12873,7 +15771,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Allowed users menu: picker page switch.
     elif data.startswith(CB_ALLOWED_PICK_PAGE):
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         if not context.user_data:
@@ -12913,7 +15811,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Allowed users menu: picker toggle one member.
     elif data.startswith(CB_ALLOWED_PICK_TOGGLE):
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         if not context.user_data:
@@ -12959,7 +15857,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Allowed users menu: picker clear selection.
     elif data == CB_ALLOWED_PICK_CLEAR:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         if not context.user_data:
@@ -12992,7 +15890,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Allowed users menu: picker next -> role selection.
     elif data == CB_ALLOWED_PICK_NEXT:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         if not context.user_data:
@@ -13014,7 +15912,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Allowed users menu: finalize batch add with chosen role.
     elif data in {CB_ALLOWED_ADD_SINGLE, CB_ALLOWED_ADD_CREATE}:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         if not context.user_data:
@@ -13058,7 +15956,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             for uid in sorted(selected_ids)
         ]
         ok, err, request = _queue_allowed_add_batch_request(
-            requested_by=user.id,
+            requested_by=callback_caller_user_id,
             targets=targets,
         )
         if not ok or request is None:
@@ -13072,8 +15970,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _clear_allowed_flow_state(context.user_data)
         await safe_edit(
             query,
-            _build_allowed_overview_text(user.id),
-            reply_markup=_build_allowed_overview_keyboard(user.id),
+            _build_allowed_overview_text(callback_caller_user_id),
+            reply_markup=_build_allowed_overview_keyboard(callback_caller_user_id),
         )
         await query.answer(
             f"Batch request queued for {len(targets)} user(s). Token sent to {delivered}/{total} admins.",
@@ -13082,20 +15980,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Allowed users menu: remove picker.
     elif data == CB_ALLOWED_REMOVE_MENU:
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         _clear_allowed_flow_state(context.user_data)
         await safe_edit(
             query,
-            _build_allowed_remove_text(user.id),
-            reply_markup=_build_allowed_remove_keyboard(user.id),
+            _build_allowed_remove_text(callback_caller_user_id),
+            reply_markup=_build_allowed_remove_keyboard(callback_caller_user_id),
         )
         await query.answer()
 
     # Allowed users menu: remove request for specific user.
     elif data.startswith(CB_ALLOWED_REMOVE):
-        if not _is_admin_user(user.id):
+        if not _is_admin_user(callback_caller_user_id):
             await query.answer("Only admins can request allowlist changes.", show_alert=True)
             return
         raw_user_id = data[len(CB_ALLOWED_REMOVE) :]
@@ -13106,7 +16004,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         ok, err, request = _queue_allowed_remove_request(
-            requested_by=user.id,
+            requested_by=callback_caller_user_id,
             target_user_id=target_user_id,
         )
         if not ok or request is None:
@@ -13119,8 +16017,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         await safe_edit(
             query,
-            _build_allowed_remove_text(user.id),
-            reply_markup=_build_allowed_remove_keyboard(user.id),
+            _build_allowed_remove_text(callback_caller_user_id),
+            reply_markup=_build_allowed_remove_keyboard(callback_caller_user_id),
         )
         await query.answer(
             f"Approval token sent to {delivered}/{total} admins.",
@@ -13695,9 +16593,9 @@ async def _retry_failed_turn_after_transient_app_server_error(
     status: str,
     error_message: str,
     source_machine_id: str = "",
-) -> set[tuple[int, int | None]]:
+) -> set[tuple[int, int | None, int | None]]:
     """Retry one failed turn from watchdog state after a transient app-server error."""
-    suppressed_topics: set[tuple[int, int | None]] = set()
+    suppressed_topics: set[tuple[int, int | None, int | None]] = set()
     retry_attempted = False
 
     for (
@@ -13712,6 +16610,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
         candidate = get_immediate_auto_retry_candidate(
             user_id=user_id,
             thread_id=bound_thread_id,
+            chat_id=bound_chat_id,
             window_id=wid,
         )
         if candidate is None:
@@ -13779,6 +16678,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
         retry_count, retry_limit = note_auto_retry_attempt(
             user_id=user_id,
             thread_id=bound_thread_id,
+            chat_id=bound_chat_id,
             window_id=wid,
         )
         await enqueue_progress_clear(
@@ -13798,6 +16698,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
         note_auto_retry_result(
             user_id=user_id,
             thread_id=bound_thread_id,
+            chat_id=bound_chat_id,
             window_id=wid,
             send_success=send_ok,
         )
@@ -13848,7 +16749,7 @@ async def _retry_failed_turn_after_transient_app_server_error(
                 message_thread_id=bound_thread_id,
             )
         retry_attempted = True
-        suppressed_topics.add((user_id, bound_thread_id))
+        suppressed_topics.add((user_id, bound_chat_id, bound_thread_id))
 
     return suppressed_topics
 
@@ -14897,6 +17798,7 @@ async def _handle_codex_app_server_notification(
             normalized_source_machine_id,
         )
         status = turn.get("status") if isinstance(turn, dict) else ""
+        terminal_turn_id = turn.get("id") if isinstance(turn, dict) else ""
         if isinstance(status, str) and status == "inProgress":
             turn_id = turn.get("id") if isinstance(turn, dict) else ""
             if isinstance(turn_id, str):
@@ -14918,17 +17820,94 @@ async def _handle_codex_app_server_notification(
             await asyncio.sleep(_IMAGE_GENERATION_COMPLETION_GRACE_SECONDS)
             had_final_text = _turn_has_final_text.get(state_key, False)
         _turn_has_final_text.pop(state_key, None)
-        # Keep the fence through terminal handling so late child output stays
-        # muted; the next FIFO `turn/started` notification clears it.
+        # Keep a confirmed interrupt fence through terminal handling so late
+        # child output stays muted; the next FIFO ``turn/started`` notification
+        # clears it.  An uncertain request is reconciled here: an interrupted
+        # terminal confirms the fence, while any other terminal proves the
+        # request did not stop this turn and releases it for normal dispatch.
         was_interrupted = state_key in _interrupted_codex_threads
+        interrupt_record = _discard_queued_on_interrupts.get(state_key)
+        terminal_matches_interrupt = False
+        buffered_uncertain_items: list[tuple[str, dict[str, object]]] = []
+        # An unrelated terminal must not confirm or consume a pending
+        # interrupt.  Keep queue cleanup disabled unless the terminal matches
+        # the captured turn (or a legacy marker explicitly matches below).
+        discard_queued_on_completion = False
+        if isinstance(interrupt_record, _DashboardInterruptRecord):
+            terminal_matches_interrupt = bool(
+                isinstance(terminal_turn_id, str)
+                and interrupt_record.turn_id in {"", terminal_turn_id}
+            )
+            if terminal_matches_interrupt:
+                interrupt_record.terminal_seen = True
+                interrupt_record.terminal_status = (
+                    status if isinstance(status, str) else ""
+                )
+                if interrupt_record.uncertain:
+                    buffered_uncertain_items = _uncertain_interrupted_items.pop(
+                        state_key,
+                        [],
+                    )
+                    if isinstance(status, str) and status in {
+                        "interrupted",
+                        "cancelled",
+                        "canceled",
+                    }:
+                        interrupt_record.committed = True
+                    else:
+                        interrupt_record.terminal_resolved_without_interrupt = True
+                        _interrupted_codex_threads.discard(state_key)
+                        _interrupted_codex_turns.pop(state_key, None)
+                        was_interrupted = False
+                elif not interrupt_record.committed:
+                    # The terminal raced the RPC.  Remember it, but do not
+                    # consume any queue until the transport outcome is known.
+                    pass
+                discard_queued_on_completion = bool(
+                    terminal_matches_interrupt and interrupt_record.committed
+                )
+        else:
+            # Compatibility for old in-memory markers/tests and state restored
+            # during a rolling upgrade.  New dashboard clicks always use the
+            # precise two-phase record above.
+            discard_turn_id = interrupt_record
+            discard_queued_on_completion = bool(
+                isinstance(discard_turn_id, str)
+                and isinstance(terminal_turn_id, str)
+                and discard_turn_id in {"", terminal_turn_id}
+            )
         _pending_image_generation_threads.discard(state_key)
         _set_codex_turn_for_callback(
             thread_id,
             "",
             source_machine_id=normalized_source_machine_id,
         )
+        if (
+            buffered_uncertain_items
+            and isinstance(interrupt_record, _DashboardInterruptRecord)
+            and interrupt_record.terminal_resolved_without_interrupt
+        ):
+            # The fence intentionally held final items while the outcome was
+            # uncertain.  Replay them only after a non-interrupted terminal
+            # proves that the natural turn completed and the request did not
+            # cancel it.
+            for buffered_method, buffered_params in buffered_uncertain_items:
+                await _handle_codex_app_server_notification(
+                    buffered_method,
+                    buffered_params,
+                    bot=bot,
+                    source_machine_id=normalized_source_machine_id,
+                )
+            had_final_text = _turn_has_final_text.get(state_key, False) or had_final_text
+            pending_image_generation = (
+                state_key in _pending_image_generation_threads
+            )
+        elif buffered_uncertain_items:
+            # Confirmed interruption: buffered assistant output must never leak
+            # after the user asked to stop the turn.
+            buffered_uncertain_items = []
         transient_error = _pending_transient_app_server_errors.pop(state_key, None)
-        suppressed_topics: set[tuple[int, int | None]] = set()
+        suppressed_topics: set[tuple[int, int | None, int | None]] = set()
         if (
             isinstance(status, str)
             and status in {"failed", "interrupted"}
@@ -14973,13 +17952,88 @@ async def _handle_codex_app_server_notification(
                 or topic_ownership.codex_thread_id != thread_id
             ):
                 continue
-            if (user_id, bound_thread_id) in suppressed_topics:
+            if (user_id, bound_chat_id, bound_thread_id) in suppressed_topics:
                 continue
+            target_binding = (
+                isinstance(interrupt_record, _DashboardInterruptRecord)
+                and terminal_matches_interrupt
+                and (
+                    user_id,
+                    bound_chat_id,
+                    bound_thread_id,
+                )
+                == (
+                    interrupt_record.owner_user_id,
+                    interrupt_record.chat_id,
+                    interrupt_record.thread_id,
+                )
+            )
+            pending_target_interrupt = bool(
+                target_binding
+                and isinstance(interrupt_record, _DashboardInterruptRecord)
+                and not interrupt_record.committed
+                and not interrupt_record.terminal_resolved_without_interrupt
+            )
+            discard_target_interrupt = bool(
+                target_binding
+                and isinstance(interrupt_record, _DashboardInterruptRecord)
+                and interrupt_record.committed
+            )
+            legacy_discard_interrupt = bool(
+                discard_queued_on_completion
+                and isinstance(interrupt_record, str)
+            )
+            retained_target_guidance = 0
             note_run_completed(
                 user_id=user_id,
                 thread_id=bound_thread_id,
+                chat_id=bound_chat_id,
                 reason=f"turn_completed:{status or 'unknown'}",
             )
+            if discard_queued_on_completion and (
+                discard_target_interrupt or legacy_discard_interrupt
+            ):
+                if discard_target_interrupt:
+                    discard_queued_topic_inputs_before_generation(
+                        user_id,
+                        bound_thread_id,
+                        bound_chat_id,
+                        generation_cutoff=(
+                            interrupt_record.queued_input_generation_cutoff
+                        ),
+                    )
+                    retained_target_guidance = queued_topic_input_count(
+                        user_id,
+                        bound_thread_id,
+                        bound_chat_id,
+                    )
+                else:
+                    clear_queued_topic_inputs(
+                        user_id,
+                        bound_thread_id,
+                        bound_chat_id,
+                    )
+                try:
+                    if retained_target_guidance:
+                        await sync_queued_topic_dock(
+                            bot,
+                            user_id,
+                            bound_thread_id,
+                            window_id=wid,
+                            chat_id=bound_chat_id,
+                        )
+                    else:
+                        await clear_queued_topic_dock(
+                            bot,
+                            user_id,
+                            bound_thread_id,
+                            bound_chat_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed refreshing confirmed dashboard interrupt queue dock: %s",
+                        exc,
+                    )
             missing_final_text = not clear_progress_on_completion and not had_final_text
             if clear_progress_on_completion:
                 await enqueue_progress_clear(
@@ -15047,6 +18101,13 @@ async def _handle_codex_app_server_notification(
                         topic_ownership=topic_ownership,
                     )
             should_dispatch = (
+                not legacy_discard_interrupt
+                and not pending_target_interrupt
+                and (
+                    not discard_target_interrupt
+                    or retained_target_guidance > 0
+                )
+                and
                 queued_topic_input_count(
                     user_id, bound_thread_id, bound_chat_id
                 )
@@ -15061,6 +18122,17 @@ async def _handle_codex_app_server_notification(
                     chat_id=bound_chat_id,
                     preserve_coalesced_wakeup=True,
                 )
+        if (
+            isinstance(interrupt_record, _DashboardInterruptRecord)
+            and terminal_matches_interrupt
+            and (
+                discard_queued_on_completion
+                or interrupt_record.terminal_resolved_without_interrupt
+            )
+        ):
+            _discard_queued_on_interrupts.pop(state_key, None)
+        elif discard_queued_on_completion and isinstance(interrupt_record, str):
+            _discard_queued_on_interrupts.pop(state_key, None)
         return
 
     if method == "item/reasoning/textDelta":
@@ -15083,6 +18155,14 @@ async def _handle_codex_app_server_notification(
             normalized_source_machine_id,
         )
         if state_key in _interrupted_codex_threads:
+            interrupt_record = _discard_queued_on_interrupts.get(state_key)
+            if (
+                isinstance(interrupt_record, _DashboardInterruptRecord)
+                and interrupt_record.uncertain
+            ):
+                buffered = _uncertain_interrupted_items.setdefault(state_key, [])
+                if len(buffered) < _UNCERTAIN_INTERRUPTED_ITEM_BUFFER_LIMIT:
+                    buffered.append((method, dict(params)))
             return
         item_type = item.get("type")
         if item_type != "agentMessage":
@@ -15115,6 +18195,14 @@ async def _handle_codex_app_server_notification(
             normalized_source_machine_id,
         )
         if state_key in _interrupted_codex_threads:
+            interrupt_record = _discard_queued_on_interrupts.get(state_key)
+            if (
+                isinstance(interrupt_record, _DashboardInterruptRecord)
+                and interrupt_record.uncertain
+            ):
+                buffered = _uncertain_interrupted_items.setdefault(state_key, [])
+                if len(buffered) < _UNCERTAIN_INTERRUPTED_ITEM_BUFFER_LIMIT:
+                    buffered.append((method, dict(params)))
             return
         item_type = item.get("type")
         role = item.get("role")
@@ -15234,6 +18322,7 @@ async def handle_new_message(
             note_run_activity(
                 user_id=user_id,
                 thread_id=thread_id,
+                chat_id=chat_id,
                 window_id=wid,
                 source=f"assistant_{msg.content_type}",
             )
@@ -15344,11 +18433,13 @@ async def handle_new_message(
                         note_run_completed(
                             user_id=user_id,
                             thread_id=thread_id,
+                            chat_id=chat_id,
                             reason="final_assistant_text",
                         )
                     if thread_id is not None:
                         looper_completed_state = consume_looper_completion_keyword(
                             user_id=user_id,
+                            chat_id=chat_id,
                             thread_id=thread_id,
                             window_id=wid,
                             assistant_text=delivery_text,
@@ -15692,6 +18783,7 @@ async def _handle_controller_rpc_request(
 
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _controller_rpc_server
+    global _coco_control_retry_task
 
     _remote_transport_state_by_machine.clear()
     _remote_transport_event_locks.clear()
@@ -15747,6 +18839,9 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(bot_commands)
 
     await _migrate_coco_control_to_general(application.bot)
+    _coco_control_retry_task = asyncio.create_task(
+        _coco_control_retry_loop(application.bot)
+    )
 
     notice_target = _pop_restart_notice_target()
     notice_targets = _startup_notice_targets(notice_target)
@@ -16065,9 +19160,22 @@ async def post_init(application: Application) -> None:
 
 async def post_shutdown(application: Application) -> None:
     global _status_poll_task, _controller_rpc_server, _update_check_task
+    global _coco_control_retry_task
     session_manager.set_transport_uncertainty_handler(None)
     session_manager.set_remote_transport_result_handler(None)
     agent_rpc_client.set_codex_mutation_dispatch_gate(None)
+
+    if _coco_control_retry_task:
+        retry_task = _coco_control_retry_task
+        cancel = getattr(retry_task, "cancel", None)
+        if callable(cancel):
+            cancel()
+        if inspect.isawaitable(retry_task):
+            try:
+                await retry_task
+            except asyncio.CancelledError:
+                pass
+        _coco_control_retry_task = None
 
     if _update_check_task:
         _update_check_task.cancel()

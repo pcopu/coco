@@ -66,6 +66,45 @@ async def _ensure_chat_allowed(update: Update) -> bool:
     return False
 
 
+_GENERAL_CONTROL_LOCKED_TEXT = (
+    "🔒 General is CoCo's permanent control channel. This action is disabled "
+    "here—use a named topic for folders, /resume, /worktree, or /unbind."
+)
+
+
+def _is_reserved_general(thread_id: int | None, chat_id: int | None) -> bool:
+    return bool(thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0))
+
+
+def _resolve_looper_session_user(
+    *,
+    caller_user_id: int,
+    thread_id: int,
+    chat_id: int | None,
+) -> tuple[int | None, str | None]:
+    """Resolve and authorize the topic owner used by `/looper` mutations."""
+    if not _is_reserved_general(thread_id, chat_id):
+        return caller_user_id, None
+
+    control = session_manager.get_coco_control_topic(int(chat_id or 0))
+    if control is None:
+        return None, _COCO_CONTROL_UNCONFIGURED_TEXT
+    if control.thread_id != GENERAL_TOPIC_THREAD_ID:
+        return (
+            None,
+            "⏳ CoCo's General control migration is still pending. Retry after "
+            "the remote machine is online.",
+        )
+    target_user_id = int(control.user_id)
+    if not _can_coco_control_target(
+        caller_user_id=caller_user_id,
+        target_user_id=target_user_id,
+        chat_id=chat_id,
+    ):
+        return None, f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}"
+    return target_user_id, None
+
+
 def _extract_history_text_from_content(content: object) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -207,6 +246,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     if not update.message:
+        return
+
+    if _is_reserved_general(thread_id, chat_id):
+        await safe_reply(update.message, _GENERAL_CONTROL_LOCKED_TEXT)
         return
 
     # Capture group chat_id for supergroup forum topic routing.
@@ -365,6 +408,9 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     thread_id = _get_thread_id(update)
     chat_id = _scoped_chat_id(update)
+    if _is_reserved_general(thread_id, chat_id):
+        await safe_reply(update.message, _GENERAL_CONTROL_LOCKED_TEXT)
+        return
     if chat_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
     if thread_id is None:
@@ -378,7 +424,13 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     display = session_manager.get_display_name(wid)
     session_manager.unbind_thread(user.id, thread_id, chat_id=chat_id)
-    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+    await clear_topic_state(
+        user.id,
+        thread_id,
+        context.bot,
+        context.user_data,
+        chat_id=chat_id,
+    )
 
     await safe_reply(
         update.message,
@@ -425,10 +477,25 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     thread_id = _get_thread_id(update)
     chat_id = _scoped_chat_id(update)
+    session_user_id = user.id
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        control = session_manager.get_coco_control_topic(int(chat_id or 0))
+        if control is not None and control.thread_id == GENERAL_TOPIC_THREAD_ID:
+            session_user_id = control.user_id
+            if not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=session_user_id,
+                chat_id=chat_id,
+            ):
+                await safe_reply(
+                    update.message,
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+                )
+                return
     if chat_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+        session_manager.set_group_chat_id(session_user_id, thread_id, chat_id)
     wid = session_manager.resolve_window_for_thread(
-        user.id,
+        session_user_id,
         thread_id,
         chat_id=chat_id,
     )
@@ -443,13 +510,13 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception as exc:
                 logger.warning(
                     "Failed sending /esc status notice (user=%d thread=%s): %s",
-                    user.id,
+                    session_user_id,
                     thread_id,
                     exc,
                 )
                 emit_telemetry(
                     "esc.telegram_notice_failed",
-                    user_id=user.id,
+                    user_id=session_user_id,
                     thread_id=thread_id,
                     error=str(exc),
                 )
@@ -457,14 +524,14 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         async def _cleanup_esc_ui() -> None:
             try:
                 await clear_queued_topic_dock(
-                    context.bot, user.id, thread_id, chat_id
+                    context.bot, session_user_id, thread_id, chat_id
                 )
             except Exception as exc:
                 logger.warning("Failed clearing /esc queue dock: %s", exc)
             try:
                 await enqueue_progress_clear(
                     context.bot,
-                    user.id,
+                    session_user_id,
                     thread_id=thread_id,
                     chat_id=chat_id,
                 )
@@ -473,7 +540,7 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         codex_thread_id = ""
         binding = session_manager.resolve_topic_binding(
-            user.id,
+            session_user_id,
             thread_id,
             chat_id=chat_id,
         )
@@ -493,17 +560,20 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             bot_mod._interrupted_codex_threads.add(codex_thread_state_key)
             bot_mod._interrupted_codex_turns[codex_thread_state_key] = ""
-            clear_queued_topic_inputs(user.id, thread_id, chat_id)
+            clear_queued_topic_inputs(session_user_id, thread_id, chat_id)
             purged = await cancel_topic_delivery(
-                user.id, thread_id, chat_id=chat_id
+                session_user_id, thread_id, chat_id=chat_id
             )
         else:
             purged = 0
 
         active_turn_id = session_manager.get_window_codex_active_turn_id(wid)
-        if codex_thread_id and not active_turn_id:
+        machine_id = session_manager.get_window_machine_id(wid).strip()
+        local_machine_id, _local_machine_name = _local_machine_identity()
+        is_remote = bool(machine_id and machine_id != local_machine_id)
+        if codex_thread_id and not active_turn_id and not is_remote:
             active_turn_id = codex_app_server_client.get_active_turn_id(codex_thread_id) or ""
-        if codex_thread_id and not active_turn_id:
+        if codex_thread_id and not active_turn_id and not is_remote:
             try:
                 thread_payload = await codex_app_server_client.thread_read(
                     thread_id=codex_thread_id,
@@ -521,10 +591,17 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 codex_thread_state_key
             ] = active_turn_id
             try:
-                await codex_app_server_client.turn_interrupt(
-                    thread_id=codex_thread_id,
-                    turn_id=active_turn_id,
-                )
+                if is_remote:
+                    await agent_rpc_client.turn_interrupt(
+                        machine_id,
+                        thread_id=codex_thread_id,
+                        turn_id=active_turn_id,
+                    )
+                else:
+                    await codex_app_server_client.turn_interrupt(
+                        thread_id=codex_thread_id,
+                        turn_id=active_turn_id,
+                    )
             except Exception as e:
                 # The turn is still live when the interrupt transport fails.
                 # Roll back the output fence so its remaining updates are not
@@ -547,7 +624,12 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return
             session_manager.clear_window_codex_turn(wid)
             codex_app_server_client.clear_active_turn(codex_thread_id)
-            clear_run_watch_state(user.id, thread_id, window_id=wid)
+            clear_run_watch_state(
+                session_user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=wid,
+            )
             suffix = f"; discarded {purged} queued update(s)" if purged else ""
             await _cleanup_esc_ui()
             await _notify_esc_status(f"⎋ Interrupted active turn{suffix}")
@@ -564,7 +646,12 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             session_manager.clear_window_codex_turn(wid)
             codex_app_server_client.clear_active_turn(codex_thread_id)
-            clear_run_watch_state(user.id, thread_id, window_id=wid)
+            clear_run_watch_state(
+                session_user_id,
+                thread_id,
+                chat_id=chat_id,
+                window_id=wid,
+            )
             await _cleanup_esc_ui()
             await _notify_esc_status(
                 "⎋ No foreground turn was visible; queued updates were cleared, but no running turn could be interrupted.",
@@ -596,22 +683,38 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     chat_id = _scoped_chat_id(update)
+    session_user_id = (
+        _coco_control_owner_user_id(user.id, chat_id)
+        if thread_id == GENERAL_TOPIC_THREAD_ID
+        else user.id
+    )
+    if thread_id == GENERAL_TOPIC_THREAD_ID and int(chat_id or 0):
+        if not _can_coco_control_target(
+            caller_user_id=user.id,
+            target_user_id=session_user_id,
+            chat_id=chat_id,
+        ):
+            await safe_reply(
+                update.message,
+                f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+            )
+            return
     if chat_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+        session_manager.set_group_chat_id(session_user_id, thread_id, chat_id)
 
     queued_text = _extract_command_args(update.message.text or "")
     if not queued_text:
         await safe_reply(update.message, "Usage: `/q <message>`")
         emit_telemetry(
             "queue.q_command.invalid_usage",
-            user_id=user.id,
+            user_id=session_user_id,
             thread_id=thread_id,
             text_len=0,
         )
         return
 
     wid = session_manager.resolve_window_for_thread(
-        user.id,
+        session_user_id,
         thread_id,
         chat_id=chat_id,
     )
@@ -619,14 +722,14 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "❌ No session bound to this topic.")
         emit_telemetry(
             "queue.q_command.rejected_unbound",
-            user_id=user.id,
+            user_id=session_user_id,
             thread_id=thread_id,
             text_len=len(queued_text),
         )
         return
 
     binding = session_manager.resolve_topic_binding(
-        user.id,
+        session_user_id,
         thread_id,
         chat_id=chat_id,
     )
@@ -637,14 +740,14 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         emit_telemetry(
             "queue.q_command.rejected_incomplete_binding",
-            user_id=user.id,
+            user_id=session_user_id,
             thread_id=thread_id,
             window_id=wid,
             text_len=len(queued_text),
         )
         return
     queue_topic_ownership = capture_topic_ownership(
-        user.id,
+        session_user_id,
         thread_id,
         chat_id,
     )
@@ -657,7 +760,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     async def _enqueue_for_later(*, native_error: str = "") -> None:
         qsize = enqueue_queued_topic_input(
-            user.id,
+            session_user_id,
             thread_id,
             queued_text,
             update.message.chat_id,
@@ -667,14 +770,14 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _set_hourglass_reaction(update.message)
         await sync_queued_topic_dock(
             context.bot,
-            user.id,
+            session_user_id,
             thread_id,
             window_id=wid,
             chat_id=update.message.chat_id,
         )
         emit_telemetry(
             "queue.q_internal_enqueued",
-            user_id=user.id,
+            user_id=session_user_id,
             thread_id=thread_id,
             window_id=wid,
             queue_size=qsize,
@@ -685,20 +788,20 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         logger.info(
             "Queued /q input (user=%d, thread=%d, window=%s, size=%d)",
-            user.id,
+            session_user_id,
             thread_id,
             wid,
             qsize,
         )
 
     if (
-        queued_topic_input_count(user.id, thread_id, chat_id) > 0
-        or _is_queued_topic_drain_active(user.id, thread_id, chat_id)
+        queued_topic_input_count(session_user_id, thread_id, chat_id) > 0
+        or _is_queued_topic_drain_active(session_user_id, thread_id, chat_id)
     ):
         await _enqueue_for_later()
         await _dispatch_next_queued_input(
             context.bot,
-            user.id,
+            session_user_id,
             thread_id,
             wid,
             chat_id=chat_id,
@@ -707,7 +810,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if await _is_window_in_progress(
-        user.id,
+        session_user_id,
         thread_id,
         wid,
         chat_id=chat_id,
@@ -716,7 +819,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     success, send_msg = await session_manager.send_topic_text_to_window(
-        user_id=user.id,
+        user_id=session_user_id,
         thread_id=thread_id,
         chat_id=chat_id,
         window_id=wid,
@@ -726,7 +829,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     emit_telemetry(
         "queue.q_immediate_send_result",
-        user_id=user.id,
+        user_id=session_user_id,
         thread_id=thread_id,
         window_id=wid,
         success=success,
@@ -738,7 +841,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _enqueue_for_later(native_error=send_msg)
             await _dispatch_next_queued_input(
                 context.bot,
-                user.id,
+                session_user_id,
                 thread_id,
                 wid,
                 chat_id=chat_id,
@@ -748,8 +851,9 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"❌ {send_msg}")
         return
     note_run_started(
-        user_id=user.id,
+        user_id=session_user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=wid,
         source="q_immediate",
         pending_text=queued_text,
@@ -757,7 +861,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     await sync_queued_topic_dock(
         context.bot,
-        user.id,
+        session_user_id,
         thread_id,
         window_id=wid,
         chat_id=update.message.chat_id,
@@ -1602,11 +1706,20 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = _scoped_chat_id(update)
+    session_user_id, scope_error = _resolve_looper_session_user(
+        caller_user_id=user.id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+    )
+    if scope_error:
+        await safe_reply(update.message, scope_error)
+        return
+    assert session_user_id is not None
     if chat_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+        session_manager.set_group_chat_id(session_user_id, thread_id, chat_id)
 
     wid = session_manager.resolve_window_for_thread(
-        user.id,
+        session_user_id,
         thread_id,
         chat_id=chat_id,
     )
@@ -1616,7 +1729,11 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     raw_args = _extract_command_args(update.message.text or "")
     if not raw_args:
-        state = get_looper_state(user_id=user.id, thread_id=thread_id)
+        state = get_looper_state(
+            user_id=session_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
         await safe_reply(
             update.message,
             _build_looper_overview_text(state=state),
@@ -1629,7 +1746,11 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_reply(update.message, f"❌ Invalid command arguments: {e}")
         return
     if not parts:
-        state = get_looper_state(user_id=user.id, thread_id=thread_id)
+        state = get_looper_state(
+            user_id=session_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
         await safe_reply(update.message, _build_looper_overview_text(state=state))
         return
 
@@ -1637,12 +1758,21 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     subargs = parts[1:]
 
     if subcmd in {"status", "list", "show"}:
-        state = get_looper_state(user_id=user.id, thread_id=thread_id)
+        state = get_looper_state(
+            user_id=session_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
         await safe_reply(update.message, _build_looper_overview_text(state=state))
         return
 
     if subcmd in {"stop", "off", "clear"}:
-        stopped = stop_looper(user_id=user.id, thread_id=thread_id, reason="manual_stop")
+        stopped = stop_looper(
+            user_id=session_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reason="manual_stop",
+        )
         if not stopped:
             await safe_reply(update.message, "ℹ️ Looper is already off for this topic.")
             return
@@ -1885,7 +2015,8 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         state = start_looper(
-            user_id=user.id,
+            user_id=session_user_id,
+            chat_id=chat_id,
             thread_id=thread_id,
             window_id=wid,
             plan_path=plan_path,
@@ -1908,7 +2039,7 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         enabled = [
             item.name
             for item in session_manager.resolve_thread_skills(
-                user.id,
+                session_user_id,
                 thread_id,
                 chat_id=chat_id,
                 catalog=app_catalog,
@@ -1916,7 +2047,7 @@ async def looper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ]
         if "looper" not in enabled:
             session_manager.set_thread_skills(
-                user.id,
+                session_user_id,
                 thread_id,
                 [*enabled, "looper"],
                 chat_id=chat_id,
@@ -1988,6 +2119,9 @@ async def worktree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     chat_id = _scoped_chat_id(update)
+    if _is_reserved_general(thread_id, chat_id):
+        await safe_reply(update.message, _GENERAL_CONTROL_LOCKED_TEXT)
+        return
     if chat_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
 
@@ -2172,6 +2306,9 @@ async def _show_resume_panel(
 
     thread_id = _get_thread_id(update)
     chat_id = _scoped_chat_id(update)
+    if _is_reserved_general(thread_id, chat_id):
+        await safe_reply(update.message, _GENERAL_CONTROL_LOCKED_TEXT)
+        return
     if chat_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat_id)
     wid = session_manager.resolve_window_for_thread(
@@ -2436,6 +2573,8 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         thread_id=thread_id,
         chat_id=chat_id,
     )
+    control = session_manager.get_coco_control_topic(chat_id)
+    control_user_id = control.user_id if control is not None else user.id
 
     raw_args = _extract_command_args(update.message.text or "").strip()
     if raw_args:
@@ -2459,6 +2598,12 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             await safe_reply(update.message, inventory)
             return
+        if subcommand == "doctor":
+            await safe_reply(
+                update.message,
+                await _build_coco_doctor_text(int(chat_id or 0)),
+            )
+            return
         if subcommand in {"steer", "queue"}:
             if len(parts) < 3:
                 await safe_reply(
@@ -2466,16 +2611,33 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "Usage: `/coco steer <thread_id|name> <message>` or `/coco queue <thread_id|name> <message>`",
                 )
                 return
-            target = _resolve_coco_target_topic(
-                current_user_id=user.id,
+            targets = _resolve_coco_target_topic(
+                current_user_id=control_user_id,
                 current_thread_id=thread_id,
                 current_chat_id=chat_id,
                 raw_target=parts[1],
             )
-            if target is None:
+            if not targets:
                 await safe_reply(update.message, f"❌ Unknown target topic `{parts[1]}`.")
                 return
+            if len(targets) > 1:
+                await safe_reply(
+                    update.message,
+                    f"❌ Ambiguous target topic `{parts[1]}`; use the dashboard controls.",
+                )
+                return
+            target = targets[0]
             target_user_id, target_chat_id, target_thread_id, target_binding = target
+            if not _can_coco_control_target(
+                caller_user_id=user.id,
+                target_user_id=target_user_id,
+                chat_id=target_chat_id,
+            ):
+                await safe_reply(
+                    update.message,
+                    f"❌ {_COCO_CONTROL_PERMISSION_DENIED_TEXT}",
+                )
+                return
             wid = session_manager.resolve_window_for_thread(
                 target_user_id,
                 target_thread_id,
@@ -2540,42 +2702,17 @@ async def coco_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         await safe_reply(
             update.message,
-            "Usage: `/coco`, `/coco topics`, `/coco steer <thread_id|name> <message>`, or `/coco queue <thread_id|name> <message>`",
+            "Usage: `/coco`, `/coco doctor`, `/coco topics`, `/coco steer <thread_id|name> <message>`, or `/coco queue <thread_id|name> <message>`",
         )
         return
 
-    binding, suggested_workspace = _ensure_coco_control_workspace_binding(
-        user_id=user.id,
-        thread_id=thread_id,
-        chat_id=chat_id,
+    dashboard_text, dashboard_keyboard = _build_coco_dashboard(
+        chat_id=int(chat_id or 0),
     )
-    current_control = session_manager.get_coco_control_topic()
-    is_current = session_manager.is_coco_control_topic(
-        user.id,
-        thread_id,
-        chat_id=chat_id,
-    )
-    current_binding = None
-    if current_control is not None:
-        current_binding = session_manager.resolve_topic_binding(
-            current_control.user_id,
-            current_control.thread_id,
-            chat_id=current_control.chat_id or None,
-        )
-
     await safe_reply(
         update.message,
-        _build_coco_control_text(
-            current_user_id=user.id,
-            current_thread_id=thread_id,
-            current_chat_id=chat_id,
-            binding=binding,
-            current_control=current_control,
-            current_control_binding=current_binding,
-            suggested_workspace=suggested_workspace,
-            is_current=is_current,
-        ),
-        reply_markup=_build_coco_control_keyboard(is_current=is_current),
+        dashboard_text,
+        reply_markup=dashboard_keyboard,
     )
 
 
@@ -2586,12 +2723,21 @@ def _build_coco_topic_inventory_text(
     current_chat_id: int | None,
 ) -> str:
     lines = ["CoCo control topic inventory", ""]
+    control = session_manager.get_coco_control_topic(current_chat_id)
+    can_view_all = bool(
+        _is_admin_user(current_user_id)
+        or (
+            control is not None
+            and control.thread_id == GENERAL_TOPIC_THREAD_ID
+            and control.user_id == current_user_id
+        )
+    )
     for user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
-        if user_id != current_user_id:
-            continue
         if chat_id != current_chat_id:
             continue
         if thread_id == current_thread_id:
+            continue
+        if not can_view_all and user_id != current_user_id:
             continue
         label = str(binding.display_name or "").strip() or f"thread-{thread_id}"
         workspace = str(binding.cwd or "").strip() or "(no workspace)"
@@ -2607,27 +2753,29 @@ def _resolve_coco_target_topic(
     current_thread_id: int,
     current_chat_id: int | None,
     raw_target: str,
-) -> tuple[int, int | None, int, TopicBinding] | None:
+) -> list[tuple[int, int | None, int, TopicBinding]]:
     normalized = raw_target.strip()
     if not normalized:
-        return None
+        return []
     by_thread_id: int | None = None
     try:
         by_thread_id = int(normalized)
     except ValueError:
         by_thread_id = None
     lowered = normalized.lower()
+    matches: list[tuple[int, int | None, int, TopicBinding]] = []
     for user_id, chat_id, thread_id, binding in session_manager.iter_topic_bindings():
-        if user_id != current_user_id or chat_id != current_chat_id:
+        if chat_id != current_chat_id:
             continue
         if thread_id == current_thread_id:
             continue
-        if by_thread_id is not None and thread_id == by_thread_id:
-            return user_id, chat_id, thread_id, binding
         display_name = str(binding.display_name or "").strip().lower()
-        if display_name and display_name == lowered:
-            return user_id, chat_id, thread_id, binding
-    return None
+        if (
+            (by_thread_id is not None and thread_id == by_thread_id)
+            or (display_name and display_name == lowered)
+        ):
+            matches.append((user_id, chat_id, thread_id, binding))
+    return matches
 
 
 async def transcription_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

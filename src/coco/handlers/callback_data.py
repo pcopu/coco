@@ -42,6 +42,12 @@ CB_MODEL_REFRESH = "md:ref"
 CB_COCO_SET = "cc:set"
 CB_COCO_CANCEL = "cc:cancel"
 CB_COCO_REFRESH = "cc:ref"
+CB_COCO_DASHBOARD = "cc:dash"
+CB_COCO_DOCTOR = "cc:doc"
+CB_COCO_INSPECT = "cc:i:"  # cc:i:<owner_user_id>:<thread_id>
+CB_COCO_STEER = "cc:s:"  # cc:s:<owner_user_id>:<thread_id>
+CB_COCO_INTERRUPT = "cc:x:"  # cc:x:<owner_user_id>:<thread_id>
+CB_COCO_PAGE = "cc:p:"  # cc:p:<page>
 
 # Update panel
 CB_UPDATE_REFRESH = "up:ref"

@@ -3,16 +3,363 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from coco.agent_rpc import AgentRpcClient, AgentRpcServer
 import coco.agent_rpc as agent_rpc
+import coco.codex_trust as codex_trust
 from coco.cluster_rpc import ClusterRpcError
 from coco.node_registry import NodeRegistry
 from coco.node_registry import node_registry
 from coco.session import session_manager
+
+
+@pytest.fixture(autouse=True)
+def _avoid_writing_real_codex_trust(monkeypatch):
+    monkeypatch.setattr(
+        agent_rpc,
+        "ensure_codex_project_trust",
+        lambda _path: (True, ""),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_ensure_control_workspace_round_trip_is_idempotent(
+    monkeypatch,
+    tmp_path,
+):
+    trusted: list[object] = []
+    monkeypatch.setattr(
+        agent_rpc,
+        "ensure_codex_project_trust",
+        lambda path: (trusted.append(path) is None, ""),
+    )
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path)
+    monkeypatch.setattr(agent_rpc.config, "machine_id", "control-node")
+
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        host, port = server.bound_address()
+        node_registry.note_heartbeat(
+            machine_id="control-node",
+            display_name="Control Node",
+            transport="agent_rpc",
+            rpc_host=host,
+            rpc_port=port,
+            is_local=False,
+            now=100.0,
+        )
+        client = AgentRpcClient(shared_secret="rpc-secret")
+
+        first = await client.ensure_control_workspace("control-node", -100123)
+        second = await client.ensure_control_workspace("control-node", -100123)
+
+        expected = tmp_path / "_coco" / "chat-100123" / "control"
+        assert first == second
+        assert first["machine_id"] == "control-node"
+        assert first["chat_id"] == -100123
+        assert first["workspace_path"] == str(expected)
+        assert first["can_write"] is True
+        assert first["write_error"] == ""
+        assert expected.is_dir()
+        assert not list(expected.glob(".coco-write-probe-*"))
+        assert trusted == [expected, expected]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_ensure_control_workspace_allows_symlinked_config_root(
+    monkeypatch,
+    tmp_path,
+):
+    real_config_root = tmp_path / "real-config"
+    real_config_root.mkdir()
+    config_link = tmp_path / "config-link"
+    config_link.symlink_to(real_config_root, target_is_directory=True)
+    monkeypatch.setattr(agent_rpc.config, "config_dir", config_link)
+
+    result = await AgentRpcServer(shared_secret="rpc-secret")._ensure_control_workspace(
+        {"chat_id": -100123}
+    )
+
+    expected = real_config_root / "_coco" / "chat-100123" / "control"
+    assert result["workspace_path"] == str(expected)
+    assert expected.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_agent_ensure_control_workspace_trust_uses_custom_codex_home(
+    monkeypatch, tmp_path
+):
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setattr(
+        agent_rpc,
+        "ensure_codex_project_trust",
+        codex_trust.ensure_codex_project_trust,
+    )
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path / "agent-config")
+    monkeypatch.setattr(agent_rpc.config, "machine_id", "control-node")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    result = await AgentRpcServer(shared_secret="rpc-secret")._ensure_control_workspace(
+        {"chat_id": -100123}
+    )
+
+    workspace = Path(result["workspace_path"])
+    config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert f'[projects."{workspace}"]' in config_text
+    assert not (tmp_path / "agent-config" / ".codex" / "config.toml").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id", [0, 1, True, None, "-100"])
+async def test_agent_ensure_control_workspace_rejects_non_group_chat_id(
+    monkeypatch,
+    tmp_path,
+    chat_id,
+):
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path)
+    with pytest.raises(ClusterRpcError, match="negative nonzero group chat_id"):
+        await AgentRpcServer(shared_secret="rpc-secret")._ensure_control_workspace(
+            {"chat_id": chat_id}
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_ensure_control_workspace_rejects_symlink_escape(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "_coco").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ClusterRpcError, match="symlink"):
+        await AgentRpcServer(shared_secret="rpc-secret")._ensure_control_workspace(
+            {"chat_id": -100123}
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_ensure_control_workspace_rejects_symlink_chat_directory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path)
+    coco_root = tmp_path / "_coco"
+    coco_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (coco_root / "chat-100123").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ClusterRpcError, match="symlink"):
+        await AgentRpcServer(shared_secret="rpc-secret")._ensure_control_workspace(
+            {"chat_id": -100123}
+        )
+    assert not (outside / "control").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", ["_coco", "chat-100123", "control"])
+async def test_agent_ensure_control_workspace_rejects_non_directory_component(
+    monkeypatch,
+    tmp_path,
+    component,
+):
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path)
+    target = tmp_path / "_coco" / "chat-100123" / "control"
+    if component == "_coco":
+        target = tmp_path / component
+    elif component == "chat-100123":
+        (tmp_path / "_coco").mkdir()
+        target = tmp_path / "_coco" / component
+    else:
+        (tmp_path / "_coco" / "chat-100123").mkdir(parents=True)
+    target.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ClusterRpcError, match="not a directory"):
+        await AgentRpcServer(shared_secret="rpc-secret")._ensure_control_workspace(
+            {"chat_id": -100123}
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_interrupt_round_trip(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent_rpc.config, "config_dir", tmp_path)
+    monkeypatch.setattr(agent_rpc.config, "machine_id", "interrupt-node")
+    calls: list[tuple[str, str]] = []
+
+    async def _interrupt(*, thread_id: str, turn_id: str):
+        calls.append((thread_id, turn_id))
+
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "turn_interrupt",
+        _interrupt,
+    )
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "transport_state_snapshot",
+        lambda: {"epoch": "interrupt-epoch", "epoch_started_at": 100.0},
+    )
+
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        host, port = server.bound_address()
+        node_registry.note_heartbeat(
+            machine_id="interrupt-node",
+            display_name="Interrupt Node",
+            transport="agent_rpc",
+            rpc_host=host,
+            rpc_port=port,
+            is_local=False,
+            now=100.0,
+        )
+        client = AgentRpcClient(shared_secret="rpc-secret")
+        client.set_codex_mutation_dispatch_gate(
+            lambda _machine_id: asyncio.sleep(
+                0,
+                result=("interrupt-epoch", 100.0),
+            )
+        )
+        payload = await client.turn_interrupt(
+            "interrupt-node",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+
+        assert calls == [("thread-1", "turn-1")]
+        assert payload == {
+            "ok": True,
+            "machine_id": "interrupt-node",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_interrupt_requires_transport_fence(monkeypatch):
+    server = AgentRpcServer(shared_secret="rpc-secret")
+    monkeypatch.setattr(
+        agent_rpc.codex_app_server_client,
+        "turn_interrupt",
+        lambda **_kwargs: pytest.fail("unfenced interrupt must not dispatch"),
+    )
+
+    with pytest.raises(
+        agent_rpc.RemoteCodexMutationDeferredError,
+        match="transport fence is required",
+    ):
+        await server._turn_interrupt(
+            {"thread_id": "thread-1", "turn_id": "turn-1"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_interrupt_marks_lost_response_as_uncertain(monkeypatch):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    client.set_codex_mutation_dispatch_gate(
+        lambda _machine_id: asyncio.sleep(
+            0,
+            result=("interrupt-epoch", 100.0),
+        )
+    )
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+
+    async def _call(**_kwargs):
+        raise ClusterRpcError("empty_response", request_dispatched=True)
+
+    monkeypatch.setattr(client._client, "call", _call)
+
+    with pytest.raises(ClusterRpcError) as raised:
+        await client.turn_interrupt(
+            "remote-node",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+    assert type(raised.value).__name__ == "RemoteCodexMutationUncertainError"
+    assert raised.value.request_dispatched is True
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_interrupt_keeps_definite_predispatch_failure(monkeypatch):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    client.set_codex_mutation_dispatch_gate(
+        lambda _machine_id: asyncio.sleep(
+            0,
+            result=("interrupt-epoch", 100.0),
+        )
+    )
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+
+    async def _call(**_kwargs):
+        raise ClusterRpcError("connect_failed", request_dispatched=False)
+
+    monkeypatch.setattr(client._client, "call", _call)
+
+    with pytest.raises(ClusterRpcError) as raised:
+        await client.turn_interrupt(
+            "remote-node",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+    assert type(raised.value).__name__ != "RemoteCodexMutationUncertainError"
+    assert raised.value.request_dispatched is False
+
+
+@pytest.mark.asyncio
+async def test_agent_ensure_control_workspace_client_validates_identity_and_writable_path(
+    monkeypatch,
+):
+    client = AgentRpcClient(shared_secret="rpc-secret")
+    monkeypatch.setattr(
+        client,
+        "_resolve_endpoint",
+        lambda _machine_id: ("127.0.0.1", 8787),
+    )
+
+    async def _call(**_kwargs):
+        return {
+            "machine_id": "other-node",
+            "chat_id": -100123,
+            "workspace_path": "/tmp/control",
+            "can_write": True,
+            "write_error": "",
+        }
+
+    monkeypatch.setattr(client._client, "call", _call)
+    with pytest.raises(ClusterRpcError, match="machine identity"):
+        await client.ensure_control_workspace("control-node", -100123)
+
+    async def _missing_path(**_kwargs):
+        return {
+            "machine_id": "control-node",
+            "chat_id": -100123,
+            "workspace_path": "",
+            "can_write": True,
+            "write_error": "",
+        }
+
+    monkeypatch.setattr(client._client, "call", _missing_path)
+    with pytest.raises(ClusterRpcError, match="workspace path"):
+        await client.ensure_control_workspace("control-node", -100123)
 
 
 def test_run_command_sync_decodes_timeout_output(monkeypatch):
@@ -479,6 +826,7 @@ async def test_lifecycle_validation_uses_target_machine_before_window_is_bound(
         "send_inputs",
         "thread_goal_set",
         "thread_goal_clear",
+        "turn_interrupt",
     ],
 )
 async def test_agent_rpc_blocks_mutation_before_unconfirmed_epoch_dispatch(
@@ -559,10 +907,16 @@ async def test_agent_rpc_blocks_mutation_before_unconfirmed_epoch_dispatch(
                 thread_id="thread-1",
                 goal="ship it",
             )
-        else:
+        elif operation == "thread_goal_clear":
             await client.thread_goal_clear(
                 "remote-node",
                 thread_id="thread-1",
+            )
+        else:
+            await client.turn_interrupt(
+                "remote-node",
+                thread_id="thread-1",
+                turn_id="turn-1",
             )
 
     assert rpc_calls == []
@@ -580,6 +934,7 @@ async def test_agent_rpc_blocks_mutation_before_unconfirmed_epoch_dispatch(
         "send_inputs",
         "thread_goal_set",
         "thread_goal_clear",
+        "turn_interrupt",
     ],
 )
 async def test_agent_rpc_binds_confirmed_epoch_to_each_mutation(
@@ -595,6 +950,13 @@ async def test_agent_rpc_binds_confirmed_epoch_to_each_mutation(
 
     async def _call(**kwargs):
         rpc_params.append(dict(kwargs["params"]))
+        if kwargs.get("method") == "agent/turn_interrupt":
+            return {
+                "ok": True,
+                "machine_id": "remote-node",
+                "thread_id": "thread-1",
+                "turn_id": "turn-1",
+            }
         return {"thread_id": "thread-1", "turn_id": ""}
 
     async def _accept_remote_result(*, window_id, result):
@@ -661,10 +1023,16 @@ async def test_agent_rpc_binds_confirmed_epoch_to_each_mutation(
             thread_id="thread-1",
             goal="ship it",
         )
-    else:
+    elif operation == "thread_goal_clear":
         await client.thread_goal_clear(
             "remote-node",
             thread_id="thread-1",
+        )
+    else:
+        await client.turn_interrupt(
+            "remote-node",
+            thread_id="thread-1",
+            turn_id="turn-1",
         )
 
     assert len(rpc_params) == 1

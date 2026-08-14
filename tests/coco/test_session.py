@@ -715,6 +715,7 @@ class TestHostFollowTakeover:
         exact_resumes: list[tuple[str, dict[str, object]]] = []
         latest_resumes: list[tuple[str, dict[str, object]]] = []
         sends: list[tuple[str, dict[str, object]]] = []
+        dispatch_state = session_mod.TopicSendDispatchState()
 
         async def _resume_thread(machine_id: str, **kwargs: object):
             exact_resumes.append((machine_id, kwargs))
@@ -736,6 +737,7 @@ class TestHostFollowTakeover:
                 "message": "ok",
                 "thread_id": canonical_thread_id,
                 "turn_id": "turn-topic-remote",
+                "dispatch_mode": "turn_start",
                 "transport_epoch": "agent-epoch-1",
                 "transport_epoch_started_at": 100.0,
                 "transport_generation": 1,
@@ -762,6 +764,7 @@ class TestHostFollowTakeover:
             thread_id=1,
             window_id="@1",
             text="continue this remote topic",
+            dispatch_state=dispatch_state,
         )
 
         assert ok is True
@@ -774,6 +777,7 @@ class TestHostFollowTakeover:
         assert latest_resumes == []
         assert len(sends) == 1
         assert sends[0][1]["thread_id"] == canonical_thread_id
+        assert dispatch_state.started_new_turn is True
 
     @pytest.mark.asyncio
     async def test_host_follow_remote_resume_drops_stale_result_after_explicit_rebind(
@@ -3393,6 +3397,159 @@ class TestCocoControlTopic:
         assert mgr.is_coco_control_topic(100, 1, chat_id=-100123)
         assert not mgr.is_coco_control_topic(100, 77, chat_id=-100123)
 
+    def test_general_control_is_independent_per_group_and_shared_by_allowed_users(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        first = mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+        second = mgr.set_coco_control_topic(200, 1, chat_id=-100456)
+
+        assert first is not None
+        assert second is not None
+        assert mgr.get_coco_control_topic(-100123) == session_mod.CocoControlTopic(
+            user_id=100,
+            thread_id=1,
+            chat_id=-100123,
+        )
+        assert mgr.get_coco_control_topic(-100456) == session_mod.CocoControlTopic(
+            user_id=200,
+            thread_id=1,
+            chat_id=-100456,
+        )
+        assert mgr.is_coco_control_topic(999, 1, chat_id=-100123)
+        assert mgr.is_coco_control_topic(999, 1, chat_id=-100456)
+        assert not mgr.is_coco_control_topic(100, 1, chat_id=-100999)
+
+    def test_general_binding_resolution_does_not_alias_non_owner(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+        state = mgr.get_window_state("@42")
+        state.cwd = "/internal/control"
+        mgr.bind_thread(100, 1, "@42", chat_id=-100123)
+
+        owner_resolved = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+        non_owner_resolved = mgr.resolve_topic_binding(999, 1, chat_id=-100123)
+
+        assert owner_resolved is not None
+        assert owner_resolved.window_id == "@42"
+        assert owner_resolved.cwd == "/internal/control"
+        assert non_owner_resolved is None
+        assert mgr.resolve_window_for_thread(999, 1, chat_id=-100123) is None
+
+    def test_non_owner_general_lookup_and_config_stay_in_callers_scope(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        chat_id = -100123
+        owner_id = 100
+        caller_id = 999
+        mgr.set_coco_control_topic(owner_id, 1, chat_id=chat_id)
+        mgr.bind_thread(owner_id, 1, "@42", chat_id=chat_id)
+
+        assert mgr.resolve_topic_binding(caller_id, 1, chat_id=chat_id) is None
+
+        caller_binding = mgr.ensure_topic_binding(caller_id, 1, chat_id=chat_id)
+
+        assert caller_binding is not None
+        assert caller_id in mgr.topic_bindings_v2
+        assert caller_binding is not mgr.topic_bindings_v2[owner_id][f"{chat_id}:1"]
+
+        changed = mgr.set_topic_response_mode(
+            caller_id,
+            1,
+            chat_id=chat_id,
+            response_mode="voice",
+        )
+
+        assert changed is True
+        assert mgr.get_topic_response_mode(owner_id, 1, chat_id=chat_id) == "text"
+        assert mgr.get_topic_response_mode(caller_id, 1, chat_id=chat_id) == "voice"
+
+    def test_owner_general_setting_mutates_owner_binding(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        owner_binding = mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+        assert owner_binding is not None
+
+        changed = mgr.set_topic_response_mode(
+            100,
+            1,
+            chat_id=-100123,
+            response_mode="voice",
+        )
+
+        assert changed is True
+        persisted = mgr._get_persisted_topic_binding(100, 1, chat_id=-100123)
+        assert persisted is owner_binding
+        assert persisted.response_mode == "voice"
+
+    def test_existing_group_control_owner_cannot_be_replaced(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        original = mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+
+        repeated = mgr.set_coco_control_topic(200, 1, chat_id=-100123)
+
+        assert repeated == original
+        assert mgr.get_coco_control_topic(-100123) == session_mod.CocoControlTopic(
+            user_id=100,
+            thread_id=1,
+            chat_id=-100123,
+        )
+        assert mgr.resolve_topic_binding(200, 1, chat_id=-100123) is None
+        assert 200 not in mgr.topic_bindings_v2
+
+    def test_set_control_recreates_binding_for_orphaned_reservation(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        chat_id = -100123
+        mgr.coco_control_topics[chat_id] = session_mod.CocoControlTopic(
+            user_id=100,
+            thread_id=1,
+            chat_id=chat_id,
+        )
+
+        binding = mgr.set_coco_control_topic(999, 1, chat_id=chat_id)
+
+        assert binding is not None
+        assert binding.chat_id == chat_id
+        assert binding.thread_id == 1
+        assert mgr.resolve_topic_binding(100, 1, chat_id=chat_id) == binding
+        assert mgr.resolve_topic_binding(999, 1, chat_id=chat_id) is None
+        assert 999 not in mgr.topic_bindings_v2
+
+    def test_set_control_archives_existing_cross_user_general_history(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=200,
+            thread_id=1,
+            chat_id=-100123,
+            codex_thread_id="existing-general",
+            cwd="/existing/general",
+            window_id="@20",
+        )
+
+        binding = mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+
+        assert binding is not None
+        assert binding.codex_thread_id == ""
+        assert mgr.get_coco_control_topic(-100123) == session_mod.CocoControlTopic(
+            user_id=100,
+            thread_id=1,
+            chat_id=-100123,
+        )
+        assert mgr.resolve_topic_binding(100, 1, chat_id=-100123) == binding
+        assert list(mgr.coco_control_archives.values())[0].codex_thread_id == (
+            "existing-general"
+        )
+
     def test_coco_control_topic_persists_across_save_and_load(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -3407,12 +3564,51 @@ class TestCocoControlTopic:
         mgr.set_coco_control_topic(100, 1, chat_id=-100123)
 
         reloaded = SessionManager()
-        control_topic = reloaded.get_coco_control_topic()
+        control_topic = reloaded.get_coco_control_topic(-100123)
 
         assert control_topic is not None
         assert control_topic.user_id == 100
         assert control_topic.chat_id == -100123
         assert control_topic.thread_id == 1
+
+    def test_legacy_singleton_control_state_migrates_to_per_group_map(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "state_schema_version": 6,
+                    "coco_control_topic": {
+                        "user_id": 100,
+                        "thread_id": 77,
+                        "chat_id": -100123,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        monkeypatch.setattr(session_mod.config, "sessions_path", tmp_path / "sessions")
+
+        reloaded = SessionManager()
+
+        assert reloaded.get_coco_control_topic(-100123) == session_mod.CocoControlTopic(
+            user_id=100,
+            thread_id=77,
+            chat_id=-100123,
+        )
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        assert persisted["coco_control_topics"] == {
+            "-100123": {
+                "user_id": 100,
+                "thread_id": 77,
+                "chat_id": -100123,
+            }
+        }
+        assert "coco_control_topic" not in persisted
 
     def test_migrate_coco_control_to_general_moves_history_and_topic_settings(
         self,
@@ -3480,6 +3676,262 @@ class TestCocoControlTopic:
         assert migrated_state.cwd == str(neutral_workspace)
         assert migrated_state.window_name == "coco-control"
         assert mgr.is_coco_control_topic(user_id, 1, chat_id=chat_id)
+
+    def test_migrate_coco_control_preserves_remote_native_workspace_path(
+        self,
+        mgr: SessionManager,
+    ) -> None:
+        chat_id = -100123
+        remote_workspace = r"C:\Users\runner\.coco\chat-100123\control"
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=77,
+            chat_id=chat_id,
+            codex_thread_id="remote-history",
+            cwd=r"C:\projects\legacy",
+            window_id="@77",
+            machine_id="windows-agent",
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, chat_id)
+
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=chat_id,
+            workspace_dir=remote_workspace,
+        )
+
+        assert migration is not None and not migration.conflict
+        general = mgr.resolve_topic_binding(100, 1, chat_id=chat_id)
+        assert general is not None
+        assert general.cwd == remote_workspace
+        assert mgr.get_window_state(general.window_id).cwd == remote_workspace
+
+    def test_migrate_coco_control_preserves_distinct_existing_general_history(
+        self,
+        mgr: SessionManager,
+        tmp_path: Path,
+    ) -> None:
+        chat_id = -100123
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=77,
+            chat_id=chat_id,
+            codex_thread_id="legacy-history",
+            cwd="/projects/legacy",
+            display_name="legacy",
+            window_id="@77",
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            chat_id=chat_id,
+            codex_thread_id="general-history",
+            cwd="/projects/general",
+            display_name="general",
+            window_id="@1",
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, chat_id)
+
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=chat_id,
+            workspace_dir=str(tmp_path / "control"),
+        )
+
+        assert migration is not None
+        assert migration.conflict is True
+        legacy = mgr.resolve_topic_binding(100, 77, chat_id=chat_id)
+        general = mgr.resolve_topic_binding(100, 1, chat_id=chat_id)
+        assert legacy is not None and legacy.codex_thread_id == "legacy-history"
+        assert general is not None and general.codex_thread_id == "general-history"
+        assert general.cwd == "/projects/general"
+        assert mgr.get_window_state("@77").cwd == "/projects/legacy"
+        assert mgr.is_coco_control_topic(999, 1, chat_id=chat_id)
+
+    @pytest.mark.asyncio
+    async def test_stale_cleanup_preserves_archived_legacy_control_binding(
+        self,
+        mgr: SessionManager,
+        tmp_path: Path,
+    ) -> None:
+        chat_id = -100123
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=77,
+            chat_id=chat_id,
+            codex_thread_id="legacy-history",
+            cwd="/projects/legacy",
+            window_id="legacy-pane",
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            chat_id=chat_id,
+            codex_thread_id="general-history",
+            cwd="/projects/general",
+            window_id="@1",
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, chat_id)
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=chat_id,
+            workspace_dir=str(tmp_path / "control"),
+        )
+        assert migration is not None and migration.conflict
+
+        await mgr.resolve_stale_ids()
+
+        archived = mgr._get_persisted_topic_binding(100, 77, chat_id=chat_id)
+        assert archived is not None
+        assert archived.codex_thread_id == "legacy-history"
+        assert archived.window_id.startswith("@")
+
+    def test_migrate_coco_control_preserves_window_backed_general_session(
+        self,
+        mgr: SessionManager,
+        tmp_path: Path,
+    ) -> None:
+        chat_id = -100123
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=77,
+            chat_id=chat_id,
+            codex_thread_id="legacy-history",
+            cwd="/projects/legacy",
+            display_name="legacy",
+            window_id="@77",
+        )
+        general_state = mgr.get_window_state("@1")
+        general_state.cwd = "/projects/general"
+        general_state.window_name = "general"
+        mgr.bind_thread(
+            100,
+            1,
+            "@1",
+            window_name="general",
+            chat_id=chat_id,
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, chat_id)
+
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=chat_id,
+            workspace_dir=str(tmp_path / "control"),
+        )
+
+        assert migration is not None and migration.conflict
+        legacy = mgr.resolve_topic_binding(100, 77, chat_id=chat_id)
+        general = mgr.resolve_topic_binding(100, 1, chat_id=chat_id)
+        assert legacy is not None and legacy.codex_thread_id == "legacy-history"
+        assert general is not None and general.window_id == "@1"
+        assert general.cwd == "/projects/general"
+        assert general.codex_thread_id == ""
+
+    def test_migrate_control_detects_general_history_owned_by_another_user(
+        self,
+        mgr: SessionManager,
+        tmp_path: Path,
+    ) -> None:
+        chat_id = -100123
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=77,
+            chat_id=chat_id,
+            codex_thread_id="legacy-history",
+            cwd="/legacy",
+            window_id="@77",
+        )
+        mgr.bind_topic_to_codex_thread(
+            user_id=200,
+            thread_id=1,
+            chat_id=chat_id,
+            codex_thread_id="existing-general",
+            cwd="/general",
+            window_id="@1",
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, chat_id)
+
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=chat_id,
+            workspace_dir=str(tmp_path / "control"),
+        )
+
+        assert migration is not None and migration.conflict
+        assert mgr.get_coco_control_topic(chat_id) == session_mod.CocoControlTopic(
+            200, 1, chat_id
+        )
+        assert mgr.resolve_topic_binding(100, 77, chat_id=chat_id).codex_thread_id == "legacy-history"
+        assert mgr.resolve_topic_binding(200, 1, chat_id=chat_id).codex_thread_id == "existing-general"
+
+    def test_migration_does_not_rewrite_a_window_shared_with_another_topic(
+        self,
+        mgr: SessionManager,
+        tmp_path: Path,
+    ) -> None:
+        chat_id = -100123
+        for thread_id in (77, 88):
+            mgr.bind_topic_to_codex_thread(
+                user_id=100,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                codex_thread_id="shared-history",
+                cwd="/shared-project",
+                window_id="@42",
+            )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, chat_id)
+
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=chat_id,
+            workspace_dir=str(tmp_path / "control"),
+        )
+
+        assert migration is not None and not migration.conflict
+        sibling = mgr.resolve_topic_binding(100, 88, chat_id=chat_id)
+        general = mgr.resolve_topic_binding(100, 1, chat_id=chat_id)
+        assert sibling is not None and sibling.window_id == "@42"
+        assert mgr.get_window_state("@42").cwd == "/shared-project"
+        assert general is not None and general.window_id != "@42"
+        assert general.codex_thread_id == "shared-history"
+
+    def test_migration_notice_outbox_persists_failures_until_acknowledged(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        monkeypatch.setattr(session_mod.config, "sessions_path", tmp_path / "sessions")
+        mgr = SessionManager()
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=77,
+            chat_id=-100123,
+            codex_thread_id="legacy-history",
+            cwd="/projects/legacy",
+            display_name="legacy",
+            window_id="@77",
+        )
+        mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, -100123)
+
+        migration = mgr.migrate_coco_control_to_general(
+            chat_id=-100123,
+            workspace_dir=str(tmp_path / "_coco" / "chat-100123" / "control"),
+        )
+
+        assert migration is not None
+        notices = list(mgr.iter_pending_coco_control_notices())
+        assert [notice.thread_id for notice in notices] == [77, 1]
+        failed_id = notices[0].notice_id
+        assert mgr.record_coco_control_notice_failure(failed_id, "network down")
+
+        reloaded = SessionManager()
+        pending = {
+            notice.notice_id: notice
+            for notice in reloaded.iter_pending_coco_control_notices()
+        }
+        assert pending[failed_id].attempts == 1
+        assert pending[failed_id].last_error == "network down"
+        assert pending[failed_id].next_attempt_at > 0
+        assert reloaded.acknowledge_coco_control_notice(failed_id)
+        assert failed_id not in {
+            notice.notice_id for notice in reloaded.iter_pending_coco_control_notices()
+        }
 
 
 class TestResolveWindowForThread:
@@ -4038,6 +4490,53 @@ async def test_resolve_stale_ids_is_noop_for_window_ids(
 
     await mgr.resolve_stale_ids()
     assert mgr.resolve_topic_binding(100, 7) is not None
+
+
+@pytest.mark.asyncio
+async def test_resolve_stale_ids_repairs_invalid_general_window(
+    mgr: SessionManager,
+) -> None:
+    binding = mgr.set_coco_control_topic(100, 1, chat_id=-100123)
+    assert binding is not None
+    binding.window_id = "legacy-window"
+    binding.codex_thread_id = "control-history"
+    binding.cwd = "/internal/control"
+    binding.display_name = "coco-control"
+    stale_state = mgr.get_window_state("legacy-window")
+    stale_state.cwd = "/internal/control"
+    stale_state.codex_thread_id = "control-history"
+
+    await mgr.resolve_stale_ids()
+
+    repaired = mgr.resolve_topic_binding(100, 1, chat_id=-100123)
+    assert repaired is not None
+    assert repaired.window_id.startswith("@")
+    assert repaired.window_id != "legacy-window"
+    assert repaired.codex_thread_id == "control-history"
+    assert repaired.cwd == "/internal/control"
+    repaired_state = mgr.get_window_state(repaired.window_id)
+    assert repaired_state.codex_thread_id == "control-history"
+    assert repaired_state.cwd == "/internal/control"
+
+
+@pytest.mark.asyncio
+async def test_resolve_stale_ids_preserves_deferred_legacy_control(
+    mgr: SessionManager,
+) -> None:
+    mgr.coco_control_topic = session_mod.CocoControlTopic(100, 77, -100123)
+    binding = mgr.ensure_topic_binding(100, 77, chat_id=-100123)
+    assert binding is not None
+    binding.window_id = "legacy-window"
+    binding.codex_thread_id = "legacy-history"
+    binding.cwd = "/remote/control"
+
+    await mgr.resolve_stale_ids()
+
+    repaired = mgr.resolve_topic_binding(100, 77, chat_id=-100123)
+    assert repaired is not None
+    assert repaired.window_id.startswith("@")
+    assert repaired.codex_thread_id == "legacy-history"
+    assert repaired.cwd == "/remote/control"
 
 
 def test_normalize_approval_policy_maps_agent_and_full_auto_to_never():
@@ -5494,6 +5993,59 @@ async def test_send_inputs_to_window_no_active_turn_retry_failure_returns_combin
 
 
 @pytest.mark.asyncio
+async def test_send_inputs_to_window_no_active_turn_retry_marks_new_turn_dispatch(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    """A stale steer recovered through turn/start reports the resolved mode."""
+    state = mgr.get_window_state("@900015")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+    state.codex_thread_id = "thread-live"
+    state.codex_active_turn_id = "turn-stale"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    attempts = 0
+    dispatch_state = session_mod.TopicSendDispatchState()
+
+    async def _send_inputs_via_codex_app_server(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise session_mod.CodexAppServerError("no active turn to steer")
+        assert kwargs["steer"] is False
+        kwargs["dispatch_state"].mark_turn_started()
+        return True, "started"
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "clear_active_turn",
+        lambda _thread_id: None,
+    )
+
+    ok, message = await mgr.send_inputs_to_window(
+        "@900015",
+        [{"type": "text", "text": "recover this steer"}],
+        steer=True,
+        dispatch_state=dispatch_state,
+    )
+
+    assert ok is True
+    assert message == "started"
+    assert attempts == 2
+    assert dispatch_state.dispatch_mode == "turn_start"
+    assert dispatch_state.started_new_turn is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retry_method", ["turn/start", "turn/steer"])
 async def test_send_inputs_to_window_no_active_turn_retry_timeout_recovers_transport(
     mgr: SessionManager,
@@ -5611,6 +6163,7 @@ async def test_send_inputs_to_window_force_new_turn_ignores_cached_active_turn(
         return "thread-live", "full-auto"
 
     turn_start_calls: list[dict[str, object]] = []
+    dispatch_state = session_mod.TopicSendDispatchState()
 
     async def _turn_start_with_retry(
         *,
@@ -5618,6 +6171,7 @@ async def test_send_inputs_to_window_force_new_turn_ignores_cached_active_turn(
         inputs: list[dict[str, object]],
         approval_policy: str,
         service_tier: str,
+        **_kwargs: object,
     ):
         turn_start_calls.append(
             {
@@ -5650,6 +6204,7 @@ async def test_send_inputs_to_window_force_new_turn_ignores_cached_active_turn(
         [{"type": "text", "text": "queued task"}],
         steer=False,
         force_new_turn=True,
+        dispatch_state=dispatch_state,
     )
 
     assert ok is True
@@ -5657,6 +6212,8 @@ async def test_send_inputs_to_window_force_new_turn_ignores_cached_active_turn(
     assert len(turn_start_calls) == 1
     assert turn_start_calls[0]["thread_id"] == "thread-live"
     assert mgr.get_window_codex_active_turn_id("@900008") == "turn-new"
+    assert dispatch_state.dispatch_mode == "turn_start"
+    assert dispatch_state.started_new_turn is True
 
 
 @pytest.mark.asyncio

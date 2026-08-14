@@ -95,13 +95,19 @@ def test_build_model_info_text_reports_missing_cache(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_callback_updates_topic_binding_not_global_config(monkeypatch):
+@pytest.mark.parametrize("topic_thread_id", [77, 1])
+async def test_model_callback_updates_topic_binding_not_global_config(
+    monkeypatch,
+    topic_thread_id,
+):
     monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
     monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
     mgr = SessionManager()
+    if topic_thread_id == 1:
+        mgr.set_coco_control_topic(1147817421, 1, chat_id=-100123)
     mgr.bind_topic_to_codex_thread(
         user_id=1147817421,
-        thread_id=77,
+        thread_id=topic_thread_id,
         chat_id=-100123,
         codex_thread_id="thread-1",
         window_id="@1",
@@ -110,7 +116,7 @@ async def test_model_callback_updates_topic_binding_not_global_config(monkeypatc
     )
     mgr.set_topic_model_selection(
         1147817421,
-        77,
+        topic_thread_id,
         chat_id=-100123,
         model_slug="gpt-5.3-codex",
         reasoning_effort="xhigh",
@@ -141,7 +147,7 @@ async def test_model_callback_updates_topic_binding_not_global_config(monkeypatc
                 "Msg",
                 (),
                 {
-                    "message_thread_id": 77,
+                    "message_thread_id": topic_thread_id,
                     "chat": type("Chat", (), {"type": "supergroup", "id": -100123})(),
                     "chat_id": -100123,
                 },
@@ -182,12 +188,97 @@ async def test_model_callback_updates_topic_binding_not_global_config(monkeypatc
 
     await bot.callback_handler(update, context)
 
-    binding = mgr.resolve_topic_binding(1147817421, 77, chat_id=-100123)
+    binding = mgr.resolve_topic_binding(
+        1147817421,
+        topic_thread_id,
+        chat_id=-100123,
+    )
     assert binding is not None
     assert binding.model_slug == "gpt-5.4"
     assert binding.reasoning_effort == "high"
     assert edits
     assert "Topic model: `gpt-5.4`" in edits[-1]
+
+
+@pytest.mark.asyncio
+async def test_general_model_callback_admin_mutates_control_owner_without_shadow_binding(
+    monkeypatch,
+):
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    owner_user_id = 100
+    admin_user_id = 200
+    chat_id = -100123
+    manager.set_coco_control_topic(owner_user_id, 1, chat_id=chat_id)
+    manager.bind_topic_to_codex_thread(
+        user_id=owner_user_id,
+        thread_id=1,
+        chat_id=chat_id,
+        codex_thread_id="control-thread",
+        window_id="@control",
+        cwd="/tmp/control",
+        display_name="coco-control",
+    )
+
+    class _FakeQuery:
+        data = f"{CB_MODEL_SET}gpt-5.4"
+        message = type(
+            "Msg",
+            (),
+            {
+                "message_thread_id": 1,
+                "chat": type("Chat", (), {"type": "supergroup", "id": chat_id})(),
+                "chat_id": chat_id,
+            },
+        )()
+
+        def __init__(self) -> None:
+            self.answers: list[tuple[str | None, bool]] = []
+
+        async def answer(self, text: str | None = None, show_alert: bool = False):
+            self.answers.append((text, show_alert))
+
+    query = _FakeQuery()
+    update = type(
+        "Update",
+        (),
+        {
+            "callback_query": query,
+            "effective_user": type("User", (), {"id": admin_user_id})(),
+            "effective_chat": query.message.chat,
+            "effective_message": query.message,
+        },
+    )()
+    catalog = {
+        "current_model": "gpt-5.3-codex",
+        "current_effort": "medium",
+        "models": [
+            {"slug": "gpt-5.4", "default_effort": "high", "levels": ["high"]}
+        ],
+        "reasoning_options": ["high"],
+    }
+    edits: list[str] = []
+
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda uid: uid == admin_user_id)
+    monkeypatch.setattr(bot, "_load_codex_model_catalog", lambda: catalog)
+
+    async def _safe_edit(_query, text: str, **_kwargs):
+        edits.append(text)
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, type("Context", (), {"user_data": {}})())
+
+    owner_binding = manager.resolve_topic_binding(owner_user_id, 1, chat_id=chat_id)
+    assert owner_binding is not None
+    assert owner_binding.model_slug == "gpt-5.4"
+    assert owner_binding.reasoning_effort == "high"
+    assert manager.resolve_topic_binding(admin_user_id, 1, chat_id=chat_id) is None
+    assert edits
 
 
 @pytest.mark.asyncio

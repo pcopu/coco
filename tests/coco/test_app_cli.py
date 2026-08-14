@@ -171,18 +171,169 @@ def test_app_cli_autoresearch_set_outcome_and_run(monkeypatch, capsys):
     assert code_set == 0
     assert code_run == 0
     assert set_calls == [
-        {
-            "user_id": 1147817421,
-            "thread_id": 77,
-            "outcome": "Close more inbound leads",
+            {
+                "user_id": 1147817421,
+                "chat_id": -100123,
+                "thread_id": 77,
+                "outcome": "Close more inbound leads",
         }
     ]
     assert run_calls == [
-        {
-            "user_id": 1147817421,
-            "chat_id": -100123,
-            "thread_id": 77,
-        }
+            {
+                "user_id": 1147817421,
+                "chat_id": -100123,
+                "thread_id": 77,
+            }
     ]
     assert "Auto research outcome updated." in out
     assert "digest text" in out
+
+
+def test_app_cli_status_resolves_group_chat_when_chat_flag_is_omitted(monkeypatch, capsys):
+    catalog = {"looper": _make_skill("looper", icon="🔁")}
+    state_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(app_cli.session_manager, "discover_skill_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [catalog["looper"]],
+    )
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100123,
+    )
+    monkeypatch.setattr(
+        app_cli,
+        "get_looper_state",
+        lambda **kwargs: state_calls.append(kwargs) or None,
+    )
+
+    code = app_cli.main(
+        [
+            "looper",
+            "status",
+            "--user-id",
+            "1147817421",
+            "--thread-id",
+            "77",
+        ]
+    )
+
+    assert code == 0
+    assert state_calls == [
+        {"user_id": 1147817421, "chat_id": -100123, "thread_id": 77}
+    ]
+
+
+def test_app_cli_explicit_topic_resolves_unique_group_binding_without_chat_flag(monkeypatch):
+    user_id = 1147817421
+    thread_id = 77
+    binding = TopicBinding(
+        chat_id=-100123,
+        thread_id=thread_id,
+        window_id="@77",
+        cwd="/tmp/project",
+    )
+    start_calls: list[dict[str, object]] = []
+    catalog = {"looper": _make_skill("looper", icon="🔁")}
+
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "iter_topic_bindings",
+        lambda: [(user_id, -100123, thread_id, binding)],
+    )
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: user_id,
+    )
+    monkeypatch.setattr(app_cli.session_manager, "discover_skill_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_window_for_thread",
+        lambda *_args, **_kwargs: "@77",
+    )
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [catalog["looper"]],
+    )
+    monkeypatch.setattr(app_cli, "build_looper_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(
+        app_cli,
+        "start_looper",
+        lambda **kwargs: start_calls.append(kwargs)
+        or SimpleNamespace(
+            plan_path=kwargs["plan_path"],
+            keyword=kwargs["keyword"],
+            instructions=kwargs["instructions"],
+            interval_seconds=kwargs["interval_seconds"],
+            deadline_at=0.0,
+        ),
+    )
+
+    code = app_cli.main(
+        [
+            "looper",
+            "start",
+            "plans/ship.md",
+            "done",
+            "--user-id",
+            str(user_id),
+            "--thread-id",
+            str(thread_id),
+        ]
+    )
+
+    assert code == 0
+    assert start_calls[0]["chat_id"] == -100123
+
+
+def test_app_cli_explicit_topic_rejects_ambiguous_group_bindings_without_chat_flag(
+    monkeypatch,
+    capsys,
+):
+    user_id = 1147817421
+    thread_id = 77
+    binding_a = TopicBinding(chat_id=-100123, thread_id=thread_id, window_id="@a", cwd="/tmp/a")
+    binding_b = TopicBinding(chat_id=-100124, thread_id=thread_id, window_id="@b", cwd="/tmp/b")
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "iter_topic_bindings",
+        lambda: [
+            (user_id, -100123, thread_id, binding_a),
+            (user_id, -100124, thread_id, binding_b),
+        ],
+    )
+    monkeypatch.setattr(
+        app_cli.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: user_id,
+    )
+
+    code = app_cli.main(
+        [
+            "looper",
+            "status",
+            "--user-id",
+            str(user_id),
+            "--thread-id",
+            str(thread_id),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "--chat-id" in err

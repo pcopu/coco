@@ -81,27 +81,44 @@ class DueLooperPrompt:
     prompt_count: int
     deadline_at: float
     runner_command: str = ""
+    chat_id: int = 0
 
 
-# (user_id, thread_id) -> LooperState
-_looper_state: dict[tuple[int, int], LooperState] = {}
+# (user_id, chat_id, thread_id) -> LooperState
+_looper_state: dict[tuple[int, int, int], LooperState] = {}
 _looper_state_loaded = False
+_legacy_looper_state_keys: set[tuple[int, int, int]] = set()
 
 
-def _topic_key(user_id: int, thread_id: int) -> tuple[int, int]:
-    return user_id, thread_id
+def _topic_key(
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None = None,
+) -> tuple[int, int, int]:
+    return int(user_id), int(chat_id or 0), int(thread_id)
 
 
-def _key_to_string(key: tuple[int, int]) -> str:
-    return f"{key[0]}:{key[1]}"
+def _key_to_string(key: tuple[int, int, int]) -> str:
+    return f"{key[0]}:{key[1]}:{key[2]}"
 
 
-def _parse_key(raw_key: str) -> tuple[int, int] | None:
-    uid_s, sep, tid_s = raw_key.partition(":")
-    if not sep:
+def _persisted_key_to_string(key: tuple[int, int, int]) -> str:
+    if key in _legacy_looper_state_keys:
+        return f"{key[0]}:{key[2]}"
+    return _key_to_string(key)
+
+
+def _parse_key(raw_key: str) -> tuple[int, int, int] | None:
+    parts = raw_key.split(":")
+    if len(parts) == 2:
+        uid_s, tid_s = parts
+        chat_s = "0"
+    elif len(parts) == 3:
+        uid_s, chat_s, tid_s = parts
+    else:
         return None
     try:
-        return int(uid_s), int(tid_s)
+        return int(uid_s), int(chat_s), int(tid_s)
     except (TypeError, ValueError):
         return None
 
@@ -209,6 +226,7 @@ def _load_state() -> None:
         return
     _looper_state_loaded = True
     _looper_state.clear()
+    _legacy_looper_state_keys.clear()
 
     if not _LOOPER_STATE_FILE.is_file():
         return
@@ -230,18 +248,24 @@ def _load_state() -> None:
         if not parsed_state:
             continue
         _looper_state[parsed_key] = parsed_state
+        if len(raw_key.split(":")) == 2:
+            _legacy_looper_state_keys.add(parsed_key)
+        else:
+            _legacy_looper_state_keys.discard(parsed_key)
 
 
 def _save_state() -> None:
     if not _looper_state_loaded:
         return
+    _legacy_looper_state_keys.intersection_update(_looper_state)
     try:
         if not _looper_state:
+            _legacy_looper_state_keys.clear()
             if _LOOPER_STATE_FILE.exists():
                 _LOOPER_STATE_FILE.unlink()
             return
         payload = {
-            _key_to_string(key): state.to_dict()
+            _persisted_key_to_string(key): state.to_dict()
             for key, state in sorted(_looper_state.items())
         }
         atomic_write_json(_LOOPER_STATE_FILE, payload, indent=2)
@@ -287,6 +311,7 @@ def build_looper_prompt(
 def start_looper(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
     window_id: str,
     plan_path: str,
@@ -352,12 +377,14 @@ def start_looper(
         next_prompt_at=ts + next_interval,
         deadline_at=deadline_at,
     )
-    _looper_state[_topic_key(user_id, thread_id)] = state
+    normalized_chat_id = int(chat_id or 0)
+    _looper_state[_topic_key(user_id, thread_id, normalized_chat_id)] = state
     _save_state()
 
     emit_telemetry(
         "looper.started",
         user_id=user_id,
+        chat_id=normalized_chat_id,
         thread_id=thread_id,
         window_id=window_id,
         plan_path=plan,
@@ -375,18 +402,21 @@ def start_looper(
 def stop_looper(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
     reason: str = "manual",
 ) -> LooperState | None:
     """Stop looper for one topic."""
     _load_state()
-    key = _topic_key(user_id, thread_id)
+    normalized_chat_id = int(chat_id or 0)
+    key = _topic_key(user_id, thread_id, normalized_chat_id)
     state = _looper_state.pop(key, None)
     if state:
         _save_state()
         emit_telemetry(
             "looper.stopped",
             user_id=user_id,
+            chat_id=normalized_chat_id,
             thread_id=thread_id,
             window_id=state.window_id,
             reason=reason,
@@ -398,33 +428,83 @@ def stop_looper(
 def get_looper_state(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
 ) -> LooperState | None:
     """Return current looper state for a topic."""
     _load_state()
-    return _looper_state.get(_topic_key(user_id, thread_id))
+    return _looper_state.get(_topic_key(user_id, thread_id, chat_id))
 
 
-def clear_looper_state(user_id: int, thread_id: int | None = None) -> None:
+def clear_looper_state(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear looper state for one topic."""
     if thread_id is None:
         return
-    stop_looper(user_id=user_id, thread_id=thread_id, reason="cleared")
+    stop_looper(
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        reason="cleared",
+    )
 
 
-def prune_looper_topics(active_topic_keys: set[tuple[int, int]]) -> None:
+def prune_looper_topics(
+    active_topic_keys: set[tuple[int, int] | tuple[int, int, int]],
+) -> None:
     """Drop looper state for topics that are no longer bound."""
     _load_state()
-    stale = [key for key in _looper_state if key not in active_topic_keys]
-    if not stale:
+    normalized_active_keys = {
+        (int(key[0]), 0, int(key[1]))
+        if len(key) == 2
+        else (int(key[0]), int(key[1]), int(key[2]))
+        for key in active_topic_keys
+    }
+    changed = False
+    for key in list(_legacy_looper_state_keys):
+        if key not in _looper_state or key[1] != 0:
+            continue
+        matches = {
+            active_key
+            for active_key in normalized_active_keys
+            if active_key[0] == key[0]
+            and active_key[2] == key[2]
+            and active_key[1] != 0
+        }
+        if len(matches) != 1:
+            continue
+        target_key = next(iter(matches))
+        if target_key in _looper_state:
+            # A concrete scoped state is authoritative. Drop the superseded
+            # legacy alias so a later prune can never revive it after clear.
+            _looper_state.pop(key, None)
+            _legacy_looper_state_keys.discard(key)
+            changed = True
+            continue
+        _looper_state[target_key] = _looper_state.pop(key)
+        _legacy_looper_state_keys.discard(key)
+        changed = True
+
+    stale = [
+        key
+        for key in _looper_state
+        if key not in normalized_active_keys
+        and not (key in _legacy_looper_state_keys and key[1] == 0)
+    ]
+    if not stale and not changed:
         return
     for key in stale:
         state = _looper_state.pop(key, None)
+        _legacy_looper_state_keys.discard(key)
         if state:
             emit_telemetry(
                 "looper.stopped",
                 user_id=key[0],
-                thread_id=key[1],
+                chat_id=key[1],
+                thread_id=key[2],
                 window_id=state.window_id,
                 reason="stale_topic",
                 prompt_count=state.prompt_count,
@@ -435,13 +515,15 @@ def prune_looper_topics(active_topic_keys: set[tuple[int, int]]) -> None:
 def stop_looper_if_expired(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
     window_id: str,
     now: float | None = None,
 ) -> LooperState | None:
     """Stop and return looper state when its time limit has elapsed."""
     _load_state()
-    key = _topic_key(user_id, thread_id)
+    normalized_chat_id = int(chat_id or 0)
+    key = _topic_key(user_id, thread_id, normalized_chat_id)
     state = _looper_state.get(key)
     if not state:
         return None
@@ -457,6 +539,7 @@ def stop_looper_if_expired(
     emit_telemetry(
         "looper.stopped",
         user_id=user_id,
+        chat_id=normalized_chat_id,
         thread_id=thread_id,
         window_id=window_id,
         reason="time_limit_reached",
@@ -468,6 +551,7 @@ def stop_looper_if_expired(
 def claim_due_looper_prompt(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
     window_id: str,
     force: bool = False,
@@ -475,7 +559,8 @@ def claim_due_looper_prompt(
 ) -> DueLooperPrompt | None:
     """Claim one due prompt and schedule the next interval."""
     _load_state()
-    key = _topic_key(user_id, thread_id)
+    normalized_chat_id = int(chat_id or 0)
+    key = _topic_key(user_id, thread_id, normalized_chat_id)
     state = _looper_state.get(key)
     if not state:
         return None
@@ -509,6 +594,7 @@ def claim_due_looper_prompt(
     emit_telemetry(
         "looper.prompt_claimed",
         user_id=user_id,
+        chat_id=normalized_chat_id,
         thread_id=thread_id,
         window_id=window_id,
         prompt_count=state.prompt_count,
@@ -528,19 +614,21 @@ def claim_due_looper_prompt(
         prompt_count=state.prompt_count,
         deadline_at=state.deadline_at,
         runner_command=state.runner_command,
+        chat_id=normalized_chat_id,
     )
 
 
 def delay_looper_next_prompt(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
     delay_seconds: int = 60,
     now: float | None = None,
 ) -> None:
     """Bring next prompt closer when a claimed send failed."""
     _load_state()
-    state = _looper_state.get(_topic_key(user_id, thread_id))
+    state = _looper_state.get(_topic_key(user_id, thread_id, chat_id))
     if not state:
         return
     ts = now if now is not None else time.time()
@@ -553,13 +641,15 @@ def delay_looper_next_prompt(
 def consume_looper_completion_keyword(
     *,
     user_id: int,
+    chat_id: int | None = None,
     thread_id: int,
     window_id: str,
     assistant_text: str,
 ) -> LooperState | None:
     """Stop looper when assistant response matches configured keyword."""
     _load_state()
-    key = _topic_key(user_id, thread_id)
+    normalized_chat_id = int(chat_id or 0)
+    key = _topic_key(user_id, thread_id, normalized_chat_id)
     state = _looper_state.get(key)
     if not state:
         return None
@@ -577,6 +667,7 @@ def consume_looper_completion_keyword(
     emit_telemetry(
         "looper.stopped",
         user_id=user_id,
+        chat_id=normalized_chat_id,
         thread_id=thread_id,
         window_id=window_id,
         reason="keyword_match",
@@ -590,6 +681,7 @@ def reset_looper_state_for_tests(*, clear_persisted: bool = True) -> None:
     """Test helper to clear looper in-memory state."""
     global _looper_state_loaded
     _looper_state.clear()
+    _legacy_looper_state_keys.clear()
     _looper_state_loaded = False
     if not clear_persisted:
         return

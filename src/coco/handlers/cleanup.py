@@ -30,6 +30,8 @@ async def clear_topic_state(
     thread_id: int,
     bot: Bot | None = None,
     user_data: dict[str, Any] | None = None,
+    *,
+    chat_id: int | None = None,
 ) -> None:
     """Clear all memory state associated with a topic.
 
@@ -47,17 +49,17 @@ async def clear_topic_state(
       - user_data pending state (_pending_thread_id, _pending_thread_text)
     """
     # Clear status message tracking
-    clear_status_msg_info(user_id, thread_id)
-    clear_progress_msg_info(user_id, thread_id)
-    clear_queued_topic_inputs(user_id, thread_id)
-    await clear_queued_topic_dock(bot, user_id, thread_id)
-    clear_run_watch_state(user_id, thread_id)
-    clear_looper_state(user_id, thread_id)
-    clear_autoresearch_state(user_id, thread_id)
-    clear_personality_state(user_id, thread_id)
+    clear_status_msg_info(user_id, thread_id, chat_id)
+    clear_progress_msg_info(user_id, thread_id, chat_id)
+    clear_queued_topic_inputs(user_id, thread_id, chat_id)
+    await clear_queued_topic_dock(bot, user_id, thread_id, chat_id)
+    clear_run_watch_state(user_id, thread_id, chat_id=chat_id)
+    clear_looper_state(user_id, thread_id, chat_id)
+    clear_autoresearch_state(user_id, thread_id, chat_id)
+    clear_personality_state(user_id, thread_id, chat_id)
 
     # Clear tool message ID tracking
-    clear_tool_msg_ids_for_topic(user_id, thread_id)
+    clear_tool_msg_ids_for_topic(user_id, thread_id, chat_id)
 
     # Clear interactive UI state (also deletes message from chat)
     await clear_interactive_msg(user_id, bot, thread_id)

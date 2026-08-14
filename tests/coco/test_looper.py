@@ -136,3 +136,158 @@ def test_random_interval_range_reschedules_with_sampled_values(monkeypatch):
     assert due is not None
     assert looper.get_looper_state(user_id=3, thread_id=55).next_prompt_at == 6100.0
     assert sampled == [(1500, 4500), (1500, 4500)]
+
+
+def test_same_user_thread_in_two_chats_keeps_completion_state_isolated():
+    looper.start_looper(
+        user_id=4,
+        chat_id=-100401,
+        thread_id=88,
+        window_id="@chat-a",
+        plan_path="plans/a.md",
+        keyword="done",
+        now=100.0,
+    )
+    looper.start_looper(
+        user_id=4,
+        chat_id=-100402,
+        thread_id=88,
+        window_id="@chat-b",
+        plan_path="plans/b.md",
+        keyword="ship",
+        now=100.0,
+    )
+
+    stopped = looper.consume_looper_completion_keyword(
+        user_id=4,
+        chat_id=-100401,
+        thread_id=88,
+        window_id="@chat-a",
+        assistant_text="done",
+    )
+
+    assert stopped is not None
+    assert looper.get_looper_state(user_id=4, chat_id=-100401, thread_id=88) is None
+    remaining = looper.get_looper_state(user_id=4, chat_id=-100402, thread_id=88)
+    assert remaining is not None
+    assert remaining.keyword == "ship"
+
+
+def test_legacy_looper_state_key_loads_into_chat_zero(tmp_path):
+    payload = {
+        "4:88": {
+            "window_id": "@legacy",
+            "plan_path": "plans/legacy.md",
+            "keyword": "done",
+            "instructions": "",
+            "interval_seconds": 600,
+            "started_at": 100.0,
+            "next_prompt_at": 700.0,
+        }
+    }
+    looper._LOOPER_STATE_FILE.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    state = looper.get_looper_state(user_id=4, thread_id=88)
+
+    assert state is not None
+    assert looper.get_looper_state(user_id=4, chat_id=1, thread_id=88) is None
+
+
+def test_pruning_keeps_active_chat_scope_only():
+    for chat_id, keyword in ((-100401, "done"), (-100402, "ship")):
+        looper.start_looper(
+            user_id=4,
+            chat_id=chat_id,
+            thread_id=88,
+            window_id=f"@{chat_id}",
+            plan_path="plans/plan.md",
+            keyword=keyword,
+            now=100.0,
+        )
+
+    looper.prune_looper_topics({(4, -100401, 88)})
+
+    assert looper.get_looper_state(user_id=4, chat_id=-100401, thread_id=88) is not None
+    assert looper.get_looper_state(user_id=4, chat_id=-100402, thread_id=88) is None
+
+
+def test_pruning_migrates_unique_legacy_state_to_active_chat():
+    payload = {
+        "4:88": {
+            "window_id": "@legacy",
+            "plan_path": "plans/legacy.md",
+            "keyword": "done",
+            "instructions": "",
+            "interval_seconds": 600,
+            "started_at": 100.0,
+            "next_prompt_at": 700.0,
+        }
+    }
+    looper._LOOPER_STATE_FILE.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    looper.prune_looper_topics({(4, -100401, 88)})
+
+    assert looper.get_looper_state(user_id=4, chat_id=-100401, thread_id=88) is not None
+    assert looper.get_looper_state(user_id=4, thread_id=88) is None
+    persisted = __import__("json").loads(looper._LOOPER_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["4:-100401:88"]
+
+
+def test_pruning_discards_superseded_legacy_state_when_scoped_state_exists():
+    payload = {
+        "4:88": {
+            "window_id": "@legacy",
+            "plan_path": "plans/legacy.md",
+            "keyword": "done",
+            "instructions": "",
+            "interval_seconds": 600,
+            "started_at": 100.0,
+            "next_prompt_at": 700.0,
+        },
+        "4:-100401:88": {
+            "window_id": "@authoritative",
+            "plan_path": "plans/current.md",
+            "keyword": "ship",
+            "instructions": "",
+            "interval_seconds": 900,
+            "started_at": 200.0,
+            "next_prompt_at": 1100.0,
+        },
+    }
+    looper._LOOPER_STATE_FILE.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    looper.prune_looper_topics({(4, -100401, 88)})
+
+    state = looper.get_looper_state(user_id=4, chat_id=-100401, thread_id=88)
+    assert state is not None
+    assert state.window_id == "@authoritative"
+    assert looper.get_looper_state(user_id=4, thread_id=88) is None
+    persisted = __import__("json").loads(looper._LOOPER_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["4:-100401:88"]
+
+    looper.clear_looper_state(4, thread_id=88, chat_id=-100401)
+    looper.prune_looper_topics({(4, -100401, 88)})
+    assert looper.get_looper_state(user_id=4, thread_id=88) is None
+
+
+def test_pruning_retains_ambiguous_legacy_state_without_cross_claiming():
+    payload = {
+        "4:88": {
+            "window_id": "@legacy",
+            "plan_path": "plans/legacy.md",
+            "keyword": "done",
+            "instructions": "",
+            "interval_seconds": 600,
+            "started_at": 100.0,
+            "next_prompt_at": 700.0,
+        }
+    }
+    looper._LOOPER_STATE_FILE.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    looper.prune_looper_topics({(4, -100401, 88), (4, -100402, 88)})
+
+    assert looper.get_looper_state(user_id=4, thread_id=88) is not None
+    assert looper.get_looper_state(user_id=4, chat_id=-100401, thread_id=88) is None
+    assert looper.get_looper_state(user_id=4, chat_id=-100402, thread_id=88) is None
+    persisted = __import__("json").loads(looper._LOOPER_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["4:88"]

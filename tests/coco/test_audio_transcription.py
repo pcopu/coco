@@ -65,6 +65,184 @@ def _make_voice_update():
     return update, tg_file
 
 
+def _pending_dashboard_steer_context(
+    *,
+    owner_user_id: int = 1147817421,
+    thread_id: int = 77,
+    created_at: float | None = None,
+):
+    return SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": owner_user_id,
+                "chat_id": -100123,
+                "thread_id": thread_id,
+                "created_at": (
+                    bot.time.monotonic() if created_at is None else created_at
+                ),
+                "ownership": {
+                    "window_id": "@target",
+                    "codex_thread_id": "codex-target",
+                    "machine_id": "controller-node",
+                    "cwd": "/target/workspace",
+                },
+            }
+        },
+    )
+
+
+def _install_pending_dashboard_voice_routing(monkeypatch):
+    """Keep General owned by another user while allowing the pending target."""
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(9001, bot.GENERAL_TOPIC_THREAD_ID, -100123),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_can_coco_control_target",
+        lambda *, caller_user_id, target_user_id, **_kwargs: int(caller_user_id)
+        == int(target_user_id),
+    )
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda *_args, **_kwargs: False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_handler_pending_steer_resolves_self_target_before_general_owner(
+    monkeypatch,
+    tmp_path,
+):
+    """A caller-owned pending voice steer bypasses another user's General owner gate."""
+    update, tg_file = _make_voice_update()
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context()
+    _install_pending_dashboard_voice_routing(monkeypatch)
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot, "begin_transcription_bootstrap", lambda profile="": None)
+    monkeypatch.setattr(
+        bot,
+        "transcribe_audio_file",
+        lambda _path, *, profile="": "pending voice steer",
+    )
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.audio_handler(update, context)
+
+    assert "_coco_dashboard_steer" not in context.user_data
+    assert replies == []
+    assert len(forwarded) == 1
+    assert forwarded[0]["user_id"] == 1147817421
+    assert forwarded[0]["thread_id"] == 77
+    assert forwarded[0]["pending_steer_target"].thread_id == 77
+    assert forwarded[0]["response_mode"] == "voice"
+    assert "pending voice steer" in forwarded[0]["text"]
+    assert len(tg_file.paths) == 1
+
+
+@pytest.mark.asyncio
+async def test_audio_handler_pending_steer_consumes_when_transcription_fails(
+    monkeypatch,
+    tmp_path,
+):
+    """A failed pending voice transcription cannot capture a later text message."""
+    update, tg_file = _make_voice_update()
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context()
+    _install_pending_dashboard_voice_routing(monkeypatch)
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot, "begin_transcription_bootstrap", lambda profile="": None)
+
+    def _fail_transcription(_path, *, profile=""):
+        raise RuntimeError("transcription failed")
+
+    monkeypatch.setattr(bot, "transcribe_audio_file", _fail_transcription)
+    replies: list[str] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.audio_handler(update, context)
+
+    assert len(tg_file.paths) == 1
+    assert "_coco_dashboard_steer" not in context.user_data
+    assert replies == ["❌ Audio transcription failed: transcription failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_at", "ownership_current", "expected_reply"),
+    [
+        (
+            bot.time.monotonic() - bot._COCO_DASHBOARD_STEER_TTL_SECONDS - 1,
+            True,
+            bot._COCO_DASHBOARD_STEER_EXPIRED_TEXT,
+        ),
+        (
+            bot.time.monotonic(),
+            False,
+            "❌ That dashboard target changed. Refresh /coco and try again.",
+        ),
+    ],
+)
+async def test_audio_handler_pending_steer_stale_or_expired_skips_transcription(
+    monkeypatch,
+    tmp_path,
+    created_at,
+    ownership_current,
+    expected_reply,
+):
+    """Stale/expired pending voice steers are consumed before media work."""
+    update, tg_file = _make_voice_update()
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context(created_at=created_at)
+    _install_pending_dashboard_voice_routing(monkeypatch)
+    monkeypatch.setattr(bot, "is_topic_ownership_current", lambda *_args, **_kwargs: ownership_current)
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot,
+        "get_default_transcription_profile",
+        lambda: pytest.fail("stale/expired voice must not transcribe"),
+    )
+    replies: list[str] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.audio_handler(update, context)
+
+    assert tg_file.paths == []
+    assert "_coco_dashboard_steer" not in context.user_data
+    assert replies == [expected_reply]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_echo", [False, True])
 async def test_audio_handler_transcribes_voice_and_forwards_topic_text(
@@ -245,6 +423,11 @@ async def test_audio_handler_activates_general_control_before_classifying_voice(
     monkeypatch.setattr(bot, "_ensure_default_coco_general_control", _activate)
     monkeypatch.setattr(
         bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(1147817421, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
         "is_coco_control_topic",
         lambda _uid, tid, *, chat_id=None: (
             activated and tid == 1 and chat_id == -100123
@@ -268,6 +451,147 @@ async def test_audio_handler_activates_general_control_before_classifying_voice(
     assert forwarded[0]["thread_id"] == 1
     assert forwarded[0]["persist_response_mode"] is False
     assert "[coco voice note]" in str(forwarded[0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_audio_handler_rejects_unconfigured_general_before_download(
+    monkeypatch,
+    tmp_path,
+):
+    update, tg_file = _make_voice_update()
+    update.message.message_thread_id = 1
+    update.effective_chat.is_forum = True
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+    routing_users: list[int] = []
+
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda uid, *_args, **_kwargs: routing_users.append(uid),
+    )
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "get_default_transcription_profile",
+        lambda: pytest.fail("unconfigured General audio must not transcribe"),
+    )
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.audio_handler(update, context)
+
+    assert tg_file.paths == []
+    assert replies == [bot._COCO_CONTROL_UNCONFIGURED_TEXT]
+    assert routing_users == []
+
+
+@pytest.mark.asyncio
+async def test_authorized_admin_general_voice_uses_canonical_control_owner(
+    monkeypatch,
+    tmp_path,
+):
+    update, tg_file = _make_voice_update()
+    owner_user_id = 100
+    admin_user_id = 200
+    update.effective_user.id = admin_user_id
+    update.message.message_thread_id = None
+    update.effective_chat.is_forum = True
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda uid: uid == admin_user_id)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(owner_user_id, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "is_coco_control_topic",
+        lambda uid, _thread_id, **_kwargs: uid == owner_user_id,
+    )
+    monkeypatch.setattr(
+        bot,
+        "transcribe_audio_file",
+        lambda _path, *, profile="": "canonical control transcript",
+        raising=False,
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.audio_handler(update, context)
+
+    assert len(tg_file.paths) == 1
+    assert replies == []
+    assert forwarded
+    assert forwarded[0]["persist_response_mode"] is False
+    assert "[coco voice note]" in str(forwarded[0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_single_session_user_cannot_upload_audio_to_general_control(
+    monkeypatch,
+    tmp_path,
+):
+    update, tg_file = _make_voice_update()
+    update.effective_user.id = 999
+    update.message.message_thread_id = None
+    update.effective_chat.is_forum = True
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "_AUDIO_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: False)
+    monkeypatch.setattr(bot, "_get_user_scope", lambda _uid: bot.SCOPE_SINGLE_SESSION)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(100, 1, -100123),
+    )
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.audio_handler(update, context)
+
+    assert tg_file.paths == []
+    assert replies == [
+        "❌ Only the CoCo control owner or an admin can control another user's topic."
+    ]
 
 
 @pytest.mark.asyncio

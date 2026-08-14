@@ -8,15 +8,18 @@ import logging
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .cluster_rpc import ClusterRpcClient, ClusterRpcError, ClusterRpcServer
 from .codex_app_server import codex_app_server_client
 from .config import config
+from .codex_trust import ensure_codex_project_trust
 from .controller_rpc import REMOTE_CODEX_MACHINE_CONTEXT_KEY
 from .handlers.directory_browser import clamp_browse_path, resolve_browse_root
 from .node_registry import node_registry
@@ -63,6 +66,18 @@ _remote_restart_requested = False
 
 class RemoteCodexMutationDeferredError(ClusterRpcError):
     """A remote Codex mutation was definitively blocked before dispatch."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_dispatched: bool | None = False,
+    ) -> None:
+        super().__init__(message, request_dispatched=request_dispatched)
+
+
+class RemoteCodexMutationUncertainError(ClusterRpcError):
+    """A remote Codex mutation may have applied before transport failure."""
 
 
 def _require_expected_codex_transport(params: dict[str, Any]) -> None:
@@ -177,6 +192,174 @@ def _probe_workspace_write_access(workspace_dir: str) -> tuple[str, bool, str | 
         return str(target), True, None
     except Exception as exc:
         return str(target), False, str(exc)
+
+
+def _validate_group_chat_id(chat_id: object) -> int:
+    """Return a Telegram group id, rejecting users/private chats."""
+    if isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id >= 0:
+        raise ClusterRpcError("negative nonzero group chat_id is required")
+    return int(chat_id)
+
+
+def _raise_control_workspace_path_error(message: str) -> NoReturn:
+    raise ClusterRpcError(f"invalid control workspace path: {message}")
+
+
+def _absolute_without_resolving(path: Path) -> Path:
+    """Normalize a path lexically while preserving symlink components."""
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _canonical_control_workspace_root(path: Path) -> Path:
+    """Resolve the configured root; its symlink chain defines the boundary."""
+    configured_root = _absolute_without_resolving(path)
+    try:
+        canonical_root = configured_root.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        _raise_control_workspace_path_error(str(exc))
+    try:
+        mode = os.lstat(canonical_root).st_mode
+    except FileNotFoundError:
+        return canonical_root
+    except OSError as exc:
+        _raise_control_workspace_path_error(str(exc))
+    if not stat.S_ISDIR(mode):
+        _raise_control_workspace_path_error(
+            f"path component is not a directory: {canonical_root}"
+        )
+    return canonical_root
+
+
+def _ensure_no_symlink_components(path: Path) -> None:
+    """Reject symlink components in a path, including existing parents."""
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _raise_control_workspace_path_error(str(exc))
+        if stat.S_ISLNK(mode):
+            _raise_control_workspace_path_error(
+                f"symlink component is not allowed: {current}"
+            )
+
+
+def _ensure_control_workspace_directory(path: Path) -> None:
+    """Create one directory and reject races with files or symlinks."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        try:
+            path.mkdir()
+        except FileExistsError:
+            # A concurrent creator is fine; verify what it created below.
+            pass
+        except OSError as exc:
+            _raise_control_workspace_path_error(str(exc))
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError as exc:
+            _raise_control_workspace_path_error(str(exc))
+    except OSError as exc:
+        _raise_control_workspace_path_error(str(exc))
+    if stat.S_ISLNK(mode):
+        _raise_control_workspace_path_error(f"symlink component is not allowed: {path}")
+    if not stat.S_ISDIR(mode):
+        _raise_control_workspace_path_error(
+            f"path component is not a directory: {path}"
+        )
+
+
+def _probe_control_workspace_write_access(
+    workspace_path: Path,
+) -> tuple[bool, str | None]:
+    """Probe with a unique temporary file and always remove the probe."""
+    probe_path: Path | None = None
+    file_descriptor = -1
+    try:
+        file_descriptor, raw_probe_path = tempfile.mkstemp(
+            prefix=".coco-write-probe-",
+            dir=str(workspace_path),
+        )
+        probe_path = Path(raw_probe_path)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as probe:
+            file_descriptor = -1
+            probe.write("ok")
+            probe.flush()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if file_descriptor >= 0:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _ensure_control_workspace(chat_id: object) -> dict[str, Any]:
+    """Create the machine-local immutable control workspace for a group."""
+    normalized_chat_id = _validate_group_chat_id(chat_id)
+    config_root = _canonical_control_workspace_root(Path(config.config_dir))
+
+    # Config normally creates this directory during startup. Keeping creation
+    # here makes the RPC idempotent for a newly provisioned agent as well.
+    try:
+        config_root_mode = os.lstat(config_root).st_mode
+    except FileNotFoundError:
+        config_root_mode = None
+    except OSError as exc:
+        _raise_control_workspace_path_error(str(exc))
+    if config_root_mode is not None and not stat.S_ISDIR(config_root_mode):
+        _raise_control_workspace_path_error(
+            f"path component is not a directory: {config_root}"
+        )
+    try:
+        config_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _raise_control_workspace_path_error(str(exc))
+    _ensure_control_workspace_directory(config_root)
+
+    coco_root = config_root / "_coco"
+    chat_root = coco_root / f"chat-{abs(normalized_chat_id)}"
+    workspace_path = chat_root / "control"
+    for directory in (coco_root, chat_root, workspace_path):
+        _ensure_no_symlink_components(directory)
+        _ensure_control_workspace_directory(directory)
+
+    try:
+        resolved_root = config_root.resolve(strict=True)
+        resolved_workspace = workspace_path.resolve(strict=True)
+        resolved_workspace.relative_to(resolved_root)
+    except ValueError:
+        _raise_control_workspace_path_error("workspace path escapes config directory")
+    except (OSError, RuntimeError) as exc:
+        _raise_control_workspace_path_error(str(exc))
+
+    can_write, write_error = _probe_control_workspace_write_access(workspace_path)
+    trust_ok, trust_error = ensure_codex_project_trust(workspace_path)
+    if not trust_ok:
+        raise ClusterRpcError(
+            f"failed to trust control workspace: {trust_error or 'unknown error'}"
+        )
+    machine_id = node_registry.local_machine_id.strip()
+    if not machine_id:
+        raise ClusterRpcError("local machine identity is unavailable")
+    return {
+        "machine_id": machine_id,
+        "chat_id": normalized_chat_id,
+        "workspace_path": str(workspace_path),
+        "can_write": can_write,
+        "write_error": write_error or "",
+    }
 
 
 def _resolve_attachment_path(
@@ -392,6 +575,9 @@ class AgentRpcServer:
         self._server.register("agent/probe_codex_health", self._probe_codex_health)
         self._server.register("agent/probe_machine", self._probe_machine)
         self._server.register("agent/probe_workspace_write_access", self._probe_workspace_write_access)
+        self._server.register(
+            "agent/ensure_control_workspace", self._ensure_control_workspace
+        )
         self._server.register("agent/browse", self._browse)
         self._server.register("agent/folder_sessions", self._folder_sessions)
         self._server.register("agent/list_threads", self._list_threads)
@@ -405,6 +591,7 @@ class AgentRpcServer:
         self._server.register("agent/thread_goal_get", self._thread_goal_get)
         self._server.register("agent/thread_goal_set", self._thread_goal_set)
         self._server.register("agent/thread_goal_clear", self._thread_goal_clear)
+        self._server.register("agent/turn_interrupt", self._turn_interrupt)
         self._server.register("agent/send_inputs", self._send_inputs)
         self._server.register("agent/run_update", self._run_update)
 
@@ -484,6 +671,9 @@ class AgentRpcServer:
             "can_write": can_write,
             "write_error": write_error or "",
         }
+
+    async def _ensure_control_workspace(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _ensure_control_workspace(params.get("chat_id"))
 
     async def _folder_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
         cwd = str(params.get("cwd", "")).strip()
@@ -740,6 +930,42 @@ class AgentRpcServer:
             raise ClusterRpcError("invalid goal clear response")
         return result
 
+    async def _turn_interrupt(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not any(
+            key in params
+            for key in (
+                EXPECTED_CODEX_TRANSPORT_LEGACY_PARAM,
+                EXPECTED_CODEX_TRANSPORT_EPOCH_PARAM,
+                EXPECTED_CODEX_TRANSPORT_EPOCH_STARTED_AT_PARAM,
+            )
+        ):
+            raise RemoteCodexMutationDeferredError(
+                "Remote Codex mutation was not dispatched because a transport "
+                "fence is required for turn interrupt"
+            )
+        _require_expected_codex_transport(params)
+        thread_id = params.get("thread_id")
+        turn_id = params.get("turn_id")
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ClusterRpcError("thread_id is required")
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ClusterRpcError("turn_id is required")
+        normalized_thread_id = thread_id.strip()
+        normalized_turn_id = turn_id.strip()
+        await codex_app_server_client.turn_interrupt(
+            thread_id=normalized_thread_id,
+            turn_id=normalized_turn_id,
+        )
+        machine_id = node_registry.local_machine_id.strip()
+        if not machine_id:
+            raise ClusterRpcError("local machine identity is unavailable")
+        return {
+            "ok": True,
+            "machine_id": machine_id,
+            "thread_id": normalized_thread_id,
+            "turn_id": normalized_turn_id,
+        }
+
     async def _send_inputs(self, params: dict[str, Any]) -> dict[str, Any]:
         _require_expected_codex_transport(params)
         window_id = str(params.get("window_id", "")).strip()
@@ -807,6 +1033,7 @@ class AgentRpcServer:
             "message": message,
             "thread_id": result_snapshot.get("thread_id", state.codex_thread_id),
             "turn_id": result_snapshot.get("turn_id", state.codex_active_turn_id),
+            "dispatch_mode": result_snapshot.get("dispatch_mode", ""),
             **_codex_transport_response_fields(transport_state),
             "transport_reset_occurred": False,
         }
@@ -933,7 +1160,10 @@ class AgentRpcClient:
             if message.startswith(
                 REMOTE_CODEX_MUTATION_DEFERRED_MESSAGE_PREFIX
             ):
-                raise RemoteCodexMutationDeferredError(message) from exc
+                raise RemoteCodexMutationDeferredError(
+                    message,
+                    request_dispatched=exc.request_dispatched,
+                ) from exc
             raise
 
     @staticmethod
@@ -960,11 +1190,17 @@ class AgentRpcClient:
     def _resolve_endpoint(machine_id: str) -> tuple[str, int]:
         node = node_registry.get_node(machine_id)
         if node is None:
-            raise ClusterRpcError(f"unknown machine: {machine_id}")
+            raise ClusterRpcError(
+                f"unknown machine: {machine_id}",
+                request_dispatched=False,
+            )
         host = node.rpc_host.strip()
         port = int(node.rpc_port)
         if not host or port <= 0:
-            raise ClusterRpcError(f"machine has no reachable RPC endpoint: {machine_id}")
+            raise ClusterRpcError(
+                f"machine has no reachable RPC endpoint: {machine_id}",
+                request_dispatched=False,
+            )
         return host, port
 
     async def ping(self, machine_id: str) -> dict[str, Any]:
@@ -1136,6 +1372,41 @@ class AgentRpcClient:
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid workspace probe response")
+        return result
+
+    async def ensure_control_workspace(
+        self,
+        machine_id: str,
+        chat_id: int,
+    ) -> dict[str, Any]:
+        normalized_machine_id = machine_id.strip()
+        normalized_chat_id = _validate_group_chat_id(chat_id)
+        host, port = self._resolve_endpoint(normalized_machine_id)
+        result = await self._client.call(
+            host=host,
+            port=port,
+            method="agent/ensure_control_workspace",
+            params={"chat_id": normalized_chat_id},
+        )
+        if not isinstance(result, dict):
+            raise ClusterRpcError("invalid control workspace response")
+        observed_machine_id = result.get("machine_id")
+        if not isinstance(observed_machine_id, str) or (
+            observed_machine_id.strip() != normalized_machine_id
+        ):
+            raise ClusterRpcError("control workspace machine identity mismatch")
+        observed_chat_id = result.get("chat_id")
+        if isinstance(observed_chat_id, bool) or not isinstance(observed_chat_id, int):
+            raise ClusterRpcError("control workspace chat identity mismatch")
+        if observed_chat_id != normalized_chat_id:
+            raise ClusterRpcError("control workspace chat identity mismatch")
+        workspace_path = result.get("workspace_path")
+        if not isinstance(workspace_path, str) or not workspace_path.strip():
+            raise ClusterRpcError("control workspace path is empty")
+        if result.get("can_write") is not True:
+            write_error = str(result.get("write_error", "")).strip()
+            suffix = f": {write_error}" if write_error else ""
+            raise ClusterRpcError(f"control workspace is not writable{suffix}")
         return result
 
     async def folder_sessions(
@@ -1587,6 +1858,62 @@ class AgentRpcClient:
         )
         if not isinstance(result, dict):
             raise ClusterRpcError("invalid goal clear response")
+        return result
+
+    async def turn_interrupt(
+        self,
+        machine_id: str,
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        normalized_machine_id = machine_id.strip()
+        normalized_thread_id = thread_id.strip()
+        normalized_turn_id = turn_id.strip()
+        if not normalized_thread_id:
+            raise ClusterRpcError("thread_id is required", request_dispatched=False)
+        if not normalized_turn_id:
+            raise ClusterRpcError("turn_id is required", request_dispatched=False)
+        dispatch_fence = await self._require_codex_mutation_dispatch(
+            machine_id=normalized_machine_id,
+            operation="turn interrupt",
+        )
+        host, port = self._resolve_endpoint(normalized_machine_id)
+        try:
+            result = await self._call_codex_mutation(
+                host=host,
+                port=port,
+                method="agent/turn_interrupt",
+                params={
+                    "thread_id": normalized_thread_id,
+                    "turn_id": normalized_turn_id,
+                    **dispatch_fence,
+                },
+            )
+        except RemoteCodexMutationDeferredError:
+            raise
+        except ClusterRpcError as exc:
+            # Only an explicit pre-dispatch result is safe to treat as a
+            # rejected interrupt.  A frame that was written (or whose write
+            # outcome is unknown) may already have reached the agent.
+            if exc.request_dispatched is not False:
+                raise RemoteCodexMutationUncertainError(
+                    str(exc),
+                    request_dispatched=exc.request_dispatched,
+                ) from exc
+            raise
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise ClusterRpcError("invalid turn interrupt response")
+        observed_machine_id = result.get("machine_id")
+        if observed_machine_id is not None and (
+            not isinstance(observed_machine_id, str)
+            or observed_machine_id.strip() != normalized_machine_id
+        ):
+            raise ClusterRpcError("turn interrupt machine identity mismatch")
+        if result.get("thread_id") != normalized_thread_id:
+            raise ClusterRpcError("turn interrupt thread identity mismatch")
+        if result.get("turn_id") != normalized_turn_id:
+            raise ClusterRpcError("turn interrupt turn identity mismatch")
         return result
 
     async def run_update(

@@ -76,6 +76,7 @@ class RunWatchCheck:
     retry_count: int
     max_auto_retries: int
     watch_token: int = 0
+    chat_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -93,18 +94,46 @@ class RunWatchRetryCandidate:
     auto_retry_reason: str
     retry_count: int
     max_auto_retries: int
+    chat_id: int | None = None
 
 
-# (user_id, thread_id_or_0) -> RunWatchState
-_run_watch_state: dict[tuple[int, int], RunWatchState] = {}
-# "<user_id>:<thread_id_or_0>:<fingerprint>" -> {"count": int, "updated_at": float}
+# (user_id, chat_id_or_0, thread_id_or_0) -> RunWatchState
+_run_watch_state: dict[tuple[int, int, int], RunWatchState] = {}
+# "<user_id>:<chat_id_or_0>:<thread_id_or_0>:<fingerprint>" -> {"count": int, "updated_at": float}
 _run_watch_retry_state: dict[str, dict[str, float | int]] = {}
 _run_watch_retry_state_loaded = False
 _run_watch_token_sequence = 0
 
 
-def _topic_key(user_id: int, thread_id: int | None) -> tuple[int, int]:
-    return user_id, thread_id or 0
+def _topic_key(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> tuple[int, int, int]:
+    """Return a chat-scoped key while retaining the legacy zero-chat scope."""
+    return user_id, chat_id or 0, thread_id or 0
+
+
+def _resolve_state_key(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+) -> tuple[tuple[int, int, int], RunWatchState | None]:
+    """Resolve current state, with a one-way fallback for pre-chat state.
+
+    Older processes could leave an in-memory zero-chat watch while a newer
+    handler receives the same topic with its explicit forum chat. Reading that
+    legacy state during the transition preserves clear/completion behavior;
+    newly-created watches always use the explicit chat key.
+    """
+    skey = _topic_key(user_id, thread_id, chat_id)
+    state = _run_watch_state.get(skey)
+    if state is None and chat_id not in (None, 0):
+        legacy_key = _topic_key(user_id, thread_id)
+        state = _run_watch_state.get(legacy_key)
+        if state is not None:
+            return legacy_key, state
+    return skey, state
 
 
 def _fingerprint_text(text: str) -> str:
@@ -112,8 +141,17 @@ def _fingerprint_text(text: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
 
-def _retry_key(topic_key: tuple[int, int], fingerprint: str) -> str:
-    return f"{topic_key[0]}:{topic_key[1]}:{fingerprint}"
+def _retry_key(topic_key: tuple[int, ...], fingerprint: str) -> str:
+    """Serialize a watchdog topic key for persisted retry counters.
+
+    Two-element keys are accepted for compatibility with legacy callers and
+    persisted state. New chat-scoped keys contain the chat component.
+    """
+    if len(topic_key) == 2:
+        user_id, thread_id = topic_key
+        return f"{user_id}:{thread_id}:{fingerprint}"
+    user_id, chat_id, thread_id = topic_key
+    return f"{user_id}:{chat_id}:{thread_id}:{fingerprint}"
 
 
 def _load_retry_state(now: float | None = None) -> None:
@@ -194,12 +232,18 @@ def _prune_retry_state(now: float | None = None) -> None:
 
 
 def _get_persisted_retry_count(
-    topic_key: tuple[int, int],
+    topic_key: tuple[int, int, int],
     fingerprint: str,
     now: float | None = None,
 ) -> int:
     _prune_retry_state(now)
     raw = _run_watch_retry_state.get(_retry_key(topic_key, fingerprint))
+    # Retry counters written before chat-scoped watchdog keys were introduced
+    # remain valid for the legacy/non-forum (zero-chat) scope.
+    if raw is None and topic_key[1] == 0:
+        raw = _run_watch_retry_state.get(
+            _retry_key((topic_key[0], topic_key[2]), fingerprint)
+        )
     if not raw:
         return 0
     try:
@@ -210,13 +254,16 @@ def _get_persisted_retry_count(
 
 
 def _set_persisted_retry_count(
-    topic_key: tuple[int, int],
+    topic_key: tuple[int, int, int],
     fingerprint: str,
     count: int,
     now: float | None = None,
 ) -> None:
     _load_retry_state(now)
     key = _retry_key(topic_key, fingerprint)
+    if topic_key[1] == 0:
+        # Keep non-forum and legacy callers on the historical persisted key.
+        key = _retry_key((topic_key[0], topic_key[2]), fingerprint)
     normalized = min(max(0, int(count)), RUN_MAX_AUTO_RETRIES)
     if normalized <= 0:
         if _run_watch_retry_state.pop(key, None) is not None:
@@ -231,11 +278,14 @@ def _set_persisted_retry_count(
     _save_retry_state()
 
 
-def _clear_persisted_retry_count(topic_key: tuple[int, int], fingerprint: str) -> None:
+def _clear_persisted_retry_count(
+    topic_key: tuple[int, int, int],
+    fingerprint: str,
+) -> None:
     _set_persisted_retry_count(topic_key, fingerprint, 0)
 
 
-def _clear_topic_state(topic_key: tuple[int, int]) -> None:
+def _clear_topic_state(topic_key: tuple[int, int, int]) -> None:
     state = _run_watch_state.pop(topic_key, None)
     if not state:
         return
@@ -246,6 +296,7 @@ def note_run_started(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     source: str = "",
     pending_text: str = "",
@@ -257,7 +308,7 @@ def note_run_started(
     global _run_watch_token_sequence
     ts = now if now is not None else time.monotonic()
     persisted_ts = persisted_now if persisted_now is not None else time.time()
-    skey = _topic_key(user_id, thread_id)
+    skey = _topic_key(user_id, thread_id, chat_id)
 
     text = pending_text.strip()
     if not expect_response or not text:
@@ -267,7 +318,10 @@ def note_run_started(
 
     pending_fingerprint = _fingerprint_text(text)
 
-    old_state = _run_watch_state.get(skey)
+    old_state_key, old_state = _resolve_state_key(user_id, thread_id, chat_id)
+    if old_state_key != skey and old_state is not None:
+        _clear_topic_state(old_state_key)
+        old_state = None
     if old_state and old_state.pending_fingerprint != pending_fingerprint:
         _clear_persisted_retry_count(skey, old_state.pending_fingerprint)
 
@@ -297,6 +351,7 @@ def note_run_started(
         "watchdog.pending_start",
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         source=source or "unknown",
         retry_count=persisted_retries,
@@ -309,14 +364,14 @@ def note_run_activity(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     source: str = "",
     now: float | None = None,
 ) -> None:
     """Record assistant activity as a heartbeat for pending-run tracking."""
     ts = now if now is not None else time.monotonic()
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if not state:
         return
     if state.window_id != window_id:
@@ -339,6 +394,7 @@ def note_run_activity(
         "watchdog.activity_heartbeat",
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         source=source or "unknown",
     )
@@ -348,13 +404,13 @@ def note_run_completed(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     reason: str = "",
     now: float | None = None,
 ) -> None:
     """Stop watchdog tracking for a completed run."""
     ts = now if now is not None else time.monotonic()
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if not state:
         return
     _clear_topic_state(skey)
@@ -371,6 +427,7 @@ def note_run_completed(
         "watchdog.pending_cleared_completion",
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=state.window_id,
         elapsed_seconds=round(elapsed, 3),
         reason=reason or "unknown",
@@ -407,7 +464,8 @@ def note_transport_reset_uncertainty(
         emit_telemetry(
             "watchdog.transport_uncertain",
             user_id=topic_key[0],
-            thread_id=topic_key[1] or None,
+            chat_id=topic_key[1] or None,
+            thread_id=topic_key[2] or None,
             window_id=state.window_id,
             reason=reason or "unknown",
             pending_fingerprint=state.pending_fingerprint,
@@ -426,12 +484,12 @@ def clear_run_watch_state(
     user_id: int,
     thread_id: int | None = None,
     *,
+    chat_id: int | None = None,
     window_id: str | None = None,
     watch_token: int | None = None,
 ) -> bool:
     """Clear one topic's watchdog state when it still matches the caller."""
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if state is None:
         return False
     if window_id is not None and state.window_id != window_id:
@@ -446,13 +504,13 @@ def rearm_run_watch_checkpoint(
     user_id: int,
     thread_id: int | None = None,
     *,
+    chat_id: int | None = None,
     window_id: str,
     watch_token: int,
     checkpoint_seconds: int,
 ) -> bool:
     """Make one consumed checkpoint due again for the same pending watch."""
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if state is None:
         return False
     if state.window_id != window_id or state.watch_token != watch_token:
@@ -464,6 +522,7 @@ def rearm_run_watch_checkpoint(
         "watchdog.check_rearmed",
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         checkpoint_seconds=checkpoint_seconds,
         watch_token=watch_token,
@@ -471,9 +530,15 @@ def rearm_run_watch_checkpoint(
     return True
 
 
-def prune_run_watch_topics(active_topic_keys: set[tuple[int, int]]) -> None:
+def prune_run_watch_topics(
+    active_topic_keys: set[tuple[int, int] | tuple[int, int, int]],
+) -> None:
     """Drop watchdog state for topics that are no longer bound."""
-    stale = [key for key in _run_watch_state if key not in active_topic_keys]
+    normalized_active_keys = {
+        key if len(key) == 3 else (key[0], 0, key[1])
+        for key in active_topic_keys
+    }
+    stale = [key for key in _run_watch_state if key not in normalized_active_keys]
     for key in stale:
         _clear_topic_state(key)
 
@@ -482,19 +547,20 @@ def note_auto_retry_attempt(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     now: float | None = None,
     persisted_now: float | None = None,
 ) -> tuple[int, int]:
     """Increment and persist auto-retry attempt count for the active topic."""
     persisted_ts = persisted_now if persisted_now is not None else time.time()
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if not state:
         emit_telemetry(
             "watchdog.retry_attempt_skipped",
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=window_id,
             reason="no_state",
         )
@@ -504,6 +570,7 @@ def note_auto_retry_attempt(
             "watchdog.retry_attempt_skipped",
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=window_id,
             reason="window_mismatch",
             state_window_id=state.window_id,
@@ -515,6 +582,7 @@ def note_auto_retry_attempt(
             "watchdog.retry_attempt_skipped",
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=window_id,
             reason="retry_cap",
             retry_count=state.retry_count,
@@ -533,6 +601,7 @@ def note_auto_retry_attempt(
         "watchdog.retry_attempt",
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         retry_count=state.retry_count,
         retry_limit=RUN_MAX_AUTO_RETRIES,
@@ -545,6 +614,7 @@ def note_auto_retry_result(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     send_success: bool,
 ) -> None:
@@ -553,8 +623,7 @@ def note_auto_retry_result(
     On success, further auto-resends for the same pending message are blocked
     to avoid duplicate long-paste submissions.
     """
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if not state:
         return
     if state.window_id != window_id:
@@ -565,6 +634,7 @@ def note_auto_retry_result(
         "watchdog.retry_result",
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
         send_success=send_success,
         retry_count=state.retry_count,
@@ -576,13 +646,13 @@ def get_immediate_auto_retry_candidate(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     now: float | None = None,
 ) -> RunWatchRetryCandidate | None:
     """Return the current resend candidate without waiting for a checkpoint."""
     ts = now if now is not None else time.monotonic()
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if not state:
         return None
 
@@ -622,6 +692,7 @@ def get_immediate_auto_retry_candidate(
         auto_retry_reason=auto_retry_reason,
         retry_count=state.retry_count,
         max_auto_retries=RUN_MAX_AUTO_RETRIES,
+        chat_id=chat_id,
     )
 
 
@@ -629,13 +700,13 @@ def get_due_run_checks(
     *,
     user_id: int,
     thread_id: int | None,
+    chat_id: int | None = None,
     window_id: str,
     now: float | None = None,
 ) -> list[RunWatchCheck]:
     """Return newly-due no-response checkpoints for a pending user turn."""
     ts = now if now is not None else time.monotonic()
-    skey = _topic_key(user_id, thread_id)
-    state = _run_watch_state.get(skey)
+    skey, state = _resolve_state_key(user_id, thread_id, chat_id)
     if not state:
         return []
 
@@ -687,12 +758,14 @@ def get_due_run_checks(
                     retry_count=state.retry_count,
                     max_auto_retries=RUN_MAX_AUTO_RETRIES,
                     watch_token=state.watch_token,
+                    chat_id=chat_id,
                 )
             )
             emit_telemetry(
                 "watchdog.check_due",
                 user_id=user_id,
                 thread_id=thread_id,
+                chat_id=chat_id,
                 window_id=window_id,
                 checkpoint_seconds=checkpoint,
                 elapsed_seconds=round(elapsed, 3),

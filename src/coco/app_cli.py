@@ -130,6 +130,75 @@ def _resolve_target_from_binding_cwd(
     return best[0]
 
 
+def _topic_chat_candidates(
+    *,
+    user_id: int,
+    thread_id: int,
+    binding: TopicBinding | None = None,
+) -> set[int]:
+    """Collect concrete group chats that can identify an unscoped topic."""
+    candidates: set[int] = set()
+    binding_chat_id = getattr(binding, "chat_id", None)
+    if binding_chat_id and int(binding_chat_id) != user_id:
+        candidates.add(int(binding_chat_id))
+
+    resolved_chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    if resolved_chat_id != user_id:
+        candidates.add(int(resolved_chat_id))
+
+    for bound_user_id, bound_chat_id, bound_thread_id, _binding in session_manager.iter_topic_bindings():
+        if bound_user_id != user_id or bound_thread_id != thread_id:
+            continue
+        if bound_chat_id and int(bound_chat_id) != user_id:
+            candidates.add(int(bound_chat_id))
+
+    raw_group_chat_ids = getattr(session_manager, "group_chat_ids", {})
+    if isinstance(raw_group_chat_ids, dict):
+        for raw_key, raw_chat_id in raw_group_chat_ids.items():
+            if not isinstance(raw_key, str):
+                continue
+            parts = raw_key.split(":")
+            try:
+                if len(parts) == 2:
+                    raw_user_id, raw_thread_id = parts
+                    if int(raw_user_id) != user_id or int(raw_thread_id) != thread_id:
+                        continue
+                elif len(parts) == 3:
+                    raw_user_id, _raw_scope_chat_id, raw_thread_id = parts
+                    if int(raw_user_id) != user_id or int(raw_thread_id) != thread_id:
+                        continue
+                else:
+                    continue
+                mapped_chat_id = int(raw_chat_id)
+            except (TypeError, ValueError):
+                continue
+            if mapped_chat_id and mapped_chat_id != user_id:
+                candidates.add(mapped_chat_id)
+    return candidates
+
+
+def _resolve_unscoped_topic_chat_id(
+    *,
+    user_id: int,
+    thread_id: int,
+    binding: TopicBinding | None = None,
+) -> int:
+    candidates = _topic_chat_candidates(
+        user_id=user_id,
+        thread_id=thread_id,
+        binding=binding,
+    )
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "Topic chat scope is ambiguous. Pass --chat-id explicitly."
+        )
+    raise RuntimeError(
+        "Unable to resolve a group chat for this topic. Pass --chat-id explicitly."
+    )
+
+
 def _resolve_topic_target(
     *,
     user_id: int | None,
@@ -148,6 +217,17 @@ def _resolve_topic_target(
 
     if env_user_id is not None and env_thread_id is not None:
         binding = session_manager.resolve_topic_binding(env_user_id, env_thread_id, chat_id=env_chat_id)
+        if env_chat_id is None:
+            env_chat_id = _resolve_unscoped_topic_chat_id(
+                user_id=env_user_id,
+                thread_id=env_thread_id,
+                binding=binding,
+            )
+            binding = session_manager.resolve_topic_binding(
+                env_user_id,
+                env_thread_id,
+                chat_id=env_chat_id,
+            )
         return TopicTarget(
             user_id=env_user_id,
             chat_id=env_chat_id,
@@ -172,6 +252,24 @@ def _enabled_app_names(*, target: TopicTarget, catalog: dict[str, SkillDefinitio
             catalog=catalog,
         )
     ]
+
+
+def _resolve_target_chat_id(*, target: TopicTarget) -> int | None:
+    """Resolve the concrete chat scope for topic app state and actions."""
+    if target.chat_id is None:
+        return _resolve_unscoped_topic_chat_id(
+            user_id=target.user_id,
+            thread_id=target.thread_id,
+            binding=target.binding,
+        )
+    resolved_chat_id = session_manager.resolve_chat_id(
+        target.user_id,
+        target.thread_id,
+        chat_id=target.chat_id,
+    )
+    if resolved_chat_id == target.user_id and target.chat_id != target.user_id:
+        return target.chat_id
+    return resolved_chat_id
 
 
 def _set_app_enabled(
@@ -214,15 +312,25 @@ def _print_apps_overview(*, target: TopicTarget, catalog: dict[str, SkillDefinit
 
 def _print_looper_status(*, target: TopicTarget, catalog: dict[str, SkillDefinition]) -> None:
     enabled = "looper" in set(_enabled_app_names(target=target, catalog=catalog))
-    state = get_looper_state(user_id=target.user_id, thread_id=target.thread_id)
-    print(f"App: looper")
+    resolved_chat_id = _resolve_target_chat_id(target=target)
+    state = get_looper_state(
+        user_id=target.user_id,
+        chat_id=resolved_chat_id,
+        thread_id=target.thread_id,
+    )
+    print("App: looper")
     print(f"Enabled: {'yes' if enabled else 'no'}")
     print(bot._build_looper_overview_text(state=state))
 
 
 def _print_autoresearch_status(*, target: TopicTarget, catalog: dict[str, SkillDefinition]) -> None:
     enabled = "autoresearch" in set(_enabled_app_names(target=target, catalog=catalog))
-    state = get_autoresearch_state(user_id=target.user_id, thread_id=target.thread_id)
+    resolved_chat_id = _resolve_target_chat_id(target=target)
+    state = get_autoresearch_state(
+        user_id=target.user_id,
+        chat_id=resolved_chat_id,
+        thread_id=target.thread_id,
+    )
     print("App: autoresearch")
     print(f"Scheduled: {'yes' if enabled else 'no'}")
     if state is None:
@@ -342,12 +450,24 @@ def _handle_looper_command(*, target: TopicTarget, catalog: dict[str, SkillDefin
         print("Enabled app `looper` for this topic.")
         return 0
     if subcmd in {"disable"}:
-        stop_looper(user_id=target.user_id, thread_id=target.thread_id, reason="cli_disable")
+        resolved_chat_id = _resolve_target_chat_id(target=target)
+        stop_looper(
+            user_id=target.user_id,
+            chat_id=resolved_chat_id,
+            thread_id=target.thread_id,
+            reason="cli_disable",
+        )
         _set_app_enabled(target=target, app_name="looper", enabled=False, catalog=catalog)
         print("Disabled app `looper` for this topic.")
         return 0
     if subcmd in {"stop", "off", "clear"}:
-        stopped = stop_looper(user_id=target.user_id, thread_id=target.thread_id, reason="manual_stop")
+        resolved_chat_id = _resolve_target_chat_id(target=target)
+        stopped = stop_looper(
+            user_id=target.user_id,
+            chat_id=resolved_chat_id,
+            thread_id=target.thread_id,
+            reason="manual_stop",
+        )
         if not stopped:
             print("Looper is already off for this topic.")
             return 0
@@ -358,16 +478,18 @@ def _handle_looper_command(*, target: TopicTarget, catalog: dict[str, SkillDefin
     if subcmd not in {"start", "run"}:
         raise RuntimeError("Unknown looper subcommand. Use status, start, stop, enable, or disable.")
 
+    resolved_chat_id = _resolve_target_chat_id(target=target)
     wid = session_manager.resolve_window_for_thread(
         target.user_id,
         target.thread_id,
-        chat_id=target.chat_id,
+        chat_id=resolved_chat_id,
     )
     if not wid:
         raise RuntimeError("No session bound to this topic.")
     plan_path, keyword, interval_seconds, limit_seconds, instructions = _parse_looper_start_args(subargs[1:])
     state = start_looper(
         user_id=target.user_id,
+        chat_id=resolved_chat_id,
         thread_id=target.thread_id,
         window_id=wid,
         plan_path=plan_path,
@@ -430,19 +552,17 @@ def _handle_autoresearch_command(*, target: TopicTarget, catalog: dict[str, Skil
         outcome = " ".join(subargs[1:]).strip()
         if not outcome:
             raise RuntimeError("Usage: `coco apps autoresearch set-outcome <text>`")
+        resolved_chat_id = _resolve_target_chat_id(target=target)
         set_autoresearch_outcome(
             user_id=target.user_id,
+            chat_id=resolved_chat_id,
             thread_id=target.thread_id,
             outcome=outcome,
         )
         print("Auto research outcome updated.")
         return 0
     if subcmd == "run":
-        resolved_chat_id = session_manager.resolve_chat_id(
-            target.user_id,
-            target.thread_id,
-            chat_id=target.chat_id,
-        )
+        resolved_chat_id = _resolve_target_chat_id(target=target)
         if resolved_chat_id is None:
             raise RuntimeError("No chat binding for this topic.")
         digest_text = run_autoresearch_now(
@@ -515,7 +635,13 @@ def main(argv: list[str] | None = None) -> int:
             if not canonical:
                 raise RuntimeError(f"Unknown app: {' '.join(args[1:]).strip()}")
             if canonical == "looper":
-                stop_looper(user_id=target.user_id, thread_id=target.thread_id, reason="cli_disable")
+                resolved_chat_id = _resolve_target_chat_id(target=target)
+                stop_looper(
+                    user_id=target.user_id,
+                    chat_id=resolved_chat_id,
+                    thread_id=target.thread_id,
+                    reason="cli_disable",
+                )
             _set_app_enabled(target=target, app_name=canonical, enabled=False, catalog=catalog)
             print(f"Disabled app `{canonical}` for this topic.")
             return 0

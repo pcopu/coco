@@ -475,6 +475,7 @@ By default under `~/.coco`, with Codex session state continuing to live in
 
 | Command | What it does |
 | --- | --- |
+| `/coco` | Open the per-group General dashboard; use `/coco doctor` for control health |
 | `/folder` | Pick machine, folder, and prior session for this topic |
 | `/resume` | Rebind this topic to an existing Codex thread |
 | `/worktree` | Create/list/fold git worktrees |
@@ -484,6 +485,10 @@ By default under `~/.coco`, with Codex session state continuing to live in
 | `/status` | Show machine/session state |
 | `/model` | Pick per-topic model and reasoning level |
 | `/approvals` | Change approval mode for the bound session |
+
+In Telegram forum groups, General is permanently reserved as CoCo's control
+plane. Its internal workspace is managed automatically per group and machine;
+folder, resume, worktree, and unbind flows remain available in named topics.
 
 Assistant commands like `/clear`, `/compact`, `/cost`, and `/help` are forwarded to Codex.
 

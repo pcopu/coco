@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .config import config
-from .utils import atomic_write_json, coco_dir, env_alias
+from .utils import atomic_write_json, coco_dir, codex_home, env_alias
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,22 @@ _CODEX_LOGS_DB_PROCESS_EXIT_POLL_SECONDS = 0.05
 
 
 class CodexAppServerError(RuntimeError):
-    """Raised for app-server request/transport failures."""
+    """Raised for app-server request/transport failures.
+
+    ``request_dispatched`` distinguishes a definite pre-write rejection from
+    a failure after the JSON-RPC frame may have reached Codex.  ``None`` is
+    intentionally conservative for callers that cannot prove the write
+    outcome.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_dispatched: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_dispatched = request_dispatched
 
 
 class CodexAppServerClient:
@@ -646,10 +661,7 @@ class CodexAppServerClient:
 
     @staticmethod
     def _codex_home() -> Path:
-        raw = env_alias("CODEX_HOME", default="").strip()
-        if raw:
-            return Path(raw).expanduser()
-        return Path.home() / ".codex"
+        return codex_home()
 
     @staticmethod
     def _codex_logs_db_recovery_enabled() -> bool:
@@ -1609,11 +1621,15 @@ class CodexAppServerClient:
                 and self._stop_sequence != expected_stop_sequence
             ):
                 raise CodexAppServerError(
-                    "App-server transport changed before request dispatch"
+                    "App-server transport changed before request dispatch",
+                    request_dispatched=False,
                 )
             proc = self._proc
             if not proc or not proc.stdin:
-                raise CodexAppServerError("codex app-server is not running")
+                raise CodexAppServerError(
+                    "codex app-server is not running",
+                    request_dispatched=False,
+                )
             proc.stdin.write(frame)
             if on_dispatch is not None:
                 on_dispatch()
@@ -1643,7 +1659,10 @@ class CodexAppServerClient:
         on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         if not self._proc or self._proc.returncode is not None:
-            raise CodexAppServerError("codex app-server is not running")
+            raise CodexAppServerError(
+                "codex app-server is not running",
+                request_dispatched=False,
+            )
 
         req_id = str(self._request_id)
         self._request_id += 1
@@ -1658,18 +1677,38 @@ class CodexAppServerClient:
             "params": params or {},
         }
 
+        # A write can fail after a partial frame reaches the peer.  Start in
+        # the unknown state and let known pre-dispatch guards mark ``False``.
+        request_dispatched: bool | None = None
+
+        def _mark_dispatched() -> None:
+            nonlocal request_dispatched
+            request_dispatched = True
+            if on_dispatch is not None:
+                on_dispatch()
+
         try:
-            await self._write_jsonrpc(
-                payload,
-                expected_stop_sequence=expected_stop_sequence,
-                on_dispatch=on_dispatch,
-            )
+            try:
+                await self._write_jsonrpc(
+                    payload,
+                    expected_stop_sequence=expected_stop_sequence,
+                    on_dispatch=_mark_dispatched,
+                )
+            except CodexAppServerError as exc:
+                if exc.request_dispatched is None:
+                    exc.request_dispatched = request_dispatched
+                raise
             try:
                 return await asyncio.wait_for(fut, timeout=timeout)
             except TimeoutError as e:
                 raise CodexAppServerError(
-                    f"Timed out waiting for app-server response: {method}"
+                    f"Timed out waiting for app-server response: {method}",
+                    request_dispatched=request_dispatched,
                 ) from e
+            except CodexAppServerError as exc:
+                if exc.request_dispatched is None:
+                    exc.request_dispatched = request_dispatched
+                raise
         finally:
             self._pending.pop(req_id, None)
 

@@ -517,6 +517,7 @@ async def safe_send(
     chat_id: int,
     text: str,
     message_thread_id: int | None = None,
+    raise_on_failure: bool = False,
     **kwargs: Any,
 ) -> Message | SimpleNamespace | None:
     """Send message with MarkdownV2, falling back to plain text on failure."""
@@ -580,4 +581,6 @@ async def safe_send(
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
+            if raise_on_failure:
+                raise
             return None

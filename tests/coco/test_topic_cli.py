@@ -588,3 +588,42 @@ def test_topic_cli_send_rejects_mixed_image_and_video(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert code == 1
     assert "Provide at most one media source" in err
+
+
+def test_topic_cli_app_state_resolves_group_chat_when_chat_flag_is_omitted(monkeypatch):
+    target = topic_cli.app_cli.TopicTarget(
+        user_id=1147817421,
+        thread_id=77,
+        chat_id=None,
+    )
+    looper_calls: list[dict[str, object]] = []
+    autoresearch_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "resolve_chat_id",
+        lambda _uid, _tid, **_kwargs: -100123,
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "get_looper_state",
+        lambda **kwargs: looper_calls.append(kwargs) or None,
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "get_autoresearch_state",
+        lambda *args, **kwargs: autoresearch_calls.append((args, kwargs)) or None,
+    )
+
+    assert topic_cli._app_state_payload(app_name="looper", target=target) == {"running": False}
+    assert topic_cli._app_state_payload(app_name="autoresearch", target=target) == {
+        "outcome": "",
+        "last_delivered_for_date": "",
+        "last_researched_for_date": "",
+    }
+    assert looper_calls == [
+        {"user_id": 1147817421, "chat_id": -100123, "thread_id": 77}
+    ]
+    assert autoresearch_calls == [
+        ((1147817421, 77, -100123), {})
+    ]

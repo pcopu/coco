@@ -218,9 +218,23 @@ def _topic_payload(*, target: app_cli.TopicTarget, binding: TopicBinding | None)
     }
 
 
+def _resolve_topic_chat_id(*, target: app_cli.TopicTarget) -> int | None:
+    """Resolve the concrete chat scope before reading per-topic app state."""
+    return session_manager.resolve_chat_id(
+        target.user_id,
+        target.thread_id,
+        chat_id=target.chat_id,
+    )
+
+
 def _app_state_payload(*, app_name: str, target: app_cli.TopicTarget) -> dict[str, Any] | None:
     if app_name == "looper":
-        state = get_looper_state(user_id=target.user_id, thread_id=target.thread_id)
+        resolved_chat_id = _resolve_topic_chat_id(target=target)
+        state = get_looper_state(
+            user_id=target.user_id,
+            chat_id=resolved_chat_id,
+            thread_id=target.thread_id,
+        )
         if state is None:
             return {"running": False}
         return {
@@ -233,7 +247,12 @@ def _app_state_payload(*, app_name: str, target: app_cli.TopicTarget) -> dict[st
             "deadline_at": float(state.deadline_at),
         }
     if app_name == "autoresearch":
-        state = get_autoresearch_state(target.user_id, target.thread_id)
+        resolved_chat_id = _resolve_topic_chat_id(target=target)
+        state = get_autoresearch_state(
+            target.user_id,
+            target.thread_id,
+            resolved_chat_id,
+        )
         if state is None:
             return {"outcome": "", "last_delivered_for_date": "", "last_researched_for_date": ""}
         return {

@@ -169,6 +169,29 @@ async def test_safe_send_does_not_duplicate_after_network_error():
 
 
 @pytest.mark.asyncio
+async def test_safe_send_can_surface_a_terminal_bad_request():
+    attempts = 0
+
+    class _Bot:
+        async def send_message(self, **kwargs):
+            nonlocal attempts
+            assert "raise_on_failure" not in kwargs
+            attempts += 1
+            raise BadRequest("Topic_id_invalid")
+
+    with pytest.raises(BadRequest, match="Topic_id_invalid"):
+        await message_sender.safe_send(
+            _Bot(),
+            chat_id=-1009,
+            text="migration notice",
+            message_thread_id=77,
+            raise_on_failure=True,
+        )
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_safe_edit_logs_outgoing_edit(monkeypatch):
     captured: list[dict[str, object]] = []
 

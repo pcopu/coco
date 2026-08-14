@@ -460,6 +460,7 @@ async def _emit_due_run_watchdog_checks(
     due_checks = get_due_run_checks(
         user_id=user_id,
         thread_id=thread_id,
+        chat_id=chat_id,
         window_id=window_id,
     )
     if not due_checks:
@@ -531,6 +532,7 @@ async def _emit_due_run_watchdog_checks(
         retry_count, retry_limit = note_auto_retry_attempt(
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=window_id,
         )
         if chat_id is None:
@@ -557,6 +559,7 @@ async def _emit_due_run_watchdog_checks(
         note_auto_retry_result(
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=window_id,
             send_success=resend_ok,
         )
@@ -637,6 +640,7 @@ async def _emit_due_run_watchdog_checks(
                 rearm_run_watch_checkpoint(
                     user_id,
                     thread_id,
+                    chat_id=chat_id,
                     window_id=window_id,
                     watch_token=latest.watch_token,
                     checkpoint_seconds=latest.checkpoint_seconds,
@@ -645,6 +649,7 @@ async def _emit_due_run_watchdog_checks(
                 clear_run_watch_state(
                     user_id,
                     thread_id,
+                    chat_id=chat_id,
                     window_id=window_id,
                     watch_token=latest.watch_token,
                 )
@@ -709,6 +714,7 @@ async def _emit_due_looper_prompt(
 
     expired = stop_looper_if_expired(
         user_id=user_id,
+        chat_id=chat_id,
         thread_id=thread_id,
         window_id=window_id,
     )
@@ -736,6 +742,7 @@ async def _emit_due_looper_prompt(
 
     due = claim_due_looper_prompt(
         user_id=user_id,
+        chat_id=chat_id,
         thread_id=thread_id,
         window_id=window_id,
         force=force,
@@ -770,6 +777,7 @@ async def _emit_due_looper_prompt(
             )
             delay_looper_next_prompt(
                 user_id=user_id,
+                chat_id=chat_id,
                 thread_id=thread_id,
                 delay_seconds=60,
             )
@@ -797,6 +805,7 @@ async def _emit_due_looper_prompt(
             )
             delay_looper_next_prompt(
                 user_id=user_id,
+                chat_id=chat_id,
                 thread_id=thread_id,
                 delay_seconds=60,
             )
@@ -832,6 +841,7 @@ async def _emit_due_looper_prompt(
         note_run_started(
             user_id=user_id,
             thread_id=thread_id,
+            chat_id=chat_id,
             window_id=window_id,
             source="looper_tick",
             pending_text=due.prompt_text,
@@ -848,6 +858,7 @@ async def _emit_due_looper_prompt(
 
     delay_looper_next_prompt(
         user_id=user_id,
+        chat_id=chat_id,
         thread_id=thread_id,
         delay_seconds=60,
     )
@@ -937,8 +948,8 @@ async def _emit_due_personality_delivery(
     )
     digest_text = personality.claim_due_personality_delivery(
         user_id=user_id,
-        chat_id=resolved_chat_id,
         thread_id=thread_id,
+        chat_id=chat_id,
     )
     if not digest_text:
         return
@@ -982,8 +993,8 @@ async def _emit_due_autoresearch_delivery(
     )
     digest_text = autoresearch.claim_due_autoresearch_delivery(
         user_id=user_id,
-        chat_id=resolved_chat_id,
         thread_id=thread_id,
+        chat_id=chat_id,
     )
     if not digest_text:
         return
@@ -1066,6 +1077,18 @@ async def _probe_topic_bindings(
             if "Topic_id_invalid" in str(e):
                 _topic_probe_retry_after.pop(key, None)
                 for user_id, chat_id, bound_thread_id, wid in target_bindings:
+                    if session_manager.is_coco_control_topic(
+                        user_id,
+                        bound_thread_id,
+                        chat_id=chat_id,
+                    ):
+                        logger.warning(
+                            "General control topic probe failed; preserving binding "
+                            "for doctor repair (chat=%s window=%s)",
+                            chat_id,
+                            wid,
+                        )
+                        continue
                     # Topic deleted: unbind and clean up state.
                     if chat_id is None:
                         session_manager.unbind_thread(user_id, bound_thread_id)
@@ -1075,7 +1098,15 @@ async def _probe_topic_bindings(
                             bound_thread_id,
                             chat_id=chat_id,
                         )
-                    await clear_topic_state(user_id, bound_thread_id, bot)
+                    if chat_id is None:
+                        await clear_topic_state(user_id, bound_thread_id, bot)
+                    else:
+                        await clear_topic_state(
+                            user_id,
+                            bound_thread_id,
+                            bot,
+                            chat_id=chat_id,
+                        )
                     logger.info(
                         "Topic deleted: unbound window_id '%s' "
                         "for thread %d user %d",
@@ -1137,14 +1168,27 @@ async def status_poll_loop(bot: Bot) -> None:
                     user_id, thread_id, wid = entry
                     bindings.append((user_id, None, thread_id, wid))
             active_topics = {
-                (user_id, thread_id or 0)
-                for user_id, _chat_id, thread_id, _ in bindings
+                (user_id, chat_id or 0, thread_id or 0)
+                for user_id, chat_id, thread_id, _ in bindings
             }
-            pending_delivery_topics: dict[int, set[int]] = {}
-            for user_id, _chat_id, _thread_id, _wid in bindings:
-                if user_id not in pending_delivery_topics:
-                    pending_delivery_topics[user_id] = await get_pending_delivery_topics(user_id)
-            prune_run_watch_topics(active_topics)
+            active_watch_topics = {
+                (user_id, chat_id or 0, thread_id or 0)
+                for user_id, chat_id, thread_id, _ in bindings
+            }
+            pending_delivery_topics: dict[tuple[int, int], set[int]] = {}
+            for user_id, chat_id, _thread_id, _wid in bindings:
+                pending_key = (user_id, chat_id or 0)
+                if pending_key in pending_delivery_topics:
+                    continue
+                if chat_id is None:
+                    pending_delivery_topics[pending_key] = (
+                        await get_pending_delivery_topics(user_id)
+                    )
+                else:
+                    pending_delivery_topics[pending_key] = (
+                        await get_pending_delivery_topics(user_id, chat_id)
+                    )
+            prune_run_watch_topics(active_watch_topics)
             prune_looper_topics(active_topics)
             autoresearch.prune_autoresearch_topics(active_topics)
             personality.prune_personality_topics(active_topics)
@@ -1157,13 +1201,14 @@ async def status_poll_loop(bot: Bot) -> None:
             for user_id, chat_id, thread_id, wid in bindings:
                 try:
                     pending_delivery = (thread_id or 0) in pending_delivery_topics.get(
-                        user_id,
+                        (user_id, chat_id or 0),
                         set(),
                     )
                     if pending_delivery:
                         retry_candidate = get_immediate_auto_retry_candidate(
                             user_id=user_id,
                             thread_id=thread_id,
+                            chat_id=chat_id,
                             window_id=wid,
                         )
                         if (

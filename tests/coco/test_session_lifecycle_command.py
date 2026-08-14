@@ -16,6 +16,30 @@ def _make_update(*, text: str = "/resume", thread_id: int = 77, user_id: int = 1
         effective_chat=chat,
         message=message,
     )
+@pytest.mark.asyncio
+async def test_resume_command_refuses_reserved_general_before_transport(monkeypatch):
+    update = _make_update(thread_id=1)
+    replies: list[str] = []
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
+    monkeypatch.setattr(
+        bot.session_manager, "get_coco_control_topic", lambda _chat: object()
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_window_for_thread",
+        lambda *_args, **_kwargs: pytest.fail("must reject before session lookup"),
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    await bot.resume_command(update, SimpleNamespace(user_data={}))
+    assert replies and "permanent control channel" in replies[0]
+
+
 async def test_resume_command_with_text_args_shows_menu_only_notice(monkeypatch):
     update = _make_update(text="/resume rollback 3")
     replies: list[tuple[str, object | None]] = []

@@ -201,3 +201,128 @@ def test_generate_digest_prefers_external_research_when_configured(tmp_path, mon
     assert digest.message_text == (
         "Hey Morgan, external research says you hate flaky Instagram logins."
     )
+
+
+def test_same_user_thread_in_two_chats_can_each_claim_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(personality, "_local_timezone", lambda _now=None: UTC)
+    memory_path = tmp_path / "TELEGRAM_CHAT_MEMORY.jsonl"
+    _write_memory_entries(
+        memory_path,
+        [
+            {
+                "ts_utc": "2026-03-18T18:00:00+00:00",
+                "direction": "in",
+                "chat_id": -100601,
+                "thread_id": 77,
+                "from_user_id": 12345,
+                "text": "Help me with sales follow-up",
+            },
+            {
+                "ts_utc": "2026-03-18T18:01:00+00:00",
+                "direction": "in",
+                "chat_id": -100602,
+                "thread_id": 77,
+                "from_user_id": 12345,
+                "text": "Help me with deployment handoff",
+            },
+        ],
+    )
+    monkeypatch.setenv("COCO_TELEGRAM_MEMORY_LOG_PATH", str(memory_path))
+
+    first = personality.claim_due_personality_delivery(
+        user_id=12345,
+        chat_id=-100601,
+        thread_id=77,
+        now=datetime(2026, 3, 19, 9, 5, tzinfo=UTC),
+    )
+    second = personality.claim_due_personality_delivery(
+        user_id=12345,
+        chat_id=-100602,
+        thread_id=77,
+        now=datetime(2026, 3, 19, 9, 5, tzinfo=UTC),
+    )
+
+    assert first is not None and "sales" in first.lower()
+    assert second is not None and "deployment" in second.lower()
+
+
+def test_legacy_personality_state_key_loads_into_chat_zero():
+    personality._PERSONALITY_STATE_FILE.write_text(
+        json.dumps({"12345:77": {"last_delivered_for_date": "2026-03-18"}}),
+        encoding="utf-8",
+    )
+
+    personality._load_state()
+    state = personality._personality_state.get((12345, 0, 77))
+
+    assert state is not None
+    assert state.last_delivered_for_date == "2026-03-18"
+
+
+def test_pruning_keeps_active_chat_scope_only():
+    personality._load_state()
+    personality._personality_state[(12345, -100601, 77)] = personality.PersonalityTopicState(
+        last_session_count=1,
+    )
+    personality._personality_state[(12345, -100602, 77)] = personality.PersonalityTopicState(
+        last_session_count=2,
+    )
+
+    personality.prune_personality_topics({(12345, -100601, 77)})
+
+    assert (12345, -100601, 77) in personality._personality_state
+    assert (12345, -100602, 77) not in personality._personality_state
+
+
+def test_pruning_migrates_unique_legacy_state_to_active_chat():
+    personality._PERSONALITY_STATE_FILE.write_text(
+        json.dumps({"12345:77": {"last_delivered_for_date": "2026-03-18"}}),
+        encoding="utf-8",
+    )
+
+    personality.prune_personality_topics({(12345, -100601, 77)})
+
+    assert (12345, -100601, 77) in personality._personality_state
+    assert (12345, 0, 77) not in personality._personality_state
+    persisted = json.loads(personality._PERSONALITY_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["12345:-100601:77"]
+
+
+def test_pruning_discards_superseded_legacy_state_when_scoped_state_exists():
+    personality._PERSONALITY_STATE_FILE.write_text(
+        json.dumps(
+            {
+                "12345:77": {"last_session_count": 1},
+                "12345:-100601:77": {"last_session_count": 9},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    personality.prune_personality_topics({(12345, -100601, 77)})
+
+    state = personality._personality_state.get((12345, -100601, 77))
+    assert state is not None
+    assert state.last_session_count == 9
+    assert (12345, 0, 77) not in personality._personality_state
+    persisted = json.loads(personality._PERSONALITY_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["12345:-100601:77"]
+
+    personality.clear_personality_state(12345, thread_id=77, chat_id=-100601)
+    personality.prune_personality_topics({(12345, -100601, 77)})
+    assert personality._personality_state.get((12345, 0, 77)) is None
+
+
+def test_pruning_retains_ambiguous_legacy_state_without_cross_claiming():
+    personality._PERSONALITY_STATE_FILE.write_text(
+        json.dumps({"12345:77": {"last_delivered_for_date": "2026-03-18"}}),
+        encoding="utf-8",
+    )
+
+    personality.prune_personality_topics({(12345, -100601, 77), (12345, -100602, 77)})
+
+    assert (12345, 0, 77) in personality._personality_state
+    assert (12345, -100601, 77) not in personality._personality_state
+    assert (12345, -100602, 77) not in personality._personality_state
+    persisted = json.loads(personality._PERSONALITY_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["12345:77"]

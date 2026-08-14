@@ -527,6 +527,89 @@ async def test_successful_forwarded_clear_disarms_existing_watch(monkeypatch):
     ) == []
 
 
+@pytest.mark.asyncio
+async def test_admin_clear_routes_watchdog_cleanup_to_general_control_owner(monkeypatch):
+    caller_user_id = 999
+    control_owner_id = 100
+    thread_id = 1
+    window_id = "@control"
+    clear_calls: list[tuple] = []
+    note_calls: list[dict] = []
+    resolve_users: list[int] = []
+
+    async def _send_action(_action):
+        return None
+
+    chat = SimpleNamespace(id=-100123, type="supergroup", send_action=_send_action)
+    message = SimpleNamespace(text="/clear", message_thread_id=thread_id, chat=chat)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_user=SimpleNamespace(id=caller_user_id),
+        effective_message=message,
+        message=message,
+    )
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda uid: uid == caller_user_id)
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(control_owner_id, 1, -100123),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def _resolve_window(user_id, _thread_id, **_kwargs):
+        resolve_users.append(user_id)
+        return window_id
+
+    monkeypatch.setattr(bot.session_manager, "resolve_window_for_thread", _resolve_window)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "resolve_topic_binding",
+        lambda user_id, _thread_id, **_kwargs: (
+            SimpleNamespace(codex_thread_id="thread-control", cwd="/tmp/control")
+            if user_id == control_owner_id
+            else None
+        ),
+    )
+    monkeypatch.setattr(bot.session_manager, "get_display_name", lambda _wid: "control")
+    async def _send_to_window(_wid, _text):
+        return True, "ok"
+
+    monkeypatch.setattr(bot.session_manager, "send_to_window", _send_to_window)
+    monkeypatch.setattr(bot.session_manager, "clear_window_session", lambda _wid: None)
+    monkeypatch.setattr(
+        watchdog,
+        "clear_run_watch_state",
+        lambda *args, **kwargs: clear_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        bot,
+        "note_run_started",
+        lambda **kwargs: note_calls.append(kwargs),
+    )
+
+    async def _safe_reply(_message, _text, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.forward_command_handler(update, SimpleNamespace())
+
+    assert resolve_users == [control_owner_id]
+    assert clear_calls and clear_calls[0][0][0] == control_owner_id
+    assert note_calls and note_calls[0]["user_id"] == control_owner_id
+
+
 def test_clear_run_watch_state_honors_window_ownership():
     watchdog.note_run_started(
         user_id=3,
@@ -608,6 +691,54 @@ def test_completion_after_activity_remains_terminal():
         window_id="@4",
         now=300.0,
     ) == []
+
+
+def test_completion_is_scoped_to_chat_for_general_topics():
+    """General (thread 1) watches in separate groups must not collide."""
+    watchdog.note_run_started(
+        user_id=42,
+        thread_id=1,
+        chat_id=-10042,
+        window_id="@group-a",
+        source="user_input",
+        pending_text="run in group A",
+        expect_response=True,
+        now=0.0,
+    )
+    watchdog.note_run_started(
+        user_id=42,
+        thread_id=1,
+        chat_id=-10043,
+        window_id="@group-b",
+        source="user_input",
+        pending_text="run in group B",
+        expect_response=True,
+        now=0.0,
+    )
+
+    watchdog.note_run_completed(
+        user_id=42,
+        thread_id=1,
+        chat_id=-10042,
+        reason="group_a_done",
+        now=1.0,
+    )
+
+    assert watchdog.get_due_run_checks(
+        user_id=42,
+        thread_id=1,
+        chat_id=-10042,
+        window_id="@group-a",
+        now=30.0,
+    ) == []
+    due_group_b = watchdog.get_due_run_checks(
+        user_id=42,
+        thread_id=1,
+        chat_id=-10043,
+        window_id="@group-b",
+        now=30.0,
+    )
+    assert [item.checkpoint_seconds for item in due_group_b] == [30]
 
 
 def test_transport_uncertainty_suppresses_replay_without_known_turn_id():

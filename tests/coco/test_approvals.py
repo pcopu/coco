@@ -2,10 +2,127 @@
 
 from pathlib import Path
 import shlex
+from types import SimpleNamespace
 
 import pytest
 
 import coco.bot as bot
+from coco.session import SessionManager
+
+
+@pytest.mark.asyncio
+async def test_general_approval_callback_uses_canonical_owner(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot.config, "state_file", tmp_path / "state.json")
+    monkeypatch.setattr(bot.config, "sessions_path", tmp_path / "sessions")
+    manager = SessionManager()
+    manager.set_coco_control_topic(100, 1, chat_id=-100123)
+    state = manager.get_window_state("@42")
+    state.cwd = "/internal/control"
+    manager.bind_thread(100, 1, "@42", chat_id=-100123)
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "session_provider", "codex")
+    monkeypatch.setattr(
+        bot,
+        "_ensure_default_coco_general_control",
+        lambda **_kwargs: None,
+    )
+
+    async def _probe(*_args, **_kwargs):
+        return "/internal/control", True, None
+
+    edits: list[str] = []
+
+    async def _edit(_query, text, **_kwargs):
+        edits.append(text)
+
+    monkeypatch.setattr(bot, "_probe_workspace_write_access_for_window", _probe)
+    monkeypatch.setattr(bot, "safe_edit", _edit)
+    chat = SimpleNamespace(type="supergroup", id=-100123, is_forum=True)
+    message = SimpleNamespace(message_thread_id=1, chat=chat, chat_id=chat.id)
+    answers: list[str] = []
+
+    async def _answer(text, **_kwargs):
+        answers.append(text)
+
+    query = SimpleNamespace(
+        data=bot.CB_APPROVAL_REFRESH,
+        message=message,
+        answer=_answer,
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=chat,
+        effective_user=SimpleNamespace(id=999),
+        effective_message=message,
+    )
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}, bot=object()))
+
+    assert edits
+    assert answers == ["Refreshed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "callback_data",
+    [
+        bot.CB_APPROVAL_REFRESH,
+        bot.CB_APPROVAL_REFRESH_DEFAULT,
+        bot.CB_APPROVAL_SET + bot.APPROVAL_MODE_NEVER,
+        bot.CB_APPROVAL_SET_DEFAULT + bot.APPROVAL_MODE_NEVER,
+    ],
+)
+async def test_general_approval_callback_denies_nonowner_before_resolution(
+    monkeypatch,
+    tmp_path,
+    callback_data,
+):
+    """Approval callbacks must fence the remapped General target before lookup/mutation."""
+    monkeypatch.setattr(bot.config, "state_file", tmp_path / "state.json")
+    monkeypatch.setattr(bot.config, "sessions_path", tmp_path / "sessions")
+    manager = SessionManager()
+    manager.set_coco_control_topic(100, 1, chat_id=-100123)
+    manager.bind_thread(100, 1, "@42", chat_id=-100123)
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    # Keep the existing admin gate open; the target fence is the defense-in-depth check.
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_coco_control_target", lambda **_kwargs: False)
+    monkeypatch.setattr(bot.config, "session_provider", "codex")
+    monkeypatch.setattr(
+        manager,
+        "resolve_window_for_thread",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a denied General approval callback must not resolve the remapped target"
+        ),
+    )
+
+    chat = SimpleNamespace(type="supergroup", id=-100123, is_forum=True)
+    message = SimpleNamespace(message_thread_id=1, chat=chat, chat_id=chat.id)
+    answers: list[str] = []
+
+    async def _answer(text, **_kwargs):
+        answers.append(text)
+
+    query = SimpleNamespace(
+        data=callback_data,
+        message=message,
+        answer=_answer,
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=chat,
+        effective_user=SimpleNamespace(id=999),
+        effective_message=message,
+    )
+
+    await bot.callback_handler(update, SimpleNamespace(user_data={}, bot=object()))
+
+    assert answers == [bot._COCO_CONTROL_PERMISSION_DENIED_TEXT]
 
 
 def test_normalize_approval_mode_aliases():

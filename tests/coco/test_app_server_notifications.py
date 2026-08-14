@@ -2282,6 +2282,402 @@ async def test_interrupted_completion_dispatches_input_queued_after_escape(monke
 
 
 @pytest.mark.asyncio
+async def test_dashboard_interrupt_completion_discards_queue_without_dispatch(monkeypatch):
+    thread_id = "th-dashboard-interrupt"
+    state_key = thread_id
+    discarded: list[tuple[int, int, int | None]] = []
+    docks: list[tuple[int, int, int | None]] = []
+    dispatched: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id=thread_id,
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(
+        bot,
+        "enqueue_progress_clear",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        bot,
+        "clear_queued_topic_inputs",
+        lambda uid, tid, chat_id: discarded.append((uid, tid, chat_id)),
+    )
+
+    async def _clear_dock(_bot, uid, tid, chat_id):
+        docks.append((uid, tid, chat_id))
+
+    async def _dispatch(**kwargs):
+        dispatched.append(kwargs)
+
+    monkeypatch.setattr(bot, "clear_queued_topic_dock", _clear_dock)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch)
+    monkeypatch.setattr(
+        bot,
+        "_discard_queued_on_interrupts",
+        {state_key: "turn-dashboard"},
+        raising=False,
+    )
+    bot._interrupted_codex_threads.add(state_key)
+    bot._interrupted_codex_turns[state_key] = "turn-dashboard"
+    try:
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": thread_id,
+                "turn": {"id": "turn-dashboard", "status": "interrupted"},
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard(state_key)
+        bot._interrupted_codex_turns.pop(state_key, None)
+
+    assert discarded == [(10, 111, -10010)]
+    assert docks == [(10, 111, -10010)]
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_interrupt_completion_is_scoped_to_captured_binding(
+    monkeypatch,
+):
+    """Shared Codex threads retain other bindings and later guidance."""
+    thread_id = "th-dashboard-shared"
+    state_key = thread_id
+    target = (10, -10010, "@1", 111)
+    other = (20, -10020, "@2", 222)
+    discarded: list[tuple[int, int, int | None, int]] = []
+    dispatched: list[tuple[int, int, int | None]] = []
+    refreshed: list[tuple[int, int, int | None]] = []
+    cleared_docks: list[tuple[int, int, int | None]] = []
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [target, other],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [target, other],
+        codex_thread_id=thread_id,
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot,
+        "queued_topic_input_count",
+        lambda uid, tid, chat_id: 1,
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: SimpleNamespace(codex_thread_id=thread_id),
+    )
+    monkeypatch.setattr(
+        bot,
+        "discard_queued_topic_inputs_before_generation",
+        lambda uid, tid, chat_id, *, generation_cutoff: discarded.append(
+            (uid, tid, chat_id, generation_cutoff)
+        )
+        or 1,
+    )
+    monkeypatch.setattr(
+        bot,
+        "enqueue_progress_clear",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    async def _sync_dock(_bot, uid, tid, **kwargs):
+        refreshed.append((uid, tid, kwargs.get("chat_id")))
+
+    async def _clear_dock(_bot, uid, tid, chat_id):
+        cleared_docks.append((uid, tid, chat_id))
+
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot, "clear_queued_topic_dock", _clear_dock)
+
+    async def _dispatch(**kwargs):
+        dispatched.append((kwargs["user_id"], kwargs["thread_id"], kwargs["chat_id"]))
+
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch)
+    bot._discard_queued_on_interrupts[state_key] = bot._DashboardInterruptRecord(
+        turn_id="turn-shared",
+        owner_user_id=target[0],
+        chat_id=target[1],
+        thread_id=target[3],
+        queued_input_generation_cutoff=4,
+        delivery_generation_cutoff=8,
+        committed=True,
+    )
+    bot._interrupted_codex_threads.add(state_key)
+    bot._interrupted_codex_turns[state_key] = "turn-shared"
+    try:
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": thread_id,
+                "turn": {"id": "turn-shared", "status": "interrupted"},
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard(state_key)
+        bot._interrupted_codex_turns.pop(state_key, None)
+        bot._discard_queued_on_interrupts.pop(state_key, None)
+
+    assert discarded == [(target[0], target[3], target[1], 4)]
+    assert dispatched == [
+        (target[0], target[3], target[1]),
+        (other[0], other[3], other[1]),
+    ]
+    assert refreshed == [(target[0], target[3], target[1])]
+    assert cleared_docks == []
+
+
+@pytest.mark.asyncio
+async def test_uncertain_dashboard_interrupt_discards_only_after_confirmed_terminal(
+    monkeypatch,
+):
+    """A lost interrupt reply is reconciled by a later interrupted terminal."""
+    thread_id = "th-dashboard-uncertain"
+    state_key = thread_id
+    discarded: list[tuple[int, int, int | None, int]] = []
+    dispatched: list[dict[str, object]] = []
+    synced: list[tuple[int, int, int | None]] = []
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id=thread_id,
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        bot,
+        "discard_queued_topic_inputs_before_generation",
+        lambda uid, tid, chat_id, *, generation_cutoff: discarded.append(
+            (uid, tid, chat_id, generation_cutoff)
+        )
+        or 1,
+    )
+    monkeypatch.setattr(
+        bot,
+        "enqueue_progress_clear",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    async def _sync_dock(_bot, uid, tid, **kwargs):
+        synced.append((uid, tid, kwargs.get("chat_id")))
+
+    async def _dispatch(**kwargs):
+        dispatched.append(kwargs)
+
+    monkeypatch.setattr(bot, "sync_queued_topic_dock", _sync_dock)
+    monkeypatch.setattr(bot, "clear_queued_topic_dock", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch)
+    monkeypatch.setattr(
+        bot,
+        "_route_app_server_message",
+        lambda message, _bot, **_kwargs: delivered.append(message.text)
+        or asyncio.sleep(0),
+    )
+    bot._discard_queued_on_interrupts[state_key] = bot._DashboardInterruptRecord(
+        turn_id="turn-uncertain",
+        owner_user_id=10,
+        chat_id=-10010,
+        thread_id=111,
+        queued_input_generation_cutoff=4,
+        delivery_generation_cutoff=8,
+        uncertain=True,
+    )
+    bot._interrupted_codex_threads.add(state_key)
+    bot._interrupted_codex_turns[state_key] = "turn-uncertain"
+    try:
+        await bot._handle_codex_app_server_notification(
+            "item/completed",
+            {
+                "threadId": thread_id,
+                "item": {"type": "agentMessage", "text": "must discard"},
+            },
+            bot=object(),
+        )
+        assert delivered == []
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": thread_id,
+                "turn": {"id": "turn-uncertain", "status": "interrupted"},
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard(state_key)
+        bot._interrupted_codex_turns.pop(state_key, None)
+        bot._discard_queued_on_interrupts.pop(state_key, None)
+
+    assert discarded == [(10, 111, -10010, 4)]
+    assert delivered == []
+    assert synced == [(10, 111, -10010)]
+    assert len(dispatched) == 1
+    assert dispatched[0]["thread_id"] == 111
+
+
+@pytest.mark.asyncio
+async def test_uncertain_dashboard_interrupt_releases_queue_on_non_interrupt_terminal(
+    monkeypatch,
+):
+    """A completed terminal proves an uncertain interrupt did not stop the turn."""
+    thread_id = "th-dashboard-uncertain-completed"
+    state_key = thread_id
+    dispatched: list[dict[str, object]] = []
+    finalized: list[tuple[int, int]] = []
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "find_users_for_codex_thread",
+        lambda _thread_id: [(10, -10010, "@1", 111)],
+    )
+    _install_current_topic_owners(
+        monkeypatch,
+        [(10, -10010, "@1", 111)],
+        codex_thread_id=thread_id,
+    )
+    monkeypatch.setattr(bot, "note_run_completed", lambda **_kwargs: None)
+    monkeypatch.setattr(bot, "queued_topic_input_count", lambda *_args, **_kwargs: 2)
+
+    async def _enqueue_finalize(_bot, uid, window_id, thread_id=None, *, compact=False, chat_id=None):
+        finalized.append((uid, thread_id))
+
+    async def _dispatch(**kwargs):
+        dispatched.append(kwargs)
+
+    async def _enqueue_content(**_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "enqueue_progress_finalize", _enqueue_finalize)
+    monkeypatch.setattr(bot, "enqueue_content_message", _enqueue_content)
+    monkeypatch.setattr(bot, "_dispatch_next_queued_input", _dispatch)
+    monkeypatch.setattr(
+        bot,
+        "_route_app_server_message",
+        lambda message, _bot, **_kwargs: delivered.append(message.text)
+        or asyncio.sleep(0),
+    )
+    bot._discard_queued_on_interrupts[state_key] = bot._DashboardInterruptRecord(
+        turn_id="turn-uncertain-completed",
+        owner_user_id=10,
+        chat_id=-10010,
+        thread_id=111,
+        queued_input_generation_cutoff=4,
+        delivery_generation_cutoff=8,
+        uncertain=True,
+    )
+    bot._interrupted_codex_threads.add(state_key)
+    bot._interrupted_codex_turns[state_key] = "turn-uncertain-completed"
+    try:
+        await bot._handle_codex_app_server_notification(
+            "item/completed",
+            {
+                "threadId": thread_id,
+                "item": {"type": "agentMessage", "text": "natural final"},
+            },
+            bot=object(),
+        )
+        assert delivered == []
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": thread_id,
+                "turn": {"id": "turn-uncertain-completed", "status": "completed"},
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard(state_key)
+        bot._interrupted_codex_turns.pop(state_key, None)
+        bot._discard_queued_on_interrupts.pop(state_key, None)
+        bot._turn_has_final_text.pop(state_key, None)
+
+    assert finalized == [(10, 111)]
+    assert delivered == ["natural final"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["thread_id"] == 111
+
+
+@pytest.mark.asyncio
+async def test_uncertain_dashboard_interrupt_ignores_unmatched_terminal(
+    monkeypatch,
+):
+    """A terminal for another turn cannot resolve an uncertain interrupt."""
+    thread_id = "th-dashboard-uncertain-unmatched"
+    state_key = thread_id
+    record = bot._DashboardInterruptRecord(
+        turn_id="turn-uncertain",
+        owner_user_id=10,
+        chat_id=-10010,
+        thread_id=111,
+        queued_input_generation_cutoff=4,
+        delivery_generation_cutoff=8,
+        uncertain=True,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_codex_turn_for_thread",
+        lambda *_args, **_kwargs: None,
+    )
+    bot._discard_queued_on_interrupts[state_key] = record
+    bot._interrupted_codex_threads.add(state_key)
+    bot._interrupted_codex_turns[state_key] = record.turn_id
+    try:
+        await bot._handle_codex_app_server_notification(
+            "turn/completed",
+            {
+                "threadId": thread_id,
+                "turn": {"id": "another-turn", "status": "completed"},
+            },
+            bot=object(),
+        )
+    finally:
+        bot._interrupted_codex_threads.discard(state_key)
+        bot._interrupted_codex_turns.pop(state_key, None)
+        bot._discard_queued_on_interrupts.pop(state_key, None)
+
+    assert record.terminal_seen is False
+    assert record.terminal_status == ""
+    assert record.uncertain is True
+
+
+@pytest.mark.asyncio
 async def test_raw_response_image_generation_routes_image_output(monkeypatch):
     handled = []
 

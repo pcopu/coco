@@ -162,6 +162,7 @@ def test_run_now_generates_digest_and_marks_delivery(tmp_path, monkeypatch):
 
     autoresearch.set_autoresearch_outcome(
         user_id=12345,
+        chat_id=-100321,
         thread_id=77,
         outcome="Close more inbound leads",
     )
@@ -175,9 +176,188 @@ def test_run_now_generates_digest_and_marks_delivery(tmp_path, monkeypatch):
         now=datetime(2026, 3, 19, 8, 0, tzinfo=UTC),
     )
 
-    state = autoresearch.get_autoresearch_state(user_id=12345, thread_id=77)
+    state = autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100321,
+        thread_id=77,
+    )
     assert digest_text is not None
     assert "Close more inbound leads" in digest_text
     assert state is not None
     assert state.last_researched_for_date == "2026-03-18"
     assert state.last_delivered_for_date == "2026-03-18"
+
+
+def test_same_user_thread_in_two_chats_can_each_claim_delivery(tmp_path, monkeypatch):
+    memory_path = tmp_path / "TELEGRAM_CHAT_MEMORY.jsonl"
+    _write_memory_entries(
+        memory_path,
+        [
+            {
+                "ts_utc": "2026-03-18T18:00:00+00:00",
+                "direction": "in",
+                "chat_id": -100501,
+                "thread_id": 77,
+                "from_user_id": 12345,
+                "text": "Help me close more leads",
+            },
+            {
+                "ts_utc": "2026-03-18T18:00:00+00:00",
+                "direction": "in",
+                "chat_id": -100502,
+                "thread_id": 77,
+                "from_user_id": 12345,
+                "text": "Help me ship more releases",
+            },
+        ],
+    )
+    monkeypatch.setenv("COCO_TELEGRAM_MEMORY_LOG_PATH", str(memory_path))
+    monkeypatch.setattr(autoresearch._personality, "_local_timezone", lambda _now=None: UTC)
+
+    autoresearch.set_autoresearch_outcome(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+        outcome="Close more leads",
+    )
+    autoresearch.set_autoresearch_outcome(
+        user_id=12345,
+        chat_id=-100502,
+        thread_id=77,
+        outcome="Ship more releases",
+    )
+
+    first = autoresearch.claim_due_autoresearch_delivery(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+        now=datetime(2026, 3, 19, 9, 5, tzinfo=UTC),
+    )
+    second = autoresearch.claim_due_autoresearch_delivery(
+        user_id=12345,
+        chat_id=-100502,
+        thread_id=77,
+        now=datetime(2026, 3, 19, 9, 5, tzinfo=UTC),
+    )
+
+    assert first is not None and "Close more leads" in first
+    assert second is not None and "Ship more releases" in second
+
+
+def test_legacy_autoresearch_state_key_loads_into_chat_zero():
+    autoresearch._AUTORESEARCH_STATE_FILE.write_text(
+        json.dumps({"12345:77": {"outcome": "legacy outcome"}}),
+        encoding="utf-8",
+    )
+
+    state = autoresearch.get_autoresearch_state(user_id=12345, thread_id=77)
+
+    assert state is not None
+    assert state.outcome == "legacy outcome"
+    assert autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+    ) is None
+
+
+def test_pruning_keeps_active_chat_scope_only():
+    autoresearch.set_autoresearch_outcome(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+        outcome="goal a",
+    )
+    autoresearch.set_autoresearch_outcome(
+        user_id=12345,
+        chat_id=-100502,
+        thread_id=77,
+        outcome="goal b",
+    )
+
+    autoresearch.prune_autoresearch_topics({(12345, -100501, 77)})
+
+    assert autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+    ) is not None
+    assert autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100502,
+        thread_id=77,
+    ) is None
+
+
+def test_pruning_migrates_unique_legacy_state_to_active_chat():
+    autoresearch._AUTORESEARCH_STATE_FILE.write_text(
+        json.dumps({"12345:77": {"outcome": "legacy outcome"}}),
+        encoding="utf-8",
+    )
+
+    autoresearch.prune_autoresearch_topics({(12345, -100501, 77)})
+
+    state = autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+    )
+    assert state is not None
+    assert state.outcome == "legacy outcome"
+    assert autoresearch.get_autoresearch_state(user_id=12345, thread_id=77) is None
+    persisted = json.loads(autoresearch._AUTORESEARCH_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["12345:-100501:77"]
+
+
+def test_pruning_discards_superseded_legacy_state_when_scoped_state_exists():
+    autoresearch._AUTORESEARCH_STATE_FILE.write_text(
+        json.dumps(
+            {
+                "12345:77": {"outcome": "legacy outcome"},
+                "12345:-100501:77": {"outcome": "authoritative outcome"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    autoresearch.prune_autoresearch_topics({(12345, -100501, 77)})
+
+    state = autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+    )
+    assert state is not None
+    assert state.outcome == "authoritative outcome"
+    assert autoresearch.get_autoresearch_state(user_id=12345, thread_id=77) is None
+    persisted = json.loads(autoresearch._AUTORESEARCH_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["12345:-100501:77"]
+
+    autoresearch.clear_autoresearch_state(12345, thread_id=77, chat_id=-100501)
+    autoresearch.prune_autoresearch_topics({(12345, -100501, 77)})
+    assert autoresearch.get_autoresearch_state(user_id=12345, thread_id=77) is None
+
+
+def test_pruning_retains_ambiguous_legacy_state_without_cross_claiming():
+    autoresearch._AUTORESEARCH_STATE_FILE.write_text(
+        json.dumps({"12345:77": {"outcome": "legacy outcome"}}),
+        encoding="utf-8",
+    )
+
+    autoresearch.prune_autoresearch_topics({(12345, -100501, 77), (12345, -100502, 77)})
+
+    state = autoresearch.get_autoresearch_state(user_id=12345, thread_id=77)
+    assert state is not None
+    assert state.outcome == "legacy outcome"
+    assert autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100501,
+        thread_id=77,
+    ) is None
+    assert autoresearch.get_autoresearch_state(
+        user_id=12345,
+        chat_id=-100502,
+        thread_id=77,
+    ) is None
+    persisted = json.loads(autoresearch._AUTORESEARCH_STATE_FILE.read_text(encoding="utf-8"))
+    assert list(persisted) == ["12345:77"]

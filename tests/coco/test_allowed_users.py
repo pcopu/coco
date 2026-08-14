@@ -8,6 +8,7 @@ import pytest
 import coco.bot as bot
 from coco.handlers import commands
 from coco.handlers.callback_data import CB_ALLOWED_REMOVE
+from coco.session import SessionManager
 
 
 def test_parse_allowed_add_input():
@@ -219,9 +220,15 @@ class _FakeQuery:
         self.answers.append((text, show_alert))
 
 
-def _make_callback_update(data: str, *, user_id: int = 1):
-    chat = SimpleNamespace(type="supergroup", id=-1001)
-    message = SimpleNamespace(message_thread_id=77, chat=chat)
+def _make_callback_update(
+    data: str,
+    *,
+    user_id: int = 1,
+    chat_id: int = -1001,
+    thread_id: int = 77,
+):
+    chat = SimpleNamespace(type="supergroup", id=chat_id)
+    message = SimpleNamespace(message_thread_id=thread_id, chat=chat)
     query = _FakeQuery(data=data, message=message)
     update = SimpleNamespace(
         callback_query=query,
@@ -363,6 +370,113 @@ async def test_allowed_batch_role_callback_queues_single_token(monkeypatch):
     assert all(t.scope == bot.SCOPE_CREATE_SESSIONS for t in queued_targets)
     assert edits
     assert edits[-1][0] == "overview"
+
+
+@pytest.mark.asyncio
+async def test_general_allowed_add_callback_attributes_request_to_authenticated_actor(
+    monkeypatch,
+):
+    owner_user_id = 100
+    actor_user_id = 200
+    target_user_id = 300
+    chat_id = -100321
+    manager = SessionManager()
+    manager.set_coco_control_topic(owner_user_id, bot.GENERAL_TOPIC_THREAD_ID, chat_id=chat_id)
+    monkeypatch.setattr(bot, "session_manager", manager)
+    update, query = _make_callback_update(
+        bot.CB_ALLOWED_ADD_CREATE,
+        user_id=actor_user_id,
+        chat_id=chat_id,
+        thread_id=bot.GENERAL_TOPIC_THREAD_ID,
+    )
+    context = SimpleNamespace(
+        bot=object(),
+        user_data={
+            bot.STATE_KEY: bot.STATE_ALLOWED_PICK_ROLE,
+            bot.ALLOWED_PICK_CHAT_KEY: chat_id,
+            bot.ALLOWED_PICK_SELECTED_IDS_KEY: [target_user_id],
+            bot.ALLOWED_PICK_THREAD_KEY: bot.GENERAL_TOPIC_THREAD_ID,
+            bot.ALLOWED_PICK_WINDOW_KEY: "@control",
+        },
+    )
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda uid: uid == actor_user_id)
+    monkeypatch.setattr(
+        manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "_group_member_candidates",
+        lambda _chat_id: [(target_user_id, "Target")],
+    )
+
+    async def _notify(**_kwargs):
+        return (1, 1)
+
+    monkeypatch.setattr(bot, "_notify_allowed_auth_token", _notify)
+
+    async def _safe_edit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+    original_allowed = set(bot.config.allowed_users)
+    bot.config.allowed_users = {owner_user_id, actor_user_id}
+    try:
+        await bot.callback_handler(update, context)
+        assert bot._PENDING_ALLOWED_AUTH_REQUESTS
+        request = next(iter(bot._PENDING_ALLOWED_AUTH_REQUESTS.values()))
+        assert request.requested_by == actor_user_id
+    finally:
+        bot.config.allowed_users = original_allowed
+        bot._PENDING_ALLOWED_AUTH_REQUESTS.clear()
+
+
+@pytest.mark.asyncio
+async def test_general_allowed_remove_callback_blocks_authenticated_actor_self_removal(
+    monkeypatch,
+):
+    owner_user_id = 100
+    actor_user_id = 200
+    chat_id = -100322
+    manager = SessionManager()
+    manager.set_coco_control_topic(owner_user_id, bot.GENERAL_TOPIC_THREAD_ID, chat_id=chat_id)
+    monkeypatch.setattr(bot, "session_manager", manager)
+    update, query = _make_callback_update(
+        f"{bot.CB_ALLOWED_REMOVE}{actor_user_id}",
+        user_id=actor_user_id,
+        chat_id=chat_id,
+        thread_id=bot.GENERAL_TOPIC_THREAD_ID,
+    )
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "_is_admin_user", lambda uid: uid == actor_user_id)
+    monkeypatch.setattr(
+        manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bot, "_build_allowed_remove_text", lambda _uid: "remove")
+    monkeypatch.setattr(bot, "_build_allowed_remove_keyboard", lambda _uid: "keyboard")
+
+    async def _safe_edit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+    original_allowed = set(bot.config.allowed_users)
+    bot.config.allowed_users = {owner_user_id, actor_user_id}
+    bot._PENDING_ALLOWED_AUTH_REQUESTS.clear()
+    try:
+        await bot.callback_handler(update, SimpleNamespace(bot=object(), user_data={}))
+        assert query.answers
+        assert "cannot remove your own" in str(query.answers[-1][0]).lower()
+        assert not bot._PENDING_ALLOWED_AUTH_REQUESTS
+    finally:
+        bot.config.allowed_users = original_allowed
+        bot._PENDING_ALLOWED_AUTH_REQUESTS.clear()
 
 
 @pytest.mark.asyncio

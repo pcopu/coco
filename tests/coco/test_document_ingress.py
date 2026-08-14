@@ -11,6 +11,11 @@ from telegram.constants import ChatAction
 
 import coco.bot as bot
 
+_REMOTE_ATTACHMENT_REJECTION_TEXT = (
+    "❌ Attachments to remote sessions are not supported yet. "
+    "Send this attachment in a local topic."
+)
+
 
 class _FakeChat:
     type = "supergroup"
@@ -435,6 +440,122 @@ async def test_document_handler_rejects_unsupported_document(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_document_handler_rejects_unconfigured_general_before_download(
+    monkeypatch,
+    tmp_path,
+):
+    update, tg_file = _make_document_update(
+        file_name="brief.md",
+        mime_type="text/markdown",
+    )
+    update.message.message_thread_id = 1
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+    routing_users: list[int] = []
+
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda uid, *_args, **_kwargs: routing_users.append(uid),
+    )
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.document_handler(update, context)
+
+    assert tg_file.paths == []
+    assert replies == [bot._COCO_CONTROL_UNCONFIGURED_TEXT]
+    assert routing_users == []
+
+
+def _install_remote_general_attachment_routing(monkeypatch, *, owner_user_id: int):
+    """Route one attachment update to a remote General control binding."""
+    remote_ownership = bot.TopicOwnership(
+        window_id="@remote-general",
+        codex_thread_id="codex-remote-general",
+        machine_id="remote-node",
+        cwd="/remote/workspace",
+    )
+    chat_id = -100123
+    monkeypatch.setattr(bot, "_is_admin_user", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_coco_control_target", lambda **_kwargs: True)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(owner_user_id, 1, chat_id),
+    )
+    monkeypatch.setattr(bot, "capture_topic_ownership", lambda *_args, **_kwargs: remote_ownership)
+    monkeypatch.setattr(bot, "_local_machine_identity", lambda: ("controller-node", "Controller"))
+    return remote_ownership
+
+
+@pytest.mark.asyncio
+async def test_document_handler_rejects_remote_general_before_download(monkeypatch, tmp_path):
+    update, _tg_file = _make_document_update(
+        file_name="brief.pdf",
+        mime_type="application/pdf",
+    )
+    update.message.message_thread_id = 1
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+
+    _install_remote_general_attachment_routing(monkeypatch, owner_user_id=1147817421)
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.document_handler(update, context)
+
+    assert _tg_file.paths == []
+    assert replies == [_REMOTE_ATTACHMENT_REJECTION_TEXT]
+
+
+@pytest.mark.asyncio
+async def test_archive_handler_rejects_remote_general_before_download(monkeypatch, tmp_path):
+    update, _tg_file = _make_document_update(
+        file_name="bundle.zip",
+        mime_type="application/zip",
+    )
+    update.message.message_thread_id = 1
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+
+    _install_remote_general_attachment_routing(monkeypatch, owner_user_id=1147817421)
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.document_handler(update, context)
+
+    assert _tg_file.paths == []
+    assert replies == [_REMOTE_ATTACHMENT_REJECTION_TEXT]
+
+
+@pytest.mark.asyncio
 async def test_video_handler_downloads_video_and_forwards_topic_text(monkeypatch, tmp_path):
     update, tg_file = _make_video_update(
         file_name="clip.mp4",
@@ -492,3 +613,577 @@ async def test_video_handler_downloads_video_and_forwards_topic_text(monkeypatch
     assert forwarded[0]["chat_id"] == -100123
     assert "Please review this" in forwarded[0]["text"]
     assert str(saved_path) in forwarded[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_video_handler_rejects_unconfigured_general_before_download(
+    monkeypatch,
+    tmp_path,
+):
+    update, tg_file = _make_video_update(
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+    )
+    update.message.message_thread_id = 1
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+    routing_users: list[int] = []
+
+    monkeypatch.setattr(bot, "_VIDEOS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda uid, *_args, **_kwargs: routing_users.append(uid),
+    )
+
+    async def _reply(_message, text, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _reply)
+
+    await bot.video_handler(update, context)
+
+    assert tg_file.paths == []
+    assert replies == [bot._COCO_CONTROL_UNCONFIGURED_TEXT]
+    assert routing_users == []
+
+
+@pytest.mark.asyncio
+async def test_video_handler_rejects_remote_general_before_download(monkeypatch, tmp_path):
+    update, _tg_file = _make_video_update(
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+    )
+    update.message.message_thread_id = 1
+    context = SimpleNamespace(bot=object(), user_data={})
+    replies: list[str] = []
+
+    _install_remote_general_attachment_routing(monkeypatch, owner_user_id=1147817421)
+    monkeypatch.setattr(bot, "_VIDEOS_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.video_handler(update, context)
+
+    assert _tg_file.paths == []
+    assert replies == [_REMOTE_ATTACHMENT_REJECTION_TEXT]
+
+
+_PENDING_STEER_CALLER_ID = 1147817421
+_PENDING_STEER_CONTROL_OWNER_ID = 9001
+
+
+def _pending_dashboard_steer_context(
+    *,
+    owner_user_id: int = _PENDING_STEER_CALLER_ID,
+    thread_id: int = 77,
+    machine_id: str = "controller-node",
+    window_id: str = "@target",
+    created_at: float | None = None,
+):
+    return SimpleNamespace(
+        bot=object(),
+        user_data={
+            "_coco_dashboard_steer": {
+                "owner_user_id": owner_user_id,
+                "chat_id": -100123,
+                "thread_id": thread_id,
+                "created_at": (
+                    bot.time.monotonic() if created_at is None else created_at
+                ),
+                "ownership": {
+                    "window_id": window_id,
+                    "codex_thread_id": "codex-target",
+                    "machine_id": machine_id,
+                    "cwd": "/target/workspace",
+                },
+            }
+        },
+    )
+
+
+def _install_pending_dashboard_attachment_routing(
+    monkeypatch,
+    *,
+    context,
+    control_owner_user_id: int,
+    canonical_ownership: bot.TopicOwnership,
+):
+    """Install General control state while retaining a pending target steer."""
+    monkeypatch.setattr(bot, "_ensure_default_coco_general_control", lambda **_kwargs: None)
+    monkeypatch.setattr(bot.session_manager, "set_group_chat_id", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_coco_control_topic",
+        lambda _chat_id: bot.CocoControlTopic(
+            control_owner_user_id,
+            bot.GENERAL_TOPIC_THREAD_ID,
+            -100123,
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_can_coco_control_target",
+        lambda *, caller_user_id, target_user_id, **_kwargs: int(caller_user_id)
+        == int(target_user_id),
+    )
+    monkeypatch.setattr(
+        bot,
+        "capture_topic_ownership",
+        lambda *_args, **_kwargs: canonical_ownership,
+    )
+    monkeypatch.setattr(
+        bot,
+        "is_topic_ownership_current",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        bot,
+        "_local_machine_identity",
+        lambda: ("controller-node", "Controller"),
+    )
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    return context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_name", "mime_type"),
+    [
+        ("brief.pdf", "application/pdf"),
+        ("bundle.zip", "application/zip"),
+        ("image.png", "image/png"),
+        ("meditation.wav", "audio/wav"),
+        ("clip.mp4", "video/mp4"),
+    ],
+)
+async def test_document_handler_pending_steer_uses_caller_owned_local_target(
+    monkeypatch,
+    tmp_path,
+    file_name,
+    mime_type,
+):
+    """A General attachment can steer the caller's topic despite another owner."""
+    update, tg_file = _make_document_update(
+        file_name=file_name,
+        mime_type=mime_type,
+        caption="Use this target",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    if file_name.endswith(".zip"):
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w") as archive:
+            archive.writestr("report/data.txt", "hello")
+        tg_file.payload = archive_buffer.getvalue()
+    context = _pending_dashboard_steer_context()
+    canonical_ownership = bot.TopicOwnership(
+        window_id="@remote-general",
+        codex_thread_id="codex-general",
+        machine_id="remote-node",
+        cwd="/remote/workspace",
+    )
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CONTROL_OWNER_ID,
+        canonical_ownership=canonical_ownership,
+    )
+    forwarded: list[dict[str, object]] = []
+    replies: list[str] = []
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.document_handler(update, context)
+
+    assert tg_file.paths
+    assert replies == []
+    assert len(forwarded) == 1
+    assert forwarded[0]["user_id"] == _PENDING_STEER_CALLER_ID
+    assert forwarded[0]["thread_id"] == 77
+    assert forwarded[0]["pending_steer_target"].thread_id == 77
+    assert forwarded[0]["pending_steer_target"].owner_user_id == _PENDING_STEER_CALLER_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_name", "mime_type"),
+    [
+        ("brief.pdf", "application/pdf"),
+        ("bundle.zip", "application/zip"),
+        ("image.png", "image/png"),
+        ("meditation.wav", "audio/wav"),
+        ("clip.mp4", "video/mp4"),
+    ],
+)
+async def test_document_handler_pending_steer_rejects_remote_target_before_download(
+    monkeypatch,
+    tmp_path,
+    file_name,
+    mime_type,
+):
+    """A pending steer must reject a caller-owned target on another machine."""
+    update, tg_file = _make_document_update(
+        file_name=file_name,
+        mime_type=mime_type,
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context(machine_id="remote-node")
+    canonical_ownership = bot.TopicOwnership(
+        window_id="@general",
+        codex_thread_id="codex-general",
+        machine_id="controller-node",
+        cwd="/controller/workspace",
+    )
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CALLER_ID,
+        canonical_ownership=canonical_ownership,
+    )
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.document_handler(update, context)
+
+    assert tg_file.paths == []
+    assert forwarded == []
+    assert replies == [_REMOTE_ATTACHMENT_REJECTION_TEXT]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_video_handler_pending_steer_uses_caller_owned_local_target(
+    monkeypatch,
+    tmp_path,
+):
+    """A General video can steer the caller's local topic despite another owner."""
+    update, tg_file = _make_video_update(
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+        caption="Use this target",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context()
+    canonical_ownership = bot.TopicOwnership(
+        window_id="@remote-general",
+        codex_thread_id="codex-general",
+        machine_id="remote-node",
+        cwd="/remote/workspace",
+    )
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CONTROL_OWNER_ID,
+        canonical_ownership=canonical_ownership,
+    )
+    forwarded: list[dict[str, object]] = []
+    replies: list[str] = []
+    monkeypatch.setattr(bot, "_VIDEOS_DIR", tmp_path, raising=False)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.video_handler(update, context)
+
+    assert tg_file.paths
+    assert replies == []
+    assert len(forwarded) == 1
+    assert forwarded[0]["user_id"] == _PENDING_STEER_CALLER_ID
+    assert forwarded[0]["thread_id"] == 77
+    assert forwarded[0]["pending_steer_target"].thread_id == 77
+    assert forwarded[0]["pending_steer_target"].owner_user_id == _PENDING_STEER_CALLER_ID
+
+
+@pytest.mark.asyncio
+async def test_video_handler_pending_steer_rejects_remote_target_before_download(
+    monkeypatch,
+    tmp_path,
+):
+    """A pending steer must reject a remote video before downloading it."""
+    update, tg_file = _make_video_update(
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context(machine_id="remote-node")
+    canonical_ownership = bot.TopicOwnership(
+        window_id="@general",
+        codex_thread_id="codex-general",
+        machine_id="controller-node",
+        cwd="/controller/workspace",
+    )
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CALLER_ID,
+        canonical_ownership=canonical_ownership,
+    )
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+    monkeypatch.setattr(bot, "_VIDEOS_DIR", tmp_path, raising=False)
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.video_handler(update, context)
+
+    assert tg_file.paths == []
+    assert forwarded == []
+    assert replies == [_REMOTE_ATTACHMENT_REJECTION_TEXT]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_at", "ownership_current", "expected_reply"),
+    [
+        (
+            bot.time.monotonic() - bot._COCO_DASHBOARD_STEER_TTL_SECONDS - 1,
+            True,
+            bot._COCO_DASHBOARD_STEER_EXPIRED_TEXT,
+        ),
+        (
+            bot.time.monotonic(),
+            False,
+            "❌ That dashboard target changed. Refresh /coco and try again.",
+        ),
+    ],
+)
+async def test_document_handler_pending_steer_stale_or_expired_fails_closed_before_download(
+    monkeypatch,
+    tmp_path,
+    created_at,
+    ownership_current,
+    expected_reply,
+):
+    """Matching stale/expired document steers are consumed before download."""
+    update, tg_file = _make_document_update(
+        file_name="brief.pdf",
+        mime_type="application/pdf",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context(created_at=created_at)
+    canonical_ownership = bot.TopicOwnership(
+        window_id="@general",
+        codex_thread_id="codex-general",
+        machine_id="controller-node",
+        cwd="/controller/workspace",
+    )
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CALLER_ID,
+        canonical_ownership=canonical_ownership,
+    )
+    monkeypatch.setattr(
+        bot,
+        "is_topic_ownership_current",
+        lambda *_args, **_kwargs: ownership_current,
+    )
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.document_handler(update, context)
+
+    assert tg_file.paths == []
+    assert forwarded == []
+    assert replies == [expected_reply]
+    assert "_coco_dashboard_steer" not in context.user_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["get_file", "download"])
+async def test_document_handler_pending_steer_consumes_before_download_failure(
+    monkeypatch,
+    tmp_path,
+    failure_stage,
+):
+    """A failed Telegram document attempt cannot arm the next General text."""
+    update, tg_file = _make_document_update(
+        file_name="brief.pdf",
+        mime_type="application/pdf",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context()
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CONTROL_OWNER_ID,
+        canonical_ownership=bot.TopicOwnership(
+            window_id="@general",
+            codex_thread_id="codex-general",
+            machine_id="controller-node",
+            cwd="/controller/workspace",
+        ),
+    )
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    replies: list[str] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    if failure_stage == "get_file":
+        async def _fail_get_file():
+            raise RuntimeError("Telegram get_file failed")
+
+        update.message.document.get_file = _fail_get_file
+    else:
+        async def _fail_download(_path):
+            raise RuntimeError("Telegram download failed")
+
+        tg_file.download_to_drive = _fail_download
+
+    with pytest.raises(RuntimeError, match="Telegram"):
+        await bot.document_handler(update, context)
+
+    assert "_coco_dashboard_steer" not in context.user_data
+    assert replies == []
+
+
+@pytest.mark.asyncio
+async def test_document_handler_pending_steer_consumes_before_archive_extraction_failure(
+    monkeypatch,
+    tmp_path,
+):
+    """A valid archive steer is consumed before fallible extraction."""
+    update, tg_file = _make_document_update(
+        file_name="bundle.zip",
+        mime_type="application/zip",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    tg_file.payload = b"not a zip archive"
+    context = _pending_dashboard_steer_context()
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CONTROL_OWNER_ID,
+        canonical_ownership=bot.TopicOwnership(
+            window_id="@general",
+            codex_thread_id="codex-general",
+            machine_id="controller-node",
+            cwd="/controller/workspace",
+        ),
+    )
+    monkeypatch.setattr(bot, "_DOCUMENTS_DIR", tmp_path, raising=False)
+    replies: list[str] = []
+    forwarded: list[dict[str, object]] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    async def _forward_topic_text_message(**kwargs):
+        forwarded.append(kwargs)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    monkeypatch.setattr(bot, "_forward_topic_text_message", _forward_topic_text_message)
+
+    await bot.document_handler(update, context)
+
+    assert "_coco_dashboard_steer" not in context.user_data
+    assert forwarded == []
+    assert replies and replies[0].startswith("❌ Archive extraction failed:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["get_file", "download"])
+async def test_video_handler_pending_steer_consumes_before_download_failure(
+    monkeypatch,
+    tmp_path,
+    failure_stage,
+):
+    """A failed Telegram video attempt cannot arm the next General text."""
+    update, tg_file = _make_video_update(
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+    )
+    update.message.message_thread_id = bot.GENERAL_TOPIC_THREAD_ID
+    context = _pending_dashboard_steer_context()
+    _install_pending_dashboard_attachment_routing(
+        monkeypatch,
+        context=context,
+        control_owner_user_id=_PENDING_STEER_CONTROL_OWNER_ID,
+        canonical_ownership=bot.TopicOwnership(
+            window_id="@general",
+            codex_thread_id="codex-general",
+            machine_id="controller-node",
+            cwd="/controller/workspace",
+        ),
+    )
+    monkeypatch.setattr(bot, "_VIDEOS_DIR", tmp_path, raising=False)
+    replies: list[str] = []
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+    if failure_stage == "get_file":
+        async def _fail_get_file():
+            raise RuntimeError("Telegram get_file failed")
+
+        update.message.video.get_file = _fail_get_file
+    else:
+        async def _fail_download(_path):
+            raise RuntimeError("Telegram download failed")
+
+        tg_file.download_to_drive = _fail_download
+
+    with pytest.raises(RuntimeError, match="Telegram"):
+        await bot.video_handler(update, context)
+
+    assert "_coco_dashboard_steer" not in context.user_data
+    assert replies == []

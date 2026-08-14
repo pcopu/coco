@@ -20,6 +20,7 @@ Key methods for thread binding access:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -82,9 +83,38 @@ class TopicSendDispatchState:
     """
 
     transport_dispatch_started: bool = False
+    # The transport may receive ``steer=True`` while no active turn remains;
+    # in that case the app-server path deliberately starts a new turn.  Keep
+    # that resolved mode alongside the write-boundary marker so callers can
+    # initialize pending-response tracking for the fallback turn.
+    dispatch_mode: str = ""
+    started_new_turn: bool = False
+    # Internal capture states (used by remote-agent snapshots) do not need a
+    # caller's write-boundary callback; explicit caller states keep it enabled.
+    notify_transport_dispatch: bool = True
 
     def mark_transport_dispatch_started(self) -> None:
         self.transport_dispatch_started = True
+
+    def mark_turn_started(self) -> None:
+        """Record a successful ``turn/start`` dispatch."""
+        self.transport_dispatch_started = True
+        self.dispatch_mode = "turn_start"
+        self.started_new_turn = True
+
+    def mark_turn_steered(self) -> None:
+        """Record a successful ``turn/steer`` dispatch."""
+        self.transport_dispatch_started = True
+        self.dispatch_mode = "turn_steer"
+        self.started_new_turn = False
+
+    def mark_dispatch_mode(self, mode: object) -> None:
+        """Apply a transport-reported dispatch mode, if recognized."""
+        normalized = str(mode or "").strip().lower()
+        if normalized == "turn_start":
+            self.mark_turn_started()
+        elif normalized == "turn_steer":
+            self.mark_turn_steered()
 
 
 @dataclass(frozen=True)
@@ -129,7 +159,7 @@ GOAL_CONTEXT_TRIGGER_RE = re.compile(
     r"(^|\s|[`'\"(])(?:/goal(?![\w-])|goal(?![\w-])|objective(?![\w-]))",
     re.IGNORECASE,
 )
-STATE_SCHEMA_VERSION = 6
+STATE_SCHEMA_VERSION = 8
 TOPIC_BINDING_TRANSPORT_WINDOW = "window"
 TOPIC_BINDING_TRANSPORT_CODEX_THREAD = "codex_thread"
 TOPIC_SYNC_MODE_TELEGRAM_LIVE = "telegram_live"
@@ -405,7 +435,7 @@ class TopicBinding:
 
 @dataclass
 class CocoControlTopic:
-    """Singleton CoCo control-topic assignment."""
+    """One group's immutable General control-topic assignment."""
 
     user_id: int
     thread_id: int
@@ -435,13 +465,65 @@ class CocoControlTopic:
 
 @dataclass(frozen=True)
 class CocoControlMigration:
-    """Persisted result of moving the singleton control topic to General."""
+    """Persisted result of moving one group's control topic to General."""
 
     user_id: int
     chat_id: int
     previous_thread_id: int
     general_thread_id: int
     moved_history: bool
+    conflict: bool = False
+
+
+@dataclass
+class CocoControlNotice:
+    """Durable Telegram notice emitted by a General-control migration."""
+
+    notice_id: str
+    chat_id: int
+    thread_id: int
+    text: str
+    attempts: int = 0
+    last_error: str = ""
+    next_attempt_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "notice_id": self.notice_id,
+            "chat_id": self.chat_id,
+            "thread_id": self.thread_id,
+            "text": self.text,
+            "attempts": self.attempts,
+            "last_error": self.last_error,
+            "next_attempt_at": self.next_attempt_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CocoControlNotice | None":
+        try:
+            notice_id = str(data.get("notice_id", "")).strip()
+            chat_id = int(data.get("chat_id", 0) or 0)
+            thread_id = int(data.get("thread_id", 0) or 0)
+            text = str(data.get("text", "")).strip()
+            attempts = max(0, int(data.get("attempts", 0) or 0))
+            last_error = str(data.get("last_error", "")).strip()[:500]
+            next_attempt_at = max(
+                0.0,
+                float(data.get("next_attempt_at", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            return None
+        if not notice_id or not chat_id or thread_id <= 0 or not text:
+            return None
+        return cls(
+            notice_id=notice_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            text=text,
+            attempts=attempts,
+            last_error=last_error,
+            next_attempt_at=next_attempt_at,
+        )
 
 
 @dataclass
@@ -493,8 +575,18 @@ class SessionManager:
     default_approval_mode: str = ""
     # machine_id -> server-wide transcription profile selection
     machine_transcription_profiles: dict[str, str] = field(default_factory=dict)
-    # Singleton control-topic assignment for `/coco`.
-    coco_control_topic: CocoControlTopic | None = None
+    # chat_id -> immutable General control-topic assignment for `/coco`.
+    coco_control_topics: dict[int, CocoControlTopic] = field(default_factory=dict)
+    # notice_id -> pending at-least-once migration announcement.
+    pending_coco_control_notices: dict[str, CocoControlNotice] = field(
+        default_factory=dict
+    )
+    # chat_id -> human-readable migration conflict retained for `/coco doctor`.
+    coco_control_migration_conflicts: dict[int, str] = field(default_factory=dict)
+    # archive_id -> detached historical General binding preserved during takeover.
+    coco_control_archives: dict[str, TopicBinding] = field(default_factory=dict)
+    # Persisted topic slots intentionally retained as archived migration sources.
+    coco_control_archived_topic_slots: set[str] = field(default_factory=set)
     # Per-window send/steer lock. Prevents concurrent turn mutations in one window.
     _window_send_locks: dict[str, asyncio.Lock] = field(
         default_factory=dict,
@@ -597,6 +689,7 @@ class SessionManager:
         remote_window_name: str = "",
         remote_approval_mode: str = "",
         result_snapshot: dict[str, str] | None = None,
+        dispatch_state: TopicSendDispatchState | None = None,
     ) -> AsyncIterator[None]:
         """Hold the send lock while applying an optional remote dispatch config."""
         lock = self._get_window_send_lock(window_id)
@@ -632,6 +725,8 @@ class SessionManager:
                     state = self.get_window_state(window_id)
                     result_snapshot["thread_id"] = state.codex_thread_id.strip()
                     result_snapshot["turn_id"] = state.codex_active_turn_id.strip()
+                    if dispatch_state is not None:
+                        result_snapshot["dispatch_mode"] = dispatch_state.dispatch_mode
 
     def set_transport_uncertainty_handler(
         self,
@@ -729,8 +824,34 @@ class SessionManager:
             state["default_approval_mode"] = self.default_approval_mode
         if self.machine_transcription_profiles:
             state["machine_transcription_profiles"] = self.machine_transcription_profiles
-        if self.coco_control_topic is not None:
-            state["coco_control_topic"] = self.coco_control_topic.to_dict()
+        if self.coco_control_topics:
+            state["coco_control_topics"] = {
+                str(chat_id): control.to_dict()
+                for chat_id, control in sorted(self.coco_control_topics.items())
+            }
+        if self.pending_coco_control_notices:
+            state["pending_coco_control_notices"] = {
+                notice_id: notice.to_dict()
+                for notice_id, notice in sorted(
+                    self.pending_coco_control_notices.items()
+                )
+            }
+        if self.coco_control_migration_conflicts:
+            state["coco_control_migration_conflicts"] = {
+                str(chat_id): detail
+                for chat_id, detail in sorted(
+                    self.coco_control_migration_conflicts.items()
+                )
+            }
+        if self.coco_control_archives:
+            state["coco_control_archives"] = {
+                archive_id: binding.to_dict()
+                for archive_id, binding in sorted(self.coco_control_archives.items())
+            }
+        if self.coco_control_archived_topic_slots:
+            state["coco_control_archived_topic_slots"] = sorted(
+                self.coco_control_archived_topic_slots
+            )
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
 
@@ -821,6 +942,7 @@ class SessionManager:
         *,
         chat_id: int | None = None,
     ) -> str | None:
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         per_user = self.topic_bindings_v2.get(user_id, {})
         scoped_chat_id = chat_id
         if scoped_chat_id is None:
@@ -857,6 +979,23 @@ class SessionManager:
             )
         return None
 
+    def _canonical_topic_user_id(
+        self,
+        user_id: int,
+        thread_id: int,
+        chat_id: int | None,
+    ) -> int:
+        """Keep topic lookups scoped to the caller's persisted user identity.
+
+        General's control assignment is an authorization/routing concern, not
+        an implicit storage alias.  Callers that have explicitly established
+        authority to operate on the control owner's topic must pass that
+        owner's ``user_id`` themselves; untrusted caller identities must never
+        be rewritten here.
+        """
+        _ = thread_id, chat_id
+        return user_id
+
     def _get_persisted_topic_binding(
         self,
         user_id: int,
@@ -865,6 +1004,7 @@ class SessionManager:
         chat_id: int | None = None,
     ) -> TopicBinding | None:
         """Return the raw persisted binding without window-state fallbacks."""
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         slot_key = self._find_topic_slot_key(
             user_id,
             thread_id,
@@ -1140,13 +1280,79 @@ class SessionManager:
                     if normalized_profile not in TRANSCRIPTION_PROFILES:
                         continue
                     self.machine_transcription_profiles[machine_id] = normalized_profile
-                raw_coco_control_topic = state.get("coco_control_topic")
-                if isinstance(raw_coco_control_topic, dict):
-                    self.coco_control_topic = CocoControlTopic.from_dict(
-                        raw_coco_control_topic
-                    )
-                else:
-                    self.coco_control_topic = None
+                self.coco_control_topics = {}
+                raw_coco_control_topics = state.get("coco_control_topics", {})
+                if isinstance(raw_coco_control_topics, dict):
+                    for raw_chat_id, raw_control in raw_coco_control_topics.items():
+                        if not isinstance(raw_control, dict):
+                            continue
+                        try:
+                            chat_id = int(raw_chat_id)
+                        except (TypeError, ValueError):
+                            continue
+                        control = CocoControlTopic.from_dict(raw_control)
+                        if (
+                            control is None
+                            or chat_id == 0
+                            or control.chat_id != chat_id
+                        ):
+                            continue
+                        self.coco_control_topics[chat_id] = control
+                raw_legacy_control = state.get("coco_control_topic")
+                if isinstance(raw_legacy_control, dict):
+                    legacy_control = CocoControlTopic.from_dict(raw_legacy_control)
+                    if (
+                        legacy_control is not None
+                        and legacy_control.chat_id
+                        and legacy_control.chat_id not in self.coco_control_topics
+                    ):
+                        self.coco_control_topics[legacy_control.chat_id] = (
+                            legacy_control
+                        )
+                self.pending_coco_control_notices = {}
+                raw_notices = state.get("pending_coco_control_notices", {})
+                if isinstance(raw_notices, dict):
+                    for raw_notice_id, raw_notice in raw_notices.items():
+                        if not isinstance(raw_notice, dict):
+                            continue
+                        notice = CocoControlNotice.from_dict(raw_notice)
+                        if notice is None or notice.notice_id != str(raw_notice_id):
+                            continue
+                        self.pending_coco_control_notices[notice.notice_id] = notice
+                self.coco_control_migration_conflicts = {}
+                raw_conflicts = state.get("coco_control_migration_conflicts", {})
+                if isinstance(raw_conflicts, dict):
+                    for raw_chat_id, raw_detail in raw_conflicts.items():
+                        try:
+                            conflict_chat_id = int(raw_chat_id)
+                        except (TypeError, ValueError):
+                            continue
+                        detail = str(raw_detail).strip()
+                        if conflict_chat_id and detail:
+                            self.coco_control_migration_conflicts[conflict_chat_id] = (
+                                detail[:1000]
+                            )
+                self.coco_control_archives = {}
+                raw_control_archives = state.get("coco_control_archives", {})
+                if isinstance(raw_control_archives, dict):
+                    for raw_archive_id, raw_binding in raw_control_archives.items():
+                        archive_id = str(raw_archive_id).strip()
+                        if not archive_id or not isinstance(raw_binding, dict):
+                            continue
+                        self.coco_control_archives[archive_id] = TopicBinding.from_dict(
+                            raw_binding
+                        )
+                self.coco_control_archived_topic_slots = set()
+                raw_archived_slots = state.get(
+                    "coco_control_archived_topic_slots",
+                    [],
+                )
+                if isinstance(raw_archived_slots, list):
+                    self.coco_control_archived_topic_slots = {
+                        str(slot).strip()
+                        for slot in raw_archived_slots
+                        if str(slot).strip()
+                    }
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -1189,13 +1395,22 @@ class SessionManager:
                 self.group_chat_ids = {}
                 self.default_approval_mode = ""
                 self.machine_transcription_profiles = {}
-                self.coco_control_topic = None
+                self.coco_control_topics = {}
+                self.pending_coco_control_notices = {}
+                self.coco_control_migration_conflicts = {}
+                self.coco_control_archives = {}
+                self.coco_control_archived_topic_slots = set()
                 pass
 
     async def resolve_stale_ids(self) -> None:
         """Remove legacy non-window-id keys from persisted state."""
         changed = False
 
+        stale_window_states = {
+            key: value
+            for key, value in self.window_states.items()
+            if not self._is_window_id(key)
+        }
         window_states: dict[str, WindowState] = {}
         for key, value in self.window_states.items():
             if self._is_window_id(key):
@@ -1217,6 +1432,53 @@ class SessionManager:
             for slot_key, binding in bindings.items():
                 wid = binding.window_id.strip()
                 if wid and not self._is_window_id(wid):
+                    parsed_chat_id, parsed_thread_id = self._parse_topic_slot_key(
+                        slot_key
+                    )
+                    binding_thread_id = binding.thread_id or parsed_thread_id
+                    binding_chat_id = binding.chat_id or parsed_chat_id
+                    recorded_control = self.get_coco_control_topic(binding_chat_id)
+                    protected_control = bool(
+                        recorded_control is not None
+                        and recorded_control.user_id == user_id
+                        and recorded_control.thread_id == binding_thread_id
+                        and recorded_control.chat_id == int(binding_chat_id or 0)
+                    )
+                    archived_slot = f"{user_id}:{slot_key}"
+                    if protected_control or archived_slot in self.coco_control_archived_topic_slots:
+                        stale_state = stale_window_states.get(wid)
+                        replacement_window_id = self.allocate_virtual_window_id()
+                        binding.window_id = replacement_window_id
+                        if not binding.cwd.strip() and stale_state is not None:
+                            binding.cwd = stale_state.cwd.strip()
+                        if (
+                            not binding.codex_thread_id.strip()
+                            and stale_state is not None
+                        ):
+                            binding.codex_thread_id = (
+                                stale_state.codex_thread_id.strip()
+                            )
+                        replacement_state = self.get_window_state(
+                            replacement_window_id
+                        )
+                        replacement_state.cwd = binding.cwd.strip()
+                        replacement_state.window_name = (
+                            binding.display_name.strip() or "coco-control"
+                        )
+                        replacement_state.codex_thread_id = (
+                            binding.codex_thread_id.strip()
+                        )
+                        cleaned[slot_key] = binding
+                        changed = True
+                        logger.warning(
+                            "Reallocated stale control-history window while preserving "
+                            "it (user=%s slot=%s old_window=%s new_window=%s)",
+                            user_id,
+                            slot_key,
+                            wid,
+                            replacement_window_id,
+                        )
+                        continue
                     changed = True
                     continue
                 cleaned[slot_key] = binding
@@ -1984,6 +2246,36 @@ class SessionManager:
         self._save_state()
         return True
 
+    def set_topic_binding_cwd(
+        self,
+        user_id: int,
+        thread_id: int | None,
+        cwd: str,
+        *,
+        chat_id: int | None = None,
+    ) -> bool:
+        """Persist a topic workspace without replacing its binding identity."""
+        if thread_id is None:
+            return False
+        binding = self._get_persisted_topic_binding(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        if binding is None:
+            return False
+        normalized_cwd = cwd.strip()
+        if binding.cwd == normalized_cwd:
+            return False
+        binding.cwd = normalized_cwd
+        window_id = binding.window_id.strip()
+        if window_id:
+            state = self.window_states.get(window_id)
+            if state is not None:
+                state.cwd = normalized_cwd
+        self._save_state()
+        return True
+
     def mark_topic_telegram_live(
         self,
         *,
@@ -2345,6 +2637,7 @@ class SessionManager:
         """Get enabled skill names for a topic thread."""
         if thread_id is None:
             return []
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         per_user = self.thread_skills.get(user_id)
         if not per_user:
             return []
@@ -2365,6 +2658,7 @@ class SessionManager:
         """Set enabled skill names for one topic thread."""
         if thread_id is None:
             return
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         normalized: list[str] = []
         seen: set[str] = set()
         for raw in skill_names:
@@ -2399,6 +2693,7 @@ class SessionManager:
         """Clear enabled skills for one topic thread."""
         if thread_id is None:
             return
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         per_user = self.thread_skills.get(user_id)
         slot_key = self._find_topic_slot_key(user_id, thread_id, chat_id=chat_id)
         if not per_user or slot_key is None or slot_key not in per_user:
@@ -2418,6 +2713,7 @@ class SessionManager:
         """Get enabled Codex skill names for a topic thread."""
         if thread_id is None:
             return []
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         per_user = self.thread_codex_skills.get(user_id)
         if not per_user:
             return []
@@ -2438,6 +2734,7 @@ class SessionManager:
         """Set enabled Codex skill names for one topic thread."""
         if thread_id is None:
             return
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         normalized: list[str] = []
         seen: set[str] = set()
         for raw in skill_names:
@@ -2472,6 +2769,7 @@ class SessionManager:
         """Clear enabled Codex skills for one topic thread."""
         if thread_id is None:
             return
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         per_user = self.thread_codex_skills.get(user_id)
         slot_key = self._find_topic_slot_key(user_id, thread_id, chat_id=chat_id)
         if not per_user or slot_key is None or slot_key not in per_user:
@@ -3353,6 +3651,10 @@ class SessionManager:
                         "Remote Codex transport changed before acknowledgement; "
                         "the request will not be replayed automatically.",
                     )
+                if dispatch_state is not None:
+                    dispatch_state.mark_dispatch_mode(
+                        remote_result.get("dispatch_mode")
+                    )
                 if not _topic_ownership_is_current():
                     return (
                         False,
@@ -3547,6 +3849,10 @@ class SessionManager:
                         "Remote Codex transport changed before acknowledgement; "
                         "the request will not be replayed automatically.",
                     )
+                if dispatch_state is not None:
+                    dispatch_state.mark_dispatch_mode(
+                        remote_result.get("dispatch_mode")
+                    )
                 if not _topic_ownership_is_current():
                     return (
                         False,
@@ -3707,6 +4013,7 @@ class SessionManager:
         """Ensure a topic has a persisted binding record, even before folder bind."""
         if thread_id is None:
             return None
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         slot_key = self._find_topic_slot_key(user_id, thread_id, chat_id=chat_id)
         if slot_key is not None:
             existing = self.topic_bindings_v2.get(user_id, {}).get(slot_key)
@@ -3732,9 +4039,115 @@ class SessionManager:
             return None
         return self.topic_bindings_v2.get(user_id, {}).get(slot_key)
 
-    def get_coco_control_topic(self) -> CocoControlTopic | None:
-        """Return the singleton `/coco` control-topic assignment."""
+    @property
+    def coco_control_topic(self) -> CocoControlTopic | None:
+        """Compatibility view for legacy single-control callers."""
+        if len(self.coco_control_topics) != 1:
+            return None
+        return next(iter(self.coco_control_topics.values()))
+
+    @coco_control_topic.setter
+    def coco_control_topic(self, value: CocoControlTopic | None) -> None:
+        self.coco_control_topics = {}
+        if value is not None and value.chat_id:
+            self.coco_control_topics[value.chat_id] = value
+
+    def get_coco_control_topic(
+        self,
+        chat_id: int | None = None,
+    ) -> CocoControlTopic | None:
+        """Return the General control assignment for one Telegram group."""
+        if chat_id is not None:
+            return self.coco_control_topics.get(int(chat_id))
         return self.coco_control_topic
+
+    def iter_coco_control_topics(self) -> Iterator[CocoControlTopic]:
+        """Iterate persisted per-group General control assignments."""
+        for chat_id in sorted(self.coco_control_topics):
+            yield self.coco_control_topics[chat_id]
+
+    def iter_pending_coco_control_notices(self) -> Iterator[CocoControlNotice]:
+        """Iterate migration notices that have not yet been acknowledged."""
+        notices = sorted(
+            self.pending_coco_control_notices.values(),
+            key=lambda notice: (
+                0 if notice.thread_id != GENERAL_TOPIC_THREAD_ID else 1,
+                notice.notice_id,
+            ),
+        )
+        yield from notices
+
+    def acknowledge_coco_control_notice(self, notice_id: str) -> bool:
+        """Remove a delivered notice from the durable outbox."""
+        if self.pending_coco_control_notices.pop(notice_id, None) is None:
+            return False
+        self._save_state()
+        return True
+
+    def record_coco_control_notice_failure(
+        self,
+        notice_id: str,
+        error: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Persist a failed notice attempt with bounded exponential backoff."""
+        notice = self.pending_coco_control_notices.get(notice_id)
+        if notice is None:
+            return False
+        notice.attempts += 1
+        notice.last_error = str(error).strip()[:500]
+        base_time = time.time() if now is None else float(now)
+        delay_seconds = min(
+            6 * 60 * 60,
+            30 * (2 ** min(notice.attempts - 1, 10)),
+        )
+        notice.next_attempt_at = base_time + delay_seconds
+        self._save_state()
+        return True
+
+    def _enqueue_coco_control_migration_notices(
+        self,
+        *,
+        chat_id: int,
+        previous_thread_id: int,
+        conflict: bool,
+    ) -> None:
+        migration_id = f"{chat_id}:{previous_thread_id}:{GENERAL_TOPIC_THREAD_ID}"
+        if conflict:
+            old_notice = (
+                "⚠️ CoCo control moved permanently to General, but the existing "
+                "General Codex history was preserved. This topic's prior control "
+                "history was not overwritten; run /coco doctor in General for details."
+            )
+            general_notice = (
+                "⚠️ General is now the permanent CoCo control channel. Its "
+                "existing history was preserved, and the previous control history "
+                "remains archived in its original topic. Run /coco doctor for details."
+            )
+        else:
+            old_notice = (
+                "ℹ️ CoCo control has moved permanently to General. Its Codex "
+                "history was migrated there. This topic is no longer the control channel."
+            )
+            general_notice = (
+                "✅ General is now the permanent CoCo control channel. The previous "
+                "control history was migrated here."
+            )
+        for suffix, thread_id, text in (
+            ("old", previous_thread_id, old_notice),
+            ("general", GENERAL_TOPIC_THREAD_ID, general_notice),
+        ):
+            notice_id = f"{migration_id}:{suffix}"
+            self.pending_coco_control_notices.setdefault(
+                notice_id,
+                CocoControlNotice(
+                    notice_id=notice_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    text=text,
+                ),
+            )
 
     def is_coco_control_topic(
         self,
@@ -3744,14 +4157,70 @@ class SessionManager:
         chat_id: int | None = None,
     ) -> bool:
         """Return whether one topic is the active `/coco` control topic."""
-        if thread_id is None or self.coco_control_topic is None:
+        if thread_id != GENERAL_TOPIC_THREAD_ID or not int(chat_id or 0):
             return False
-        if self.coco_control_topic.user_id != user_id:
-            return False
-        if self.coco_control_topic.thread_id != thread_id:
-            return False
+        _ = user_id
+        control = self.get_coco_control_topic(int(chat_id or 0))
+        return bool(control and control.thread_id == GENERAL_TOPIC_THREAD_ID)
+
+    def archive_general_topic_bindings(
+        self,
+        chat_id: int,
+        *,
+        preserve_control_user_id: int | None = None,
+    ) -> int:
+        """Detach occupied General sessions while preserving their history."""
         normalized_chat_id = int(chat_id or 0)
-        return self.coco_control_topic.chat_id == normalized_chat_id
+        control = self.get_coco_control_topic(normalized_chat_id)
+        occupied: list[tuple[int, str, TopicBinding]] = []
+        for candidate_user_id, candidate_chat_id, candidate_thread_id, candidate in (
+            self.iter_topic_bindings()
+        ):
+            if (
+                int(candidate_chat_id or 0) != normalized_chat_id
+                or candidate_thread_id != GENERAL_TOPIC_THREAD_ID
+            ):
+                continue
+            if not (
+                candidate.codex_thread_id.strip()
+                or candidate.cwd.strip()
+                or candidate.window_id.strip()
+            ):
+                continue
+            # Async control bootstrap may persist the workspace before it can
+            # label the binding; the persisted assignment still owns General.
+            if (
+                preserve_control_user_id == candidate_user_id
+                and (
+                    candidate.display_name.strip() == "coco-control"
+                    or (control is not None and control.user_id == candidate_user_id)
+                )
+            ):
+                continue
+            slot_key = self._find_topic_slot_key(
+                candidate_user_id,
+                GENERAL_TOPIC_THREAD_ID,
+                chat_id=normalized_chat_id,
+            )
+            if slot_key is not None:
+                occupied.append((candidate_user_id, slot_key, candidate))
+        for occupied_user_id, slot_key, candidate in occupied:
+            archive_id = f"{normalized_chat_id}:{occupied_user_id}:{slot_key}"
+            suffix = 2
+            while archive_id in self.coco_control_archives:
+                archive_id = (
+                    f"{normalized_chat_id}:{occupied_user_id}:{slot_key}:{suffix}"
+                )
+                suffix += 1
+            self.coco_control_archives[archive_id] = TopicBinding.from_dict(
+                candidate.to_dict()
+            )
+            self.topic_bindings_v2.get(occupied_user_id, {}).pop(slot_key, None)
+            self.thread_skills.get(occupied_user_id, {}).pop(slot_key, None)
+            self.thread_codex_skills.get(occupied_user_id, {}).pop(slot_key, None)
+        if occupied:
+            self._save_state()
+        return len(occupied)
 
     def set_coco_control_topic(
         self,
@@ -3760,16 +4229,39 @@ class SessionManager:
         *,
         chat_id: int | None = None,
     ) -> TopicBinding | None:
-        """Persist General as the singleton `/coco` control topic."""
+        """Persist General as one group's `/coco` control topic."""
         if thread_id != GENERAL_TOPIC_THREAD_ID or not int(chat_id or 0):
             return None
-        binding = self.ensure_topic_binding(user_id, thread_id, chat_id=chat_id)
+        normalized_chat_id = int(chat_id or 0)
+        existing = self.get_coco_control_topic(normalized_chat_id)
+        if existing is not None:
+            binding = self.resolve_topic_binding(
+                existing.user_id,
+                GENERAL_TOPIC_THREAD_ID,
+                chat_id=normalized_chat_id,
+            )
+            if binding is not None:
+                return binding
+            return self.ensure_topic_binding(
+                existing.user_id,
+                GENERAL_TOPIC_THREAD_ID,
+                chat_id=normalized_chat_id,
+            )
+        self.archive_general_topic_bindings(
+            normalized_chat_id,
+            preserve_control_user_id=user_id,
+        )
+        binding = self.ensure_topic_binding(
+            user_id,
+            thread_id,
+            chat_id=normalized_chat_id,
+        )
         if binding is None:
             return None
-        self.coco_control_topic = CocoControlTopic(
+        self.coco_control_topics[normalized_chat_id] = CocoControlTopic(
             user_id=user_id,
             thread_id=thread_id,
-            chat_id=int(chat_id or 0),
+            chat_id=normalized_chat_id,
         )
         self._save_state()
         return binding
@@ -3778,21 +4270,25 @@ class SessionManager:
         self,
         *,
         workspace_dir: str,
+        chat_id: int | None = None,
         general_thread_id: int = GENERAL_TOPIC_THREAD_ID,
     ) -> CocoControlMigration | None:
         """Move the existing control binding and its history to General once."""
-        current = self.coco_control_topic
+        current = self.get_coco_control_topic(chat_id)
         raw_workspace = workspace_dir.strip()
         if (
             current is None
             or current.user_id <= 0
             or not current.chat_id
-            or general_thread_id <= 0
+            or general_thread_id != GENERAL_TOPIC_THREAD_ID
             or not raw_workspace
             or current.thread_id == general_thread_id
         ):
             return None
-        workspace = os.path.abspath(os.path.expanduser(raw_workspace))
+        # The allocator on the owning machine returns its canonical native path.
+        # Treat it as opaque here: resolving a remote Windows/POSIX path on the
+        # controller would rewrite it using the controller's filesystem rules.
+        workspace = raw_workspace
 
         user_id = current.user_id
         chat_id = current.chat_id
@@ -3808,8 +4304,96 @@ class SessionManager:
         )
         per_user = self.topic_bindings_v2.setdefault(user_id, {})
         source = per_user.get(old_slot) if old_slot is not None else None
+        target = per_user.get(new_slot)
+        for candidate_user_id, candidate_chat_id, candidate_thread_id, candidate in (
+            self.iter_topic_bindings()
+        ):
+            if (
+                candidate_user_id == user_id
+                or int(candidate_chat_id or 0) != chat_id
+                or candidate_thread_id != GENERAL_TOPIC_THREAD_ID
+            ):
+                continue
+            if not (
+                candidate.codex_thread_id.strip()
+                or candidate.cwd.strip()
+                or candidate.window_id.strip()
+            ):
+                continue
+            self.coco_control_topics[chat_id] = CocoControlTopic(
+                user_id=candidate_user_id,
+                thread_id=GENERAL_TOPIC_THREAD_ID,
+                chat_id=chat_id,
+            )
+            self.coco_control_migration_conflicts[chat_id] = (
+                "General already belonged to another persisted user session; "
+                "both histories were preserved and the legacy control was archived."
+            )
+            if old_slot is not None:
+                self.coco_control_archived_topic_slots.add(
+                    f"{user_id}:{old_slot}"
+                )
+            self._enqueue_coco_control_migration_notices(
+                chat_id=chat_id,
+                previous_thread_id=old_thread_id,
+                conflict=True,
+            )
+            self._save_state()
+            return CocoControlMigration(
+                user_id=candidate_user_id,
+                chat_id=chat_id,
+                previous_thread_id=old_thread_id,
+                general_thread_id=GENERAL_TOPIC_THREAD_ID,
+                moved_history=False,
+                conflict=True,
+            )
+        if source is not None and target is not None:
+            source_thread_id = source.codex_thread_id.strip()
+            target_thread_id = target.codex_thread_id.strip()
+            same_identity = bool(
+                source_thread_id
+                and source_thread_id == target_thread_id
+                and source.machine_id.strip() == target.machine_id.strip()
+            )
+            if same_identity:
+                source = target
+                if target.cwd.strip():
+                    workspace = target.cwd.strip()
+            target_occupied = bool(
+                target_thread_id
+                or target.cwd.strip()
+                or target.window_id.strip()
+            )
+            if target_occupied and not same_identity:
+                self.coco_control_topics[chat_id] = CocoControlTopic(
+                    user_id=user_id,
+                    thread_id=GENERAL_TOPIC_THREAD_ID,
+                    chat_id=chat_id,
+                )
+                self.coco_control_migration_conflicts[chat_id] = (
+                    "General already had a distinct persisted session; both sessions "
+                    "were preserved and the legacy control topic was archived."
+                )
+                if old_slot is not None:
+                    self.coco_control_archived_topic_slots.add(
+                        f"{user_id}:{old_slot}"
+                    )
+                self._enqueue_coco_control_migration_notices(
+                    chat_id=chat_id,
+                    previous_thread_id=old_thread_id,
+                    conflict=True,
+                )
+                self._save_state()
+                return CocoControlMigration(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    previous_thread_id=old_thread_id,
+                    general_thread_id=GENERAL_TOPIC_THREAD_ID,
+                    moved_history=False,
+                    conflict=True,
+                )
         if source is None:
-            source = per_user.get(new_slot)
+            source = target
         if source is None:
             machine_id, machine_display_name = self._local_machine_identity()
             source = TopicBinding(
@@ -3818,11 +4402,35 @@ class SessionManager:
                 machine_display_name=machine_display_name,
             )
 
+        source_window_id = source.window_id.strip()
+        source_window_shared = bool(
+            source_window_id
+            and any(
+                candidate.window_id.strip() == source_window_id
+                and not (
+                    candidate_user_id == user_id
+                    and int(candidate_chat_id or 0) == chat_id
+                    and candidate_thread_id == old_thread_id
+                )
+                for (
+                    candidate_user_id,
+                    candidate_chat_id,
+                    candidate_thread_id,
+                    candidate,
+                ) in self.iter_topic_bindings()
+            )
+        )
+        control_window_id = (
+            self.allocate_virtual_window_id()
+            if source_window_shared
+            else (source_window_id or self.allocate_virtual_window_id())
+        )
+
         binding = TopicBinding(
             transport=source.transport,
             chat_id=chat_id,
             thread_id=general_thread_id,
-            window_id=source.window_id or self.allocate_virtual_window_id(),
+            window_id=control_window_id,
             codex_thread_id=source.codex_thread_id,
             cwd=workspace,
             display_name="coco-control",
@@ -3862,10 +4470,16 @@ class SessionManager:
 
         self.group_chat_ids[f"{user_id}:{new_slot}"] = chat_id
         self.group_chat_ids[f"{user_id}:{general_thread_id}"] = chat_id
-        self.coco_control_topic = CocoControlTopic(
+        self.coco_control_topics[chat_id] = CocoControlTopic(
             user_id=user_id,
             thread_id=general_thread_id,
             chat_id=chat_id,
+        )
+        self.coco_control_migration_conflicts.pop(chat_id, None)
+        self._enqueue_coco_control_migration_notices(
+            chat_id=chat_id,
+            previous_thread_id=old_thread_id,
+            conflict=False,
         )
         self._save_state()
         return CocoControlMigration(
@@ -4632,6 +5246,18 @@ class SessionManager:
             raise ValueError("codex_thread_id is required")
 
         existing = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        control = self.get_coco_control_topic(int(chat_id or 0))
+        if control is not None and thread_id == GENERAL_TOPIC_THREAD_ID:
+            if user_id != control.user_id:
+                raise ValueError(
+                    "General control binding belongs to its persisted owner"
+                )
+            if (
+                existing is not None
+                and existing.codex_thread_id.strip()
+                and existing.codex_thread_id.strip() != normalized_codex_thread_id
+            ):
+                raise ValueError("General control Codex thread is immutable")
         resolved_window_id = window_id.strip() or (existing.window_id if existing else "")
         resolved_cwd = cwd.strip() or (existing.cwd if existing else "")
         resolved_display_name = (
@@ -4713,6 +5339,7 @@ class SessionManager:
         if thread_id is None:
             return None
 
+        user_id = self._canonical_topic_user_id(user_id, thread_id, chat_id)
         slot_key = self._find_topic_slot_key(user_id, thread_id, chat_id=chat_id)
         if slot_key is None:
             return None
@@ -4789,6 +5416,13 @@ class SessionManager:
         chat_id: int | None = None,
     ) -> TopicBinding | None:
         """Remove a transport-neutral topic binding."""
+        if self.is_coco_control_topic(user_id, thread_id, chat_id=chat_id):
+            logger.warning(
+                "Refused to unbind reserved General control (user=%s chat=%s)",
+                user_id,
+                chat_id,
+            )
+            return None
         per_user_bindings = self.topic_bindings_v2.get(user_id)
         slot_key = self._find_topic_slot_key(user_id, thread_id, chat_id=chat_id)
         if not per_user_bindings or slot_key is None or slot_key not in per_user_bindings:
@@ -4827,8 +5461,18 @@ class SessionManager:
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
         """
+        control = self.get_coco_control_topic(int(chat_id or 0))
+        current = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        if control is not None and thread_id == GENERAL_TOPIC_THREAD_ID:
+            if user_id != control.user_id:
+                raise ValueError(
+                    "General control binding belongs to its persisted owner"
+                )
+            current_window = str(current.window_id or "").strip() if current else ""
+            if current_window and current_window != window_id:
+                raise ValueError("General control window is immutable")
         fallback = self._topic_binding_from_window(window_id)
-        existing = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
+        existing = current
         display = window_name.strip() or fallback.display_name
         binding = TopicBinding(
             transport=TOPIC_BINDING_TRANSPORT_WINDOW,
@@ -6125,7 +6769,7 @@ class SessionManager:
 
         on_dispatch = (
             dispatch_state.mark_transport_dispatch_started
-            if dispatch_state is not None
+            if dispatch_state is not None and dispatch_state.notify_transport_dispatch
             else None
         )
 
@@ -6164,6 +6808,8 @@ class SessionManager:
                     "was in flight; the outcome is uncertain and the request will "
                     "not be replayed automatically.",
                 )
+            if dispatch_state is not None:
+                dispatch_state.mark_turn_steered()
             new_turn_id = result.get("turnId") if isinstance(result, dict) else None
             state.codex_active_turn_id = (
                 new_turn_id
@@ -6201,6 +6847,8 @@ class SessionManager:
                     "was in flight; the outcome is uncertain and the request will "
                     "not be replayed automatically.",
                 )
+            if dispatch_state is not None:
+                dispatch_state.mark_turn_started()
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None
             state.codex_active_turn_id = turn_id if isinstance(turn_id, str) else ""
@@ -6241,6 +6889,9 @@ class SessionManager:
         dispatch_state: TopicSendDispatchState | None = None,
     ) -> tuple[bool, str]:
         """Send structured user inputs to a window via Codex app-server."""
+        effective_dispatch_state = dispatch_state or TopicSendDispatchState(
+            notify_transport_dispatch=False
+        )
         display = self.get_display_name(window_id)
         lock_wait_started = time.monotonic()
         async with self._window_send_context(
@@ -6250,6 +6901,7 @@ class SessionManager:
             remote_window_name=remote_window_name,
             remote_approval_mode=remote_approval_mode,
             result_snapshot=result_snapshot,
+            dispatch_state=effective_dispatch_state,
         ):
             lock_wait_elapsed = time.monotonic() - lock_wait_started
             if lock_wait_elapsed >= 0.01:
@@ -6279,6 +6931,25 @@ class SessionManager:
                 ):
                     return False
                 return ownership_validator is None or ownership_validator()
+
+            try:
+                send_transport_parameters = inspect.signature(
+                    self._send_inputs_via_codex_app_server
+                ).parameters.values()
+                transport_accepts_dispatch_state = any(
+                    parameter.name == "dispatch_state"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in send_transport_parameters
+                )
+            except (TypeError, ValueError):
+                # Dynamically supplied transports are assumed to support the
+                # optional marker; the concrete implementation does.
+                transport_accepts_dispatch_state = True
+            transport_dispatch_state = (
+                effective_dispatch_state
+                if dispatch_state is not None or transport_accepts_dispatch_state
+                else None
+            )
 
             if codex_app_server_mode:
                 if not cwd:
@@ -6310,8 +6981,8 @@ class SessionManager:
                         initial_send_kwargs["ownership_validator"] = (
                             strict_ownership_validator
                         )
-                    if dispatch_state is not None:
-                        initial_send_kwargs["dispatch_state"] = dispatch_state
+                    if transport_dispatch_state is not None:
+                        initial_send_kwargs["dispatch_state"] = transport_dispatch_state
                     send_result = await self._send_inputs_via_codex_app_server(
                         window_id=window_id,
                         inputs=inputs,
@@ -6364,7 +7035,7 @@ class SessionManager:
                                 steer=steer,
                                 stale_thread_id=stale_thread_id,
                                 ownership_validator=_send_ownership_is_current,
-                                dispatch_state=dispatch_state,
+                                dispatch_state=transport_dispatch_state,
                                 **send_kwargs,
                             )
                         except Exception as retry_error:
@@ -6422,7 +7093,7 @@ class SessionManager:
                                 stale_turn_id=stale_turn_id,
                                 thread_id=stale_thread_id,
                                 ownership_validator=_send_ownership_is_current,
-                                dispatch_state=dispatch_state,
+                                dispatch_state=transport_dispatch_state,
                                 **send_kwargs,
                             )
                         except Exception as retry_error:

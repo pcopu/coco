@@ -175,24 +175,40 @@ class _MemoryEntry:
     text: str
 
 
-_personality_state: dict[tuple[int, int], PersonalityTopicState] = {}
+_personality_state: dict[tuple[int, int, int], PersonalityTopicState] = {}
 _personality_state_loaded = False
+_legacy_personality_state_keys: set[tuple[int, int, int]] = set()
 
 
-def _topic_key(user_id: int, thread_id: int) -> tuple[int, int]:
-    return user_id, thread_id
+def _topic_key(
+    user_id: int,
+    thread_id: int,
+    chat_id: int | None = None,
+) -> tuple[int, int, int]:
+    return int(user_id), int(chat_id or 0), int(thread_id)
 
 
-def _key_to_string(key: tuple[int, int]) -> str:
-    return f"{key[0]}:{key[1]}"
+def _key_to_string(key: tuple[int, int, int]) -> str:
+    return f"{key[0]}:{key[1]}:{key[2]}"
 
 
-def _parse_key(raw_key: str) -> tuple[int, int] | None:
-    user_s, sep, thread_s = raw_key.partition(":")
-    if not sep:
+def _persisted_key_to_string(key: tuple[int, int, int]) -> str:
+    if key in _legacy_personality_state_keys:
+        return f"{key[0]}:{key[2]}"
+    return _key_to_string(key)
+
+
+def _parse_key(raw_key: str) -> tuple[int, int, int] | None:
+    parts = raw_key.split(":")
+    if len(parts) == 2:
+        user_s, thread_s = parts
+        chat_s = "0"
+    elif len(parts) == 3:
+        user_s, chat_s, thread_s = parts
+    else:
         return None
     try:
-        return int(user_s), int(thread_s)
+        return int(user_s), int(chat_s), int(thread_s)
     except (TypeError, ValueError):
         return None
 
@@ -221,6 +237,7 @@ def _load_state() -> None:
         return
     _personality_state_loaded = True
     _personality_state.clear()
+    _legacy_personality_state_keys.clear()
 
     if not _PERSONALITY_STATE_FILE.is_file():
         return
@@ -241,18 +258,24 @@ def _load_state() -> None:
         if state is None:
             continue
         _personality_state[key] = state
+        if len(raw_key.split(":")) == 2:
+            _legacy_personality_state_keys.add(key)
+        else:
+            _legacy_personality_state_keys.discard(key)
 
 
 def _save_state() -> None:
     if not _personality_state_loaded:
         return
+    _legacy_personality_state_keys.intersection_update(_personality_state)
     try:
         if not _personality_state:
+            _legacy_personality_state_keys.clear()
             if _PERSONALITY_STATE_FILE.exists():
                 _PERSONALITY_STATE_FILE.unlink()
             return
         payload = {
-            _key_to_string(key): state.to_dict()
+            _persisted_key_to_string(key): state.to_dict()
             for key, state in sorted(_personality_state.items())
         }
         atomic_write_json(_PERSONALITY_STATE_FILE, payload, indent=2)
@@ -264,6 +287,7 @@ def reset_personality_state_for_tests(*, clear_persisted: bool = True) -> None:
     """Test helper to clear in-memory personality state."""
     global _personality_state_loaded
     _personality_state.clear()
+    _legacy_personality_state_keys.clear()
     _personality_state_loaded = False
     if clear_persisted:
         try:
@@ -272,23 +296,66 @@ def reset_personality_state_for_tests(*, clear_persisted: bool = True) -> None:
             pass
 
 
-def prune_personality_topics(active_topic_keys: set[tuple[int, int]]) -> None:
+def prune_personality_topics(
+    active_topic_keys: set[tuple[int, int] | tuple[int, int, int]],
+) -> None:
     """Drop personality state for topics that are no longer active."""
     _load_state()
-    stale = [key for key in _personality_state if key not in active_topic_keys]
-    if not stale:
+    normalized_active_keys = {
+        (int(key[0]), 0, int(key[1]))
+        if len(key) == 2
+        else (int(key[0]), int(key[1]), int(key[2]))
+        for key in active_topic_keys
+    }
+    changed = False
+    for key in list(_legacy_personality_state_keys):
+        if key not in _personality_state or key[1] != 0:
+            continue
+        matches = {
+            active_key
+            for active_key in normalized_active_keys
+            if active_key[0] == key[0]
+            and active_key[2] == key[2]
+            and active_key[1] != 0
+        }
+        if len(matches) != 1:
+            continue
+        target_key = next(iter(matches))
+        if target_key in _personality_state:
+            # A concrete scoped state is authoritative. Drop the superseded
+            # legacy alias so a later prune can never revive it after clear.
+            _personality_state.pop(key, None)
+            _legacy_personality_state_keys.discard(key)
+            changed = True
+            continue
+        _personality_state[target_key] = _personality_state.pop(key)
+        _legacy_personality_state_keys.discard(key)
+        changed = True
+
+    stale = [
+        key
+        for key in _personality_state
+        if key not in normalized_active_keys
+        and not (key in _legacy_personality_state_keys and key[1] == 0)
+    ]
+    if not stale and not changed:
         return
     for key in stale:
         _personality_state.pop(key, None)
+        _legacy_personality_state_keys.discard(key)
     _save_state()
 
 
-def clear_personality_state(user_id: int, thread_id: int | None = None) -> None:
+def clear_personality_state(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> None:
     """Clear personality state for one topic."""
     if thread_id is None:
         return
     _load_state()
-    key = _topic_key(user_id, thread_id)
+    key = _topic_key(user_id, thread_id, chat_id)
     if key not in _personality_state:
         return
     del _personality_state[key]
@@ -635,11 +702,12 @@ def _build_digest_text(
 def generate_personality_digest(
     *,
     user_id: int,
-    chat_id: int,
     thread_id: int,
+    chat_id: int | None = None,
     target_date: str,
 ) -> PersonalityDigest | None:
     """Generate one daily digest from Telegram-visible topic memory."""
+    normalized_chat_id = int(chat_id or 0)
     try:
         target = date.fromisoformat(target_date)
     except ValueError:
@@ -648,7 +716,7 @@ def generate_personality_digest(
     tzinfo = _local_timezone()
     entries = _parse_memory_entries(
         user_id=user_id,
-        chat_id=chat_id,
+        chat_id=normalized_chat_id,
         thread_id=thread_id,
         target_date=target,
         tzinfo=tzinfo,
@@ -678,7 +746,7 @@ def generate_personality_digest(
     if _research_backend() != PERSONALITY_RESEARCH_BACKEND_HEURISTIC:
         external_payload = _run_external_personality_research(
             user_id=user_id,
-            chat_id=chat_id,
+            chat_id=normalized_chat_id,
             thread_id=thread_id,
             target_date=target_date,
             sessions=sessions,
@@ -722,23 +790,24 @@ def generate_personality_digest(
 def claim_due_personality_delivery(
     *,
     user_id: int,
-    chat_id: int,
     thread_id: int,
+    chat_id: int | None = None,
     now: datetime | None = None,
 ) -> str | None:
     """Generate and claim a once-per-day morning personality digest."""
     _load_state()
+    normalized_chat_id = int(chat_id or 0)
     ts = _normalize_now(now)
     local_now = ts.astimezone(_local_timezone(ts))
     target_date = (local_now.date() - timedelta(days=1)).isoformat()
-    key = _topic_key(user_id, thread_id)
+    key = _topic_key(user_id, thread_id, normalized_chat_id)
     state = _personality_state.get(key) or PersonalityTopicState()
 
     if local_now.hour >= PERSONALITY_RESEARCH_HOUR_LOCAL:
         if state.last_researched_for_date != target_date:
             digest = generate_personality_digest(
                 user_id=user_id,
-                chat_id=chat_id,
+                chat_id=normalized_chat_id,
                 thread_id=thread_id,
                 target_date=target_date,
             )
