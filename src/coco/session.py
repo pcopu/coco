@@ -1066,6 +1066,18 @@ class SessionManager:
             )
         )
 
+    def _window_topic_binding_count(self, window_id: str) -> int:
+        """Return the number of active topic bindings sharing one window."""
+        normalized_window_id = window_id.strip()
+        if not normalized_window_id:
+            return 0
+        return sum(
+            1
+            for bindings in self.topic_bindings_v2.values()
+            for binding in bindings.values()
+            if binding.window_id.strip() == normalized_window_id
+        )
+
     def _get_persisted_window_codex_thread_id(self, window_id: str) -> str:
         """Return one raw canonical thread ID persisted for a window."""
         thread_ids = {
@@ -3182,6 +3194,9 @@ class SessionManager:
         topic_ownership: TopicOwnership | None = None,
     ) -> tuple[bool, str]:
         """Send user/topic text with app/skill context applied."""
+        effective_dispatch_state = dispatch_state or TopicSendDispatchState(
+            notify_transport_dispatch=False
+        )
         if topic_ownership is not None and (
             thread_id is None
             or not self._topic_binding_ownership_matches(
@@ -3320,6 +3335,240 @@ class SessionManager:
                 ),
             )
             return True, ""
+
+        automatic_rollover_allowed = bool(
+            thread_id is not None
+            and canonical_topic_thread_id
+            and not self.is_coco_control_topic(
+                user_id,
+                thread_id,
+                chat_id=chat_id,
+            )
+            and self.get_topic_sync_mode(user_id, thread_id, chat_id=chat_id)
+            == TOPIC_SYNC_MODE_TELEGRAM_LIVE
+            and self._window_topic_binding_count(window_id) == 1
+        )
+
+        def _is_missing_thread_resume_limit_failure(ok: bool, message: str) -> bool:
+            """Return whether a definite stale-thread failure may roll forward."""
+            return bool(
+                automatic_rollover_allowed
+                and not ok
+                and APP_SERVER_THREAD_NOT_FOUND_RE.search(message)
+                and self.is_codex_resume_limit_error(message)
+                and not self.is_codex_uncertain_send_result(message)
+            )
+
+        def _prepare_automatic_topic_rollover() -> tuple[bool, str]:
+            """Stage a fresh window thread while preserving topic authority."""
+            if not _topic_ownership_is_current():
+                return (
+                    False,
+                    "The topic's canonical Codex binding changed during stale-thread "
+                    "recovery. The request was not sent.",
+                )
+            if self._window_topic_binding_count(window_id) != 1:
+                return (
+                    False,
+                    "The stale Codex thread is shared by multiple topic bindings. "
+                    "Use /resume or /new explicitly.",
+                )
+            self._set_window_codex_thread_cache(window_id, "")
+            self.mark_window_pending_session_start_reason(
+                window_id,
+                "oversized_rollover",
+            )
+            emit_telemetry(
+                "transport.app_server.thread_missing_rollover_started",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                window_id=window_id,
+                stale_thread_id=canonical_topic_thread_id,
+                user_id=user_id,
+                chat_id=chat_id,
+                topic_thread_id=thread_id,
+            )
+            return True, ""
+
+        def _restore_failed_automatic_topic_rollover(message: str) -> None:
+            """Restore the old cache after a definitely pre-dispatch fresh failure."""
+            if (
+                _topic_ownership_is_current()
+                and not self.is_codex_uncertain_send_result(message)
+            ):
+                self._set_window_codex_thread_cache(
+                    window_id,
+                    canonical_topic_thread_id,
+                )
+                self.consume_window_pending_session_start_reason(window_id)
+
+        def _quarantine_orphaned_automatic_rollover() -> None:
+            """Detach an uncommitted fresh thread from an abandoned window."""
+            if self._window_topic_binding_count(window_id) != 0:
+                return
+            cached_thread_id = self.get_window_codex_thread_id(window_id).strip()
+            if not cached_thread_id or cached_thread_id == canonical_topic_thread_id:
+                return
+            self._set_window_codex_thread_cache(window_id, "")
+            self.consume_window_pending_session_start_reason(window_id)
+            emit_telemetry(
+                "transport.app_server.thread_missing_rollover_quarantined",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                window_id=window_id,
+                stale_thread_id=canonical_topic_thread_id,
+                fresh_thread_id=cached_thread_id,
+                user_id=user_id,
+                chat_id=chat_id,
+                topic_thread_id=thread_id,
+            )
+
+        def _commit_automatic_topic_rollover(
+            fresh_thread_id: str = "",
+        ) -> tuple[bool, str]:
+            """Commit a staged fresh thread after its first turn was accepted."""
+            if thread_id is None:
+                return False, "Automatic recovery requires a bound Telegram topic."
+            if not _topic_ownership_is_current():
+                return (
+                    False,
+                    "The topic's canonical Codex binding changed while its fresh "
+                    "recovery turn was in flight. The request will not be replayed.",
+                )
+            if self._window_topic_binding_count(window_id) != 1:
+                return (
+                    False,
+                    "The topic window became shared while its fresh recovery turn "
+                    "was in flight. The request will not be replayed.",
+                )
+            resolved_fresh_thread_id = (
+                fresh_thread_id.strip()
+                or self.get_window_codex_thread_id(window_id).strip()
+            )
+            if (
+                not resolved_fresh_thread_id
+                or resolved_fresh_thread_id == canonical_topic_thread_id
+            ):
+                return False, "Codex did not return a fresh recovery thread."
+            self.bind_topic_to_codex_thread(
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                codex_thread_id=resolved_fresh_thread_id,
+                cwd=canonical_topic_cwd,
+                display_name=(
+                    persisted_topic_binding.display_name.strip()
+                    if persisted_topic_binding is not None
+                    else self.get_display_name(window_id)
+                ),
+                window_id=window_id,
+                machine_id=machine_id,
+                machine_display_name=(
+                    persisted_topic_binding.machine_display_name.strip()
+                    if persisted_topic_binding is not None
+                    else ""
+                ),
+            )
+            emit_telemetry(
+                "transport.app_server.thread_missing_rollover_committed",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                window_id=window_id,
+                stale_thread_id=canonical_topic_thread_id,
+                fresh_thread_id=resolved_fresh_thread_id,
+                user_id=user_id,
+                chat_id=chat_id,
+                topic_thread_id=thread_id,
+            )
+            return True, ""
+
+        async def _send_local_with_automatic_rollover(
+            send_once: Callable[[], Awaitable[tuple[bool, str]]],
+        ) -> tuple[bool, str]:
+            """Retry one definite stale-thread admission failure on a fresh thread."""
+            ok, message = await send_once()
+            if not _is_missing_thread_resume_limit_failure(ok, message):
+                return ok, message
+            prepared, prepare_error = _prepare_automatic_topic_rollover()
+            if not prepared:
+                return False, prepare_error
+            ok, message = await send_once()
+            if not ok:
+                _restore_failed_automatic_topic_rollover(message)
+                return ok, message
+            committed, commit_error = _commit_automatic_topic_rollover()
+            if not committed:
+                _quarantine_orphaned_automatic_rollover()
+                return False, commit_error
+            return ok, message
+
+        async def _send_remote_with_automatic_rollover(
+            *,
+            dispatched_thread_id: str,
+            send_once: Callable[[str], Awaitable[dict[str, Any]]],
+        ) -> tuple[dict[str, Any] | None, bool, str]:
+            """Send remotely and retry one definite stale thread on a fresh ID."""
+
+            async def _validate_result(result: dict[str, Any]) -> str:
+                if not _topic_ownership_is_current():
+                    return (
+                        "The topic's canonical Codex binding changed while the "
+                        "request was in flight; the remote outcome is uncertain "
+                        "and the request will not be replayed automatically."
+                    )
+                if not await self._accept_remote_transport_result(
+                    window_id=window_id,
+                    result=result,
+                ):
+                    return (
+                        "Remote Codex transport changed before acknowledgement; "
+                        "the request will not be replayed automatically."
+                    )
+                effective_dispatch_state.mark_dispatch_mode(
+                    result.get("dispatch_mode")
+                )
+                if not _topic_ownership_is_current():
+                    return (
+                        "The topic's canonical Codex binding changed while the "
+                        "request was in flight; the remote outcome is uncertain "
+                        "and the request will not be replayed automatically."
+                    )
+                return ""
+
+            result = await send_once(dispatched_thread_id)
+            validation_error = await _validate_result(result)
+            if validation_error:
+                return None, False, validation_error
+            ok = bool(result.get("ok", False))
+            message = str(result.get("message", "")).strip()
+            if not _is_missing_thread_resume_limit_failure(ok, message):
+                return result, False, ""
+            if not _topic_ownership_is_current():
+                return None, False, (
+                    "The topic's canonical Codex binding changed during stale-thread "
+                    "recovery. The request was not sent."
+                )
+            if self._window_topic_binding_count(window_id) != 1:
+                return None, False, (
+                    "The stale Codex thread is shared by multiple topic bindings. "
+                    "Use /resume or /new explicitly."
+                )
+            emit_telemetry(
+                "transport.app_server.thread_missing_rollover_started",
+                runtime_mode=config.runtime_mode,
+                codex_transport=config.codex_transport,
+                window_id=window_id,
+                stale_thread_id=canonical_topic_thread_id,
+                user_id=user_id,
+                chat_id=chat_id,
+                topic_thread_id=thread_id,
+                remote=True,
+            )
+            result = await send_once("")
+            validation_error = await _validate_result(result)
+            if validation_error:
+                return None, True, validation_error
+            return result, True, ""
 
         local_machine_id, _local_machine_name = self._local_machine_identity()
         operator_context = self._build_coco_operator_context(
@@ -3603,8 +3852,10 @@ class SessionManager:
                         "The topic's canonical Codex binding changed before "
                         "remote dispatch. The request was not sent.",
                     )
-                try:
-                    remote_result = await agent_rpc_client.send_inputs(
+                async def _send_remote_plain_once(
+                    request_thread_id: str,
+                ) -> dict[str, Any]:
+                    return await agent_rpc_client.send_inputs(
                         machine_id,
                         window_id=window_id,
                         cwd=cwd,
@@ -3613,18 +3864,26 @@ class SessionManager:
                         inputs=[{"type": "text", "text": text}],
                         steer=steer,
                         force_new_turn=force_new_turn,
-                        thread_id=dispatched_thread_id,
+                        thread_id=request_thread_id,
                         approval_mode=state.approval_mode.strip(),
                         model_slug=model_slug,
                         reasoning_effort=reasoning_effort,
                         service_tier=service_tier,
                         **(
                             {
-                                "on_dispatch": dispatch_state.mark_transport_dispatch_started
+                                "on_dispatch": effective_dispatch_state.mark_transport_dispatch_started
                             }
-                            if dispatch_state is not None
+                            if effective_dispatch_state.notify_transport_dispatch
                             else {}
                         ),
+                    )
+
+                try:
+                    remote_result, remote_rolled_over, remote_error = (
+                        await _send_remote_with_automatic_rollover(
+                            dispatched_thread_id=dispatched_thread_id,
+                            send_once=_send_remote_plain_once,
+                        )
                     )
                 except RemoteCodexMutationDeferredError as exc:
                     return False, str(exc)
@@ -3635,41 +3894,23 @@ class SessionManager:
                     )
                     self.clear_window_codex_turn(window_id)
                     raise
-                if not _topic_ownership_is_current():
-                    return (
-                        False,
-                        "The topic's canonical Codex binding changed while the "
-                        "request was in flight; the remote outcome is uncertain "
-                        "and the request will not be replayed automatically.",
-                    )
-                if not await self._accept_remote_transport_result(
-                    window_id=window_id,
-                    result=remote_result,
-                ):
-                    return (
-                        False,
-                        "Remote Codex transport changed before acknowledgement; "
-                        "the request will not be replayed automatically.",
-                    )
-                if dispatch_state is not None:
-                    dispatch_state.mark_dispatch_mode(
-                        remote_result.get("dispatch_mode")
-                    )
-                if not _topic_ownership_is_current():
-                    return (
-                        False,
-                        "The topic's canonical Codex binding changed while the "
-                        "request was in flight; the remote outcome is uncertain "
-                        "and the request will not be replayed automatically.",
-                    )
+                if remote_error:
+                    return False, remote_error
+                if remote_result is None:
+                    return False, "Remote Codex returned no send result."
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
                 ok = bool(remote_result.get("ok", False))
                 if ok and (
                     not resolved_thread_id
                     or (
-                        dispatched_thread_id
+                        not remote_rolled_over
+                        and dispatched_thread_id
                         and resolved_thread_id != dispatched_thread_id
+                    )
+                    or (
+                        remote_rolled_over
+                        and resolved_thread_id == dispatched_thread_id
                     )
                 ):
                     emit_telemetry(
@@ -3708,7 +3949,13 @@ class SessionManager:
                         "request was in flight; the response was not applied "
                         "and the request will not be replayed automatically.",
                     )
-                if ok and resolved_thread_id and not canonical_topic_thread_id:
+                if ok and remote_rolled_over:
+                    committed, commit_error = _commit_automatic_topic_rollover(
+                        resolved_thread_id
+                    )
+                    if not committed:
+                        return False, commit_error
+                elif ok and resolved_thread_id and not canonical_topic_thread_id:
                     self.bind_topic_to_codex_thread(
                         user_id=user_id,
                         thread_id=thread_id,
@@ -3726,15 +3973,20 @@ class SessionManager:
                     self.set_window_codex_active_turn_id(window_id, resolved_turn_id)
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
-                ok, msg = await self.send_to_window(
-                    window_id,
-                    text,
-                    steer=steer,
-                    force_new_turn=force_new_turn,
-                    dispatch_cwd=canonical_topic_cwd,
-                    ownership_validator=_topic_ownership_is_current,
-                    dispatch_state=dispatch_state,
-                    **topic_send_kwargs,
+                async def _send_local_plain_once() -> tuple[bool, str]:
+                    return await self.send_to_window(
+                        window_id,
+                        text,
+                        steer=steer,
+                        force_new_turn=force_new_turn,
+                        dispatch_cwd=canonical_topic_cwd,
+                        ownership_validator=_topic_ownership_is_current,
+                        dispatch_state=effective_dispatch_state,
+                        **topic_send_kwargs,
+                    )
+
+                ok, msg = await _send_local_with_automatic_rollover(
+                    _send_local_plain_once
                 )
                 if ok:
                     committed, commit_error = _commit_fresh_local_topic_thread()
@@ -3801,8 +4053,10 @@ class SessionManager:
                         "The topic's canonical Codex binding changed before "
                         "remote dispatch. The request was not sent.",
                     )
-                try:
-                    remote_result = await agent_rpc_client.send_inputs(
+                async def _send_remote_context_once(
+                    request_thread_id: str,
+                ) -> dict[str, Any]:
+                    return await agent_rpc_client.send_inputs(
                         machine_id,
                         window_id=window_id,
                         cwd=cwd,
@@ -3811,18 +4065,26 @@ class SessionManager:
                         inputs=inputs,
                         steer=steer,
                         force_new_turn=force_new_turn,
-                        thread_id=dispatched_thread_id,
+                        thread_id=request_thread_id,
                         approval_mode=state.approval_mode.strip(),
                         model_slug=model_slug,
                         reasoning_effort=reasoning_effort,
                         service_tier=service_tier,
                         **(
                             {
-                                "on_dispatch": dispatch_state.mark_transport_dispatch_started
+                                "on_dispatch": effective_dispatch_state.mark_transport_dispatch_started
                             }
-                            if dispatch_state is not None
+                            if effective_dispatch_state.notify_transport_dispatch
                             else {}
                         ),
+                    )
+
+                try:
+                    remote_result, remote_rolled_over, remote_error = (
+                        await _send_remote_with_automatic_rollover(
+                            dispatched_thread_id=dispatched_thread_id,
+                            send_once=_send_remote_context_once,
+                        )
                     )
                 except RemoteCodexMutationDeferredError as exc:
                     return False, str(exc)
@@ -3833,41 +4095,23 @@ class SessionManager:
                     )
                     self.clear_window_codex_turn(window_id)
                     raise
-                if not _topic_ownership_is_current():
-                    return (
-                        False,
-                        "The topic's canonical Codex binding changed while the "
-                        "request was in flight; the remote outcome is uncertain "
-                        "and the request will not be replayed automatically.",
-                    )
-                if not await self._accept_remote_transport_result(
-                    window_id=window_id,
-                    result=remote_result,
-                ):
-                    return (
-                        False,
-                        "Remote Codex transport changed before acknowledgement; "
-                        "the request will not be replayed automatically.",
-                    )
-                if dispatch_state is not None:
-                    dispatch_state.mark_dispatch_mode(
-                        remote_result.get("dispatch_mode")
-                    )
-                if not _topic_ownership_is_current():
-                    return (
-                        False,
-                        "The topic's canonical Codex binding changed while the "
-                        "request was in flight; the remote outcome is uncertain "
-                        "and the request will not be replayed automatically.",
-                    )
+                if remote_error:
+                    return False, remote_error
+                if remote_result is None:
+                    return False, "Remote Codex returned no send result."
                 resolved_thread_id = str(remote_result.get("thread_id", "")).strip()
                 resolved_turn_id = str(remote_result.get("turn_id", "")).strip()
                 ok = bool(remote_result.get("ok", False))
                 if ok and (
                     not resolved_thread_id
                     or (
-                        dispatched_thread_id
+                        not remote_rolled_over
+                        and dispatched_thread_id
                         and resolved_thread_id != dispatched_thread_id
+                    )
+                    or (
+                        remote_rolled_over
+                        and resolved_thread_id == dispatched_thread_id
                     )
                 ):
                     emit_telemetry(
@@ -3906,7 +4150,13 @@ class SessionManager:
                         "request was in flight; the response was not applied "
                         "and the request will not be replayed automatically.",
                     )
-                if ok and resolved_thread_id and not canonical_topic_thread_id:
+                if ok and remote_rolled_over:
+                    committed, commit_error = _commit_automatic_topic_rollover(
+                        resolved_thread_id
+                    )
+                    if not committed:
+                        return False, commit_error
+                elif ok and resolved_thread_id and not canonical_topic_thread_id:
                     self.bind_topic_to_codex_thread(
                         user_id=user_id,
                         thread_id=thread_id,
@@ -3924,15 +4174,20 @@ class SessionManager:
                     self.set_window_codex_active_turn_id(window_id, resolved_turn_id)
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
-                ok, msg = await self.send_inputs_to_window(
-                    window_id,
-                    inputs,
-                    steer=steer,
-                    force_new_turn=force_new_turn,
-                    dispatch_cwd=canonical_topic_cwd,
-                    ownership_validator=_topic_ownership_is_current,
-                    dispatch_state=dispatch_state,
-                    **topic_send_kwargs,
+                async def _send_local_context_once() -> tuple[bool, str]:
+                    return await self.send_inputs_to_window(
+                        window_id,
+                        inputs,
+                        steer=steer,
+                        force_new_turn=force_new_turn,
+                        dispatch_cwd=canonical_topic_cwd,
+                        ownership_validator=_topic_ownership_is_current,
+                        dispatch_state=effective_dispatch_state,
+                        **topic_send_kwargs,
+                    )
+
+                ok, msg = await _send_local_with_automatic_rollover(
+                    _send_local_context_once
                 )
                 if ok:
                     committed, commit_error = _commit_fresh_local_topic_thread()

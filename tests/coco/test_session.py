@@ -7347,3 +7347,435 @@ async def test_send_inputs_to_window_validates_owner_before_recovery_after_rebin
         "/workspace/b",
         "turn-b",
     )
+
+
+@pytest.mark.asyncio
+async def test_named_local_topic_rolls_over_stale_thread_after_aggregate_resume_limit(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A named Telegram-live topic may commit a fresh thread after recovery."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    async def _empty_goal_context(**_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(mgr, "_build_live_goal_context", _empty_goal_context)
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "",
+    )
+
+    user_id = 100
+    chat_id = -100123
+    topic_id = 17
+    window_id = "@930001"
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=window_id,
+        cwd="/workspace/topic",
+        display_name="named-topic",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+
+    exact_resume_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        raise session_mod._CodexAggregateResumeLimitError(
+            "Codex transcripts exceed aggregate resume limit"
+        )
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+
+    thread_start_calls: list[dict[str, object]] = []
+
+    async def _thread_start(**kwargs: object) -> dict[str, object]:
+        thread_start_calls.append(kwargs)
+        return {"thread": {"id": "thread-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_start",
+        _thread_start,
+    )
+
+    turn_start_thread_ids: list[str] = []
+    binding_before_fresh_turn: list[tuple[str, str]] = []
+
+    async def _turn_start(**kwargs: object) -> dict[str, object]:
+        thread_id = str(kwargs["thread_id"])
+        turn_start_thread_ids.append(thread_id)
+        if thread_id == "thread-old":
+            raise session_mod.CodexAppServerError("thread not found: thread-old")
+        binding = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+        assert binding is not None
+        binding_before_fresh_turn.append(
+            (binding.codex_thread_id, mgr.get_window_codex_thread_id(window_id))
+        )
+        return {"turn": {"id": "turn-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        text="continue this named topic",
+    )
+
+    assert ok is True, message
+    assert exact_resume_calls == [(window_id, "/workspace/topic", "thread-old")]
+    assert len(thread_start_calls) == 1
+    assert turn_start_thread_ids == ["thread-old", "thread-fresh"]
+    # The canonical binding is not changed until the fresh turn is accepted.
+    assert binding_before_fresh_turn == [("thread-old", "thread-fresh")]
+    binding = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-fresh"
+    state = mgr.get_window_state(window_id)
+    assert state.codex_thread_id == "thread-fresh"
+    assert state.codex_active_turn_id == "turn-fresh"
+
+
+@pytest.mark.asyncio
+async def test_named_local_topic_rollover_quarantines_fresh_thread_after_rebind(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A fresh recovery thread must not remain attached to an orphaned window."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    user_id = 100
+    chat_id = -100123
+    topic_id = 117
+    old_window_id = "@930011"
+    new_window_id = "@930012"
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=old_window_id,
+        cwd="/workspace/topic",
+        display_name="named-topic",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+
+    sends = 0
+
+    async def _send_to_window(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+        nonlocal sends
+        sends += 1
+        if sends == 1:
+            return (
+                False,
+                "App-server send failed: thread not found: thread-old; "
+                "retry with new thread failed: Codex transcripts exceed "
+                "aggregate resume limit",
+            )
+        mgr._set_window_codex_thread_cache(old_window_id, "thread-fresh")
+        mgr.set_window_codex_active_turn_id(old_window_id, "turn-fresh")
+        mgr.bind_topic_to_codex_thread(
+            user_id=user_id,
+            thread_id=topic_id,
+            chat_id=chat_id,
+            codex_thread_id="thread-rebound",
+            window_id=new_window_id,
+            cwd="/workspace/rebound",
+            display_name="rebound-topic",
+            machine_id="local-node",
+            machine_display_name="Local",
+        )
+        return True, "fresh recovery turn accepted"
+
+    monkeypatch.setattr(mgr, "send_to_window", _send_to_window)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=old_window_id,
+        text="continue this named topic",
+    )
+
+    assert ok is False
+    assert "binding changed" in message
+    rebound = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+    assert rebound is not None
+    assert rebound.window_id == new_window_id
+    assert rebound.codex_thread_id == "thread-rebound"
+    assert mgr.get_window_codex_thread_id(old_window_id) == ""
+    assert mgr.get_window_codex_active_turn_id(old_window_id) == ""
+
+
+@pytest.mark.asyncio
+async def test_named_remote_topic_rollover_retries_empty_thread_and_commits_fresh_binding(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A remote rollover is accepted only after the controller proves both dispatches."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(session_mod.node_registry, "get_node", lambda _mid: None)
+
+    user_id = 100
+    chat_id = -100123
+    topic_id = 18
+    window_id = "@930002"
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=window_id,
+        cwd="/workspace/remote-topic",
+        display_name="remote-topic",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def _transport_fields() -> dict[str, object]:
+        return {
+            "transport_epoch": "agent-epoch-1",
+            "transport_epoch_started_at": 100.0,
+            "transport_generation": 1,
+            "transport_reset_sequence": 0,
+            "transport_last_reset_generation": 0,
+            "transport_last_reset_reason": "",
+        }
+
+    async def _send_inputs(machine_id: str, **kwargs: object) -> dict[str, object]:
+        assert machine_id == "remote-node"
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            return {
+                "ok": False,
+                "message": (
+                    "App-server send failed: thread not found: thread-old; "
+                    "retry with new thread failed: Codex transcripts exceed "
+                    "aggregate resume limit (999 > 100 bytes): thread-old"
+                ),
+                "thread_id": "thread-old",
+                "turn_id": "",
+                **_transport_fields(),
+            }
+        assert kwargs["thread_id"] == ""
+        return {
+            "ok": True,
+            "message": "fresh remote dispatch",
+            "thread_id": "thread-fresh",
+            "turn_id": "turn-fresh",
+            "dispatch_mode": "turn_start",
+            **_transport_fields(),
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        text="continue this remote topic",
+    )
+
+    assert ok is True, message
+    assert [call["thread_id"] for call in calls] == ["thread-old", ""]
+    binding = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-fresh"
+    assert mgr.get_window_codex_thread_id(window_id) == "thread-fresh"
+    assert mgr.get_window_codex_active_turn_id(window_id) == "turn-fresh"
+
+
+@pytest.mark.asyncio
+async def test_named_remote_topic_rejects_unsolicited_mismatched_thread_response(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A mismatched remote acknowledgement is not implicit rollover proof."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(session_mod.node_registry, "get_node", lambda _mid: None)
+    user_id = 100
+    chat_id = -100123
+    topic_id = 19
+    window_id = "@930003"
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=window_id,
+        cwd="/workspace/remote-topic",
+        display_name="remote-topic",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+
+    calls: list[dict[str, object]] = []
+
+    async def _send_inputs(_machine_id: str, **kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "message": "unsolicited mismatched acknowledgement",
+            "thread_id": "thread-unrelated",
+            "turn_id": "turn-unrelated",
+            "transport_epoch": "agent-epoch-1",
+            "transport_epoch_started_at": 100.0,
+            "transport_generation": 1,
+        }
+
+    monkeypatch.setattr(agent_rpc_mod.agent_rpc_client, "send_inputs", _send_inputs)
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        text="continue this remote topic",
+    )
+
+    assert ok is False
+    assert "exact expected thread" in message
+    assert [call["thread_id"] for call in calls] == ["thread-old"]
+    binding = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-old"
+    assert mgr.get_window_codex_thread_id(window_id) == "thread-old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_kind", ["general", "shared_window"])
+async def test_local_general_and_shared_window_bindings_do_not_auto_rollover(
+    mgr: SessionManager,
+    monkeypatch,
+    binding_kind: str,
+) -> None:
+    """Only an isolated named topic may implicitly leave a stale thread behind."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    async def _empty_goal_context(**_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(mgr, "_build_live_goal_context", _empty_goal_context)
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "",
+    )
+
+    user_id = 100
+    chat_id = -100123
+    window_id = "@930004"
+    topic_id = 1 if binding_kind == "general" else 20
+    if binding_kind == "general":
+        mgr.set_coco_control_topic(user_id, topic_id, chat_id=chat_id)
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=window_id,
+        cwd="/workspace/topic",
+        display_name="general" if binding_kind == "general" else "shared-topic",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    if binding_kind == "shared_window":
+        mgr.bind_topic_to_codex_thread(
+            user_id=200,
+            thread_id=21,
+            chat_id=chat_id,
+            codex_thread_id="thread-old",
+            window_id=window_id,
+            cwd="/workspace/topic",
+            display_name="other-topic",
+            machine_id="local-node",
+            machine_display_name="Local",
+        )
+
+    exact_resume_calls: list[tuple[str, str, str]] = []
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        exact_resume_calls.append((window_id, cwd, thread_id))
+        raise session_mod._CodexAggregateResumeLimitError(
+            "Codex transcripts exceed aggregate resume limit"
+        )
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    thread_start_calls: list[dict[str, object]] = []
+
+    async def _thread_start(**kwargs: object) -> dict[str, object]:
+        thread_start_calls.append(kwargs)
+        return {"thread": {"id": "thread-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_start",
+        _thread_start,
+    )
+    turn_start_thread_ids: list[str] = []
+
+    async def _turn_start(**kwargs: object) -> dict[str, object]:
+        turn_start_thread_ids.append(str(kwargs["thread_id"]))
+        raise session_mod.CodexAppServerError("thread not found: thread-old")
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        text="do not leave this binding implicitly",
+    )
+
+    assert ok is False
+    assert message
+    assert turn_start_thread_ids == ["thread-old"]
+    assert exact_resume_calls == [(window_id, "/workspace/topic", "thread-old")]
+    assert thread_start_calls == []
+    binding = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-old"
+    state = mgr.get_window_state(window_id)
+    assert state.codex_thread_id == "thread-old"
