@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile missed Chief of Staff GitHub directives
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pcopu/env/coco
+ExecStart=/home/pcopu/env/coco/.venv/bin/python -m coco.chief_of_staff reconcile
+Environment=HOME=/home/pcopu
+Environment=COCO_DIR=/home/pcopu/.coco
+Environment=COS_ENV_FILE=/home/pcopu/.coco/chief-of-staff.env
+Environment=PYTHONUNBUFFERED=1
+Environment="PATH=/home/pcopu/.nvm/versions/node/v24.13.1/bin:/home/pcopu/.local/bin:/usr/local/bin:/usr/bin:/bin"

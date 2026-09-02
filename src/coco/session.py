@@ -83,6 +83,7 @@ class TopicSendDispatchState:
     """
 
     transport_dispatch_started: bool = False
+    pre_dispatch_transport_failure: bool = False
     # The transport may receive ``steer=True`` while no active turn remains;
     # in that case the app-server path deliberately starts a new turn.  Keep
     # that resolved mode alongside the write-boundary marker so callers can
@@ -95,6 +96,11 @@ class TopicSendDispatchState:
 
     def mark_transport_dispatch_started(self) -> None:
         self.transport_dispatch_started = True
+
+    def mark_pre_dispatch_transport_failure(self) -> None:
+        """Record a transport failure proven to precede request dispatch."""
+        if not self.transport_dispatch_started:
+            self.pre_dispatch_transport_failure = True
 
     def mark_turn_started(self) -> None:
         """Record a successful ``turn/start`` dispatch."""
@@ -3192,8 +3198,14 @@ class SessionManager:
         force_new_turn: bool = False,
         dispatch_state: TopicSendDispatchState | None = None,
         topic_ownership: TopicOwnership | None = None,
+        structured_inputs: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, str]:
-        """Send user/topic text with app/skill context applied."""
+        """Send user/topic content with app/skill context applied."""
+        direct_inputs = (
+            [dict(item) for item in structured_inputs]
+            if structured_inputs is not None
+            else None
+        )
         effective_dispatch_state = dispatch_state or TopicSendDispatchState(
             notify_transport_dispatch=False
         )
@@ -3336,13 +3348,18 @@ class SessionManager:
             )
             return True, ""
 
+        is_coco_control = self.is_coco_control_topic(
+            user_id,
+            thread_id,
+            chat_id=chat_id,
+        )
+        coco_control = self.get_coco_control_topic(int(chat_id or 0))
         automatic_rollover_allowed = bool(
             thread_id is not None
             and canonical_topic_thread_id
-            and not self.is_coco_control_topic(
-                user_id,
-                thread_id,
-                chat_id=chat_id,
+            and (
+                not is_coco_control
+                or (coco_control is not None and coco_control.user_id == user_id)
             )
             and self.get_topic_sync_mode(user_id, thread_id, chat_id=chat_id)
             == TOPIC_SYNC_MODE_TELEGRAM_LIVE
@@ -3450,25 +3467,54 @@ class SessionManager:
                 or resolved_fresh_thread_id == canonical_topic_thread_id
             ):
                 return False, "Codex did not return a fresh recovery thread."
-            self.bind_topic_to_codex_thread(
-                user_id=user_id,
-                thread_id=thread_id,
-                chat_id=chat_id,
-                codex_thread_id=resolved_fresh_thread_id,
-                cwd=canonical_topic_cwd,
-                display_name=(
-                    persisted_topic_binding.display_name.strip()
-                    if persisted_topic_binding is not None
-                    else self.get_display_name(window_id)
-                ),
-                window_id=window_id,
-                machine_id=machine_id,
-                machine_display_name=(
-                    persisted_topic_binding.machine_display_name.strip()
-                    if persisted_topic_binding is not None
-                    else ""
-                ),
-            )
+            if is_coco_control:
+                if coco_control is None or coco_control.user_id != user_id:
+                    return (
+                        False,
+                        "General's control owner changed while its fresh recovery "
+                        "turn was in flight. The request will not be replayed.",
+                    )
+                current_binding = self._get_persisted_topic_binding(
+                    user_id,
+                    thread_id,
+                    chat_id=chat_id,
+                )
+                if (
+                    current_binding is None
+                    or current_binding.codex_thread_id.strip()
+                    != canonical_topic_thread_id
+                    or current_binding.window_id.strip() != window_id
+                ):
+                    return (
+                        False,
+                        "General's canonical Codex binding changed while its fresh "
+                        "recovery turn was in flight. The request will not be replayed.",
+                    )
+                current_binding.codex_thread_id = resolved_fresh_thread_id
+                self.get_window_state(window_id).codex_thread_id = (
+                    resolved_fresh_thread_id
+                )
+                self._save_state()
+            else:
+                self.bind_topic_to_codex_thread(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    chat_id=chat_id,
+                    codex_thread_id=resolved_fresh_thread_id,
+                    cwd=canonical_topic_cwd,
+                    display_name=(
+                        persisted_topic_binding.display_name.strip()
+                        if persisted_topic_binding is not None
+                        else self.get_display_name(window_id)
+                    ),
+                    window_id=window_id,
+                    machine_id=machine_id,
+                    machine_display_name=(
+                        persisted_topic_binding.machine_display_name.strip()
+                        if persisted_topic_binding is not None
+                        else ""
+                    ),
+                )
             emit_telemetry(
                 "transport.app_server.thread_missing_rollover_committed",
                 runtime_mode=config.runtime_mode,
@@ -3571,6 +3617,16 @@ class SessionManager:
             return result, True, ""
 
         local_machine_id, _local_machine_name = self._local_machine_identity()
+        if (
+            direct_inputs is not None
+            and machine_id
+            and machine_id != local_machine_id
+        ):
+            return (
+                False,
+                "Attachments to remote sessions are not supported yet. "
+                "Send this attachment in a local topic.",
+            )
         operator_context = self._build_coco_operator_context(
             user_id=user_id,
             thread_id=thread_id,
@@ -3974,6 +4030,17 @@ class SessionManager:
                 msg = str(remote_result.get("message", "")).strip() or "Remote send complete."
             else:
                 async def _send_local_plain_once() -> tuple[bool, str]:
+                    if direct_inputs is not None:
+                        return await self.send_inputs_to_window(
+                            window_id,
+                            direct_inputs,
+                            steer=steer,
+                            force_new_turn=force_new_turn,
+                            dispatch_cwd=canonical_topic_cwd,
+                            ownership_validator=_topic_ownership_is_current,
+                            dispatch_state=effective_dispatch_state,
+                            **topic_send_kwargs,
+                        )
                     return await self.send_to_window(
                         window_id,
                         text,
@@ -4021,7 +4088,10 @@ class SessionManager:
                 inputs.insert(0, {"type": "text", "text": app_context})
             if goal_context:
                 inputs.append({"type": "text", "text": goal_context})
-            inputs.append({"type": "text", "text": text})
+            if direct_inputs is not None:
+                inputs.extend(direct_inputs)
+            else:
+                inputs.append({"type": "text", "text": text})
             if machine_id and machine_id != local_machine_id:
                 from .agent_rpc import (
                     RemoteCodexMutationDeferredError,
@@ -4202,6 +4272,9 @@ class SessionManager:
                 )
             return ok, msg
 
+        if direct_inputs is not None:
+            return False, "Structured inputs require Codex app-server transport."
+
         injected_text = text
         if goal_context:
             injected_text = f"{goal_context}\n\n{injected_text}"
@@ -4234,6 +4307,34 @@ class SessionManager:
                 chat_id=chat_id,
             )
         return ok, msg
+
+    async def send_topic_inputs_to_window(
+        self,
+        *,
+        user_id: int,
+        thread_id: int | None,
+        chat_id: int | None = None,
+        window_id: str,
+        inputs: list[dict[str, Any]],
+        user_text: str = "",
+        steer: bool = False,
+        force_new_turn: bool = False,
+        dispatch_state: TopicSendDispatchState | None = None,
+        topic_ownership: TopicOwnership | None = None,
+    ) -> tuple[bool, str]:
+        """Send structured inputs through the topic-aware recovery path."""
+        return await self.send_topic_text_to_window(
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            window_id=window_id,
+            text=user_text,
+            steer=steer,
+            force_new_turn=force_new_turn,
+            dispatch_state=dispatch_state,
+            topic_ownership=topic_ownership,
+            structured_inputs=inputs,
+        )
 
     def _set_topic_binding(
         self,
@@ -7256,6 +7357,12 @@ class SessionManager:
                         )
                     return send_result
                 except Exception as e:
+                    if (
+                        transport_dispatch_state is not None
+                        and isinstance(e, CodexAppServerError)
+                        and e.request_dispatched is False
+                    ):
+                        transport_dispatch_state.mark_pre_dispatch_transport_failure()
                     stale_thread_id = dispatched_thread_id
                     stale_turn_id = dispatched_turn_id
                     error_text = str(e)

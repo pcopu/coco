@@ -5054,6 +5054,50 @@ async def test_send_inputs_to_window_app_server_failure_returns_without_legacy_f
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_dispatched", "expected_pre_dispatch"),
+    [(False, True), (None, False), (True, False)],
+)
+async def test_send_inputs_only_marks_definite_failure_pre_dispatch(
+    mgr: SessionManager,
+    monkeypatch,
+    request_dispatched: bool | None,
+    expected_pre_dispatch: bool,
+) -> None:
+    state = mgr.get_window_state("@900002")
+    state.cwd = "/tmp/demo"
+    state.window_name = "demo"
+
+    monkeypatch.setattr(session_mod.config, "session_provider", "codex")
+    monkeypatch.setattr(session_mod.config, "runtime_mode", "hybrid")
+    monkeypatch.setattr(session_mod.config, "codex_transport", "app_server")
+
+    async def _send_inputs_via_codex_app_server(**_kwargs: object) -> tuple[bool, str]:
+        raise session_mod.CodexAppServerError(
+            "app-server startup failed",
+            request_dispatched=request_dispatched,
+        )
+
+    monkeypatch.setattr(
+        mgr,
+        "_send_inputs_via_codex_app_server",
+        _send_inputs_via_codex_app_server,
+    )
+    dispatch_state = session_mod.TopicSendDispatchState()
+
+    ok, message = await mgr.send_inputs_to_window(
+        "@900002",
+        [{"type": "localImage", "path": "/tmp/photo.png"}],
+        dispatch_state=dispatch_state,
+    )
+
+    assert ok is False
+    assert message == "App-server send failed: app-server startup failed"
+    assert dispatch_state.transport_dispatch_started is False
+    assert dispatch_state.pre_dispatch_transport_failure is expected_pre_dispatch
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_to_window_thread_not_found_retries_bound_thread(
     mgr: SessionManager,
     monkeypatch,
@@ -7350,11 +7394,13 @@ async def test_send_inputs_to_window_validates_owner_before_recovery_after_rebin
 
 
 @pytest.mark.asyncio
-async def test_named_local_topic_rolls_over_stale_thread_after_aggregate_resume_limit(
+@pytest.mark.parametrize("topic_kind", ["named", "general"])
+async def test_local_topic_rolls_over_stale_thread_after_aggregate_resume_limit(
     mgr: SessionManager,
     monkeypatch,
+    topic_kind: str,
 ) -> None:
-    """A named Telegram-live topic may commit a fresh thread after recovery."""
+    """An isolated Telegram-live topic may commit a fresh thread after recovery."""
     monkeypatch.setattr(
         mgr,
         "_local_machine_identity",
@@ -7374,8 +7420,10 @@ async def test_named_local_topic_rolls_over_stale_thread_after_aggregate_resume_
 
     user_id = 100
     chat_id = -100123
-    topic_id = 17
+    topic_id = 1 if topic_kind == "general" else 17
     window_id = "@930001"
+    if topic_kind == "general":
+        mgr.set_coco_control_topic(user_id, topic_id, chat_id=chat_id)
     mgr.bind_topic_to_codex_thread(
         user_id=user_id,
         thread_id=topic_id,
@@ -7383,7 +7431,7 @@ async def test_named_local_topic_rolls_over_stale_thread_after_aggregate_resume_
         codex_thread_id="thread-old",
         window_id=window_id,
         cwd="/workspace/topic",
-        display_name="named-topic",
+        display_name="coco-control" if topic_kind == "general" else "named-topic",
         machine_id="local-node",
         machine_display_name="Local",
     )
@@ -7451,6 +7499,280 @@ async def test_named_local_topic_rolls_over_stale_thread_after_aggregate_resume_
     state = mgr.get_window_state(window_id)
     assert state.codex_thread_id == "thread-fresh"
     assert state.codex_active_turn_id == "turn-fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topic_kind", ["named", "general"])
+async def test_local_topic_structured_inputs_roll_over_with_topic_settings(
+    mgr: SessionManager,
+    monkeypatch,
+    topic_kind: str,
+) -> None:
+    """Structured image inputs inherit topic settings and stale-thread rollover."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    async def _empty_goal_context(**_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(mgr, "_build_live_goal_context", _empty_goal_context)
+    monkeypatch.setattr(mgr, "_build_coco_operator_context", lambda **_kwargs: "")
+    monkeypatch.setattr(mgr, "resolve_thread_skills", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        mgr,
+        "resolve_thread_codex_skills",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "",
+    )
+
+    user_id = 100
+    chat_id = -100123
+    topic_id = 1 if topic_kind == "general" else 18
+    window_id = "@930010"
+    if topic_kind == "general":
+        mgr.set_coco_control_topic(user_id, topic_id, chat_id=chat_id)
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=window_id,
+        cwd="/workspace/topic",
+        display_name="coco-control" if topic_kind == "general" else "image-topic",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
+    mgr.set_topic_model_selection(
+        user_id,
+        topic_id,
+        chat_id=chat_id,
+        model_slug="gpt-5.6-luna",
+        reasoning_effort="max",
+    )
+    mgr.set_topic_service_tier_selection(
+        user_id,
+        topic_id,
+        chat_id=chat_id,
+        service_tier="fast",
+    )
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        raise session_mod._CodexAggregateResumeLimitError(
+            "Codex transcripts exceed aggregate resume limit"
+        )
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+
+    async def _thread_start(**_kwargs: object) -> dict[str, object]:
+        return {"thread": {"id": "thread-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_start",
+        _thread_start,
+    )
+
+    turn_start_calls: list[dict[str, object]] = []
+
+    async def _turn_start(**kwargs: object) -> dict[str, object]:
+        turn_start_calls.append(kwargs)
+        if kwargs["thread_id"] == "thread-old":
+            raise session_mod.CodexAppServerError("thread not found: thread-old")
+        return {"turn": {"id": "turn-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+    inputs = [
+        {"type": "localImage", "path": "/workspace/topic/chart.png"},
+        {"type": "text", "text": "Inspect this image"},
+    ]
+
+    ok, message = await mgr.send_topic_inputs_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        inputs=inputs,
+    )
+
+    assert ok is True, message
+    assert [call["thread_id"] for call in turn_start_calls] == [
+        "thread-old",
+        "thread-fresh",
+    ]
+    assert all(call["inputs"][1:] == inputs for call in turn_start_calls)
+    assert all(call["inputs"][0]["type"] == "text" for call in turn_start_calls)
+    assert all(call["model"] == "gpt-5.6-luna" for call in turn_start_calls)
+    assert all(call["effort"] == "max" for call in turn_start_calls)
+    assert all(call["service_tier"] == "fast" for call in turn_start_calls)
+    binding = mgr.resolve_topic_binding(user_id, topic_id, chat_id=chat_id)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-fresh"
+    assert binding.cwd == "/workspace/topic"
+    assert binding.display_name == (
+        "coco-control" if topic_kind == "general" else "image-topic"
+    )
+    assert binding.machine_id == "local-node"
+    assert binding.model_slug == "gpt-5.6-luna"
+    assert binding.reasoning_effort == "max"
+    assert binding.service_tier == "fast"
+    assert mgr.get_window_codex_thread_id(window_id) == "thread-fresh"
+
+
+@pytest.mark.asyncio
+async def test_non_owner_general_binding_cannot_auto_roll_over(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+
+    async def _empty_goal_context(**_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(mgr, "_build_live_goal_context", _empty_goal_context)
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "get_active_turn_id",
+        lambda _thread_id: "",
+    )
+
+    owner_user_id = 100
+    caller_user_id = 200
+    chat_id = -100123
+    topic_id = 1
+    window_id = "@930020"
+    mgr.set_coco_control_topic(owner_user_id, topic_id, chat_id=chat_id)
+    mgr._set_topic_binding(
+        user_id=caller_user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        binding=session_mod.TopicBinding(
+            transport=session_mod.TOPIC_BINDING_TRANSPORT_CODEX_THREAD,
+            chat_id=chat_id,
+            thread_id=topic_id,
+            window_id=window_id,
+            codex_thread_id="thread-old",
+            cwd="/workspace/topic",
+            display_name="coco-control",
+            sync_mode=session_mod.TOPIC_SYNC_MODE_TELEGRAM_LIVE,
+            machine_id="local-node",
+            machine_display_name="Local",
+        ),
+    )
+    state = mgr.get_window_state(window_id)
+    state.codex_thread_id = "thread-old"
+    state.cwd = "/workspace/topic"
+    state.window_name = "coco-control"
+
+    async def _resume_exact(*, window_id: str, cwd: str, thread_id: str) -> str:
+        raise session_mod._CodexAggregateResumeLimitError(
+            "Codex transcripts exceed aggregate resume limit"
+        )
+
+    monkeypatch.setattr(mgr, "resume_codex_session_for_window", _resume_exact)
+    thread_start_calls: list[dict[str, object]] = []
+
+    async def _thread_start(**kwargs: object) -> dict[str, object]:
+        thread_start_calls.append(kwargs)
+        return {"thread": {"id": "thread-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "thread_start",
+        _thread_start,
+    )
+
+    async def _turn_start(**kwargs: object) -> dict[str, object]:
+        if kwargs["thread_id"] == "thread-old":
+            raise session_mod.CodexAppServerError("thread not found: thread-old")
+        return {"turn": {"id": "turn-fresh"}}
+
+    monkeypatch.setattr(
+        session_mod.codex_app_server_client,
+        "turn_start",
+        _turn_start,
+    )
+
+    ok, message = await mgr.send_topic_text_to_window(
+        user_id=caller_user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        text="continue this invalid control binding",
+    )
+
+    assert ok is False
+    assert message
+    assert thread_start_calls == []
+    binding = mgr.resolve_topic_binding(caller_user_id, topic_id, chat_id=chat_id)
+    assert binding is not None
+    assert binding.codex_thread_id == "thread-old"
+    assert mgr.get_window_codex_thread_id(window_id) == "thread-old"
+
+
+@pytest.mark.asyncio
+async def test_remote_topic_rejects_controller_local_structured_inputs(
+    mgr: SessionManager,
+    monkeypatch,
+) -> None:
+    """A remote topic must never receive controller-local attachment paths."""
+    monkeypatch.setattr(
+        mgr,
+        "_local_machine_identity",
+        lambda: ("local-node", "Local"),
+    )
+    monkeypatch.setattr(mgr, "_codex_app_server_mode_enabled", lambda: True)
+    user_id = 100
+    chat_id = -100123
+    topic_id = 19
+    window_id = "@930019"
+    mgr.bind_topic_to_codex_thread(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        codex_thread_id="thread-remote",
+        window_id=window_id,
+        cwd="/workspace/remote",
+        display_name="remote-image-topic",
+        machine_id="remote-node",
+        machine_display_name="Remote",
+    )
+
+    async def _unexpected_remote_send(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("controller-local image path reached remote transport")
+
+    monkeypatch.setattr(
+        agent_rpc_mod.agent_rpc_client,
+        "send_inputs",
+        _unexpected_remote_send,
+    )
+
+    ok, message = await mgr.send_topic_inputs_to_window(
+        user_id=user_id,
+        thread_id=topic_id,
+        chat_id=chat_id,
+        window_id=window_id,
+        inputs=[{"type": "localImage", "path": "/controller/photo.png"}],
+    )
+
+    assert ok is False
+    assert "remote sessions" in message
 
 
 @pytest.mark.asyncio
@@ -7675,13 +7997,11 @@ async def test_named_remote_topic_rejects_unsolicited_mismatched_thread_response
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("binding_kind", ["general", "shared_window"])
-async def test_local_general_and_shared_window_bindings_do_not_auto_rollover(
+async def test_local_shared_window_bindings_do_not_auto_rollover(
     mgr: SessionManager,
     monkeypatch,
-    binding_kind: str,
 ) -> None:
-    """Only an isolated named topic may implicitly leave a stale thread behind."""
+    """A shared topic window must not implicitly leave a stale thread behind."""
     monkeypatch.setattr(
         mgr,
         "_local_machine_identity",
@@ -7702,9 +8022,7 @@ async def test_local_general_and_shared_window_bindings_do_not_auto_rollover(
     user_id = 100
     chat_id = -100123
     window_id = "@930004"
-    topic_id = 1 if binding_kind == "general" else 20
-    if binding_kind == "general":
-        mgr.set_coco_control_topic(user_id, topic_id, chat_id=chat_id)
+    topic_id = 20
     mgr.bind_topic_to_codex_thread(
         user_id=user_id,
         thread_id=topic_id,
@@ -7712,22 +8030,21 @@ async def test_local_general_and_shared_window_bindings_do_not_auto_rollover(
         codex_thread_id="thread-old",
         window_id=window_id,
         cwd="/workspace/topic",
-        display_name="general" if binding_kind == "general" else "shared-topic",
+        display_name="shared-topic",
         machine_id="local-node",
         machine_display_name="Local",
     )
-    if binding_kind == "shared_window":
-        mgr.bind_topic_to_codex_thread(
-            user_id=200,
-            thread_id=21,
-            chat_id=chat_id,
-            codex_thread_id="thread-old",
-            window_id=window_id,
-            cwd="/workspace/topic",
-            display_name="other-topic",
-            machine_id="local-node",
-            machine_display_name="Local",
-        )
+    mgr.bind_topic_to_codex_thread(
+        user_id=200,
+        thread_id=21,
+        chat_id=chat_id,
+        codex_thread_id="thread-old",
+        window_id=window_id,
+        cwd="/workspace/topic",
+        display_name="other-topic",
+        machine_id="local-node",
+        machine_display_name="Local",
+    )
 
     exact_resume_calls: list[tuple[str, str, str]] = []
 

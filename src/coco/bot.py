@@ -9894,6 +9894,26 @@ async def _dispatch_pending_dashboard_steer(
 
 # Per-topic lock for Codex image resume submissions: (user_id, thread_id) -> lock
 _photo_resume_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_SAFE_IMAGE_CLI_FALLBACK_ERRORS = frozenset(
+    {
+        "Codex app-server transport is unavailable.",
+        "Structured inputs require Codex app-server transport.",
+    }
+)
+
+
+def _is_safe_image_cli_fallback_error(
+    error: str,
+    dispatch_state: TopicSendDispatchState,
+) -> bool:
+    """Return whether app-server failed definitely before image dispatch."""
+    return bool(
+        not dispatch_state.transport_dispatch_started
+        and (
+            error in _SAFE_IMAGE_CLI_FALLBACK_ERRORS
+            or dispatch_state.pre_dispatch_transport_failure
+        )
+    )
 
 _DOCUMENT_TEXT_EXTENSIONS = {
     ".txt",
@@ -10177,18 +10197,32 @@ def _build_codex_image_resume_cmd(
     session_id: str,
     image_path: Path,
     prompt: str,
+    *,
+    model_slug: str = "",
+    reasoning_effort: str = "",
+    service_tier: str = "",
 ) -> list[str]:
     """Build `codex exec resume` command for image + prompt."""
-    return [
+    cmd = [
         codex_binary,
         "exec",
         "resume",
         session_id,
         "--skip-git-repo-check",
-        "-i",
-        str(image_path),
-        prompt,
     ]
+    if model_slug:
+        cmd.extend(["--model", model_slug])
+    if reasoning_effort:
+        cmd.extend(
+            [
+                "--config",
+                f"model_reasoning_effort={json.dumps(reasoning_effort)}",
+            ]
+        )
+    if service_tier:
+        cmd.extend(["--config", f"service_tier={json.dumps(service_tier)}"])
+    cmd.extend(["-i", str(image_path), prompt])
+    return cmd
 
 
 def _tail_command_output(data: bytes, limit: int = 700) -> str:
@@ -10218,10 +10252,10 @@ async def _submit_image_to_codex_session(
     image_path: Path,
     prompt: str,
     topic_ownership: TopicOwnership,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Submit an image prompt into the existing Codex session."""
     if config.session_provider != "codex":
-        return False, "Image bridge is only available in Codex provider mode."
+        return False, "Image bridge is only available in Codex provider mode.", True
 
     def _topic_ownership_is_current() -> bool:
         return is_topic_ownership_current(
@@ -10235,10 +10269,17 @@ async def _submit_image_to_codex_session(
         topic_ownership.window_id != window_id
         or not _topic_ownership_is_current()
     ):
-        return False, "The topic binding changed before the image could be sent."
+        return False, "The topic binding changed before the image could be sent.", False
+    remote_ingress_error = _remote_attachment_ingress_error(
+        topic_ownership,
+        attachment_type="photo",
+    )
+    if remote_ingress_error:
+        return False, remote_ingress_error, False
 
     # Try app-server image input first whenever app-server transport is preferred.
     if _codex_app_server_preferred():
+        dispatch_state = TopicSendDispatchState()
         steer = bool(session_manager.get_window_codex_active_turn_id(window_id))
         if not steer:
             codex_thread_id = session_manager.get_window_codex_thread_id(window_id)
@@ -10248,21 +10289,39 @@ async def _submit_image_to_codex_session(
             {"type": "localImage", "path": str(image_path)},
             {"type": "text", "text": prompt},
         ]
-        ok, err = await session_manager.send_inputs_to_window(
-            window_id,
-            inputs,
-            steer=steer,
-            dispatch_cwd=topic_ownership.cwd,
-            ownership_validator=_topic_ownership_is_current,
-        )
-        if ok:
-            session_manager.mark_topic_telegram_live(
+        try:
+            ok, err = await session_manager.send_topic_inputs_to_window(
                 user_id=user_id,
                 thread_id=thread_id,
                 chat_id=chat_id,
                 window_id=window_id,
+                inputs=inputs,
+                user_text=prompt,
+                steer=steer,
+                dispatch_state=dispatch_state,
+                topic_ownership=topic_ownership,
             )
-            return True, ""
+        except Exception as exc:
+            if (
+                isinstance(exc, CodexAppServerError)
+                and exc.request_dispatched is False
+            ):
+                dispatch_state.mark_pre_dispatch_transport_failure()
+            ok = False
+            err = f"App-server send failed: {exc}"
+        if ok:
+            return True, "", False
+        if not _is_safe_image_cli_fallback_error(err, dispatch_state):
+            emit_telemetry(
+                "transport.image.cli_fallback_blocked",
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                window_id=window_id,
+                transport_dispatch_started=dispatch_state.transport_dispatch_started,
+                error=err,
+            )
+            return False, err, False
         logger.warning(
             "App-server image send failed; falling back to CLI resume bridge (user=%d thread=%d window=%s): %s",
             user_id,
@@ -10270,26 +10329,56 @@ async def _submit_image_to_codex_session(
             window_id,
             err,
         )
+        emit_telemetry(
+            "transport.image.cli_fallback_started",
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            window_id=window_id,
+            error=err,
+        )
 
     codex_binary = _resolve_codex_exec_binary()
     if not codex_binary:
-        return False, "Codex CLI executable not found in PATH."
+        return False, "Codex CLI executable not found in PATH.", True
 
     session = await session_manager.resolve_session_for_window(window_id)
     if not session or not session.session_id:
-        return False, "No active Codex session found for this topic yet."
+        return False, "No active Codex session found for this topic yet.", True
+    if (
+        topic_ownership.codex_thread_id
+        and session.session_id != topic_ownership.codex_thread_id
+    ):
+        return (
+            False,
+            "The topic's active Codex session changed before the image could be sent.",
+            False,
+        )
 
     window_state = session_manager.get_window_state(window_id)
     workdir = window_state.cwd or str(Path.cwd())
+    model_slug, reasoning_effort = session_manager.get_topic_model_selection(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    service_tier = session_manager.get_topic_service_tier_selection(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
     cmd = _build_codex_image_resume_cmd(
         codex_binary,
         session.session_id,
         image_path,
         prompt,
+        model_slug=model_slug,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
     )
 
     if not _topic_ownership_is_current():
-        return False, "The topic binding changed before the image could be sent."
+        return False, "The topic binding changed before the image could be sent.", False
 
     logger.info(
         "Submitting image via Codex resume (user=%d thread=%d window=%s session=%s image=%s)",
@@ -10308,7 +10397,7 @@ async def _submit_image_to_codex_session(
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as e:
-        return False, f"Failed to start Codex image bridge: {e}"
+        return False, f"Failed to start Codex image bridge: {e}", True
 
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0:
@@ -10319,12 +10408,16 @@ async def _submit_image_to_codex_session(
             chat_id=chat_id,
             window_id=window_id,
         )
-        return True, ""
+        return True, "", False
 
     details = _tail_command_output(stderr or stdout)
     if details:
-        return False, f"Codex image bridge failed (exit {proc.returncode}): {details}"
-    return False, f"Codex image bridge failed (exit {proc.returncode})."
+        return (
+            False,
+            f"Codex image bridge failed (exit {proc.returncode}): {details}",
+            False,
+        )
+    return False, f"Codex image bridge failed (exit {proc.returncode}).", False
 
 
 async def _run_photo_bridge_task(
@@ -10342,7 +10435,7 @@ async def _run_photo_bridge_task(
     lock = _get_photo_resume_lock(user_id, thread_id)
     async with lock:
         try:
-            ok, err = await _submit_image_to_codex_session(
+            ok, err, path_fallback_allowed = await _submit_image_to_codex_session(
                 user_id=user_id,
                 thread_id=thread_id,
                 chat_id=chat_id,
@@ -10352,6 +10445,19 @@ async def _run_photo_bridge_task(
                 topic_ownership=topic_ownership,
             )
             if ok:
+                return
+
+            if not path_fallback_allowed:
+                await safe_send(
+                    bot,
+                    session_manager.resolve_chat_id(
+                        user_id,
+                        thread_id,
+                        chat_id=chat_id,
+                    ),
+                    f"❌ {err}",
+                    message_thread_id=thread_id,
+                )
                 return
 
             logger.warning(
@@ -18716,6 +18822,9 @@ async def _handle_controller_rpc_request(
     if not isinstance(method, str) or not isinstance(inner_params, dict):
         return None
 
+    if method == "chief_of_staff/enqueue":
+        return await _handle_chief_of_staff_enqueue(inner_params, bot=bot)
+
     if "transport" in rpc_params:
         transport = rpc_params.get("transport")
         if not isinstance(transport, dict):
@@ -18776,6 +18885,114 @@ async def _handle_controller_rpc_request(
         )
         return None
     return result
+
+
+async def _handle_chief_of_staff_enqueue(
+    params: dict[str, object],
+    *,
+    bot: Bot,
+) -> dict[str, object]:
+    """Attempt one durable Chief of Staff delivery into General.
+
+    The webhook service owns persistence and retry.  This controller method
+    therefore has deliberately simple semantics: if General is busy, it
+    reports ``busy`` without creating an in-memory queue entry; if General is
+    idle, it performs exactly one fenced transport send.  An uncertain
+    post-dispatch result is reported as accepted so the external service does
+    not blindly replay a request that Codex may already have received.
+    """
+    directive_id = str(params.get("directive_id", "")).strip()
+    prompt = str(params.get("prompt", "")).strip()
+    try:
+        control_chat_id = int(params.get("control_chat_id", 0) or 0)
+    except (TypeError, ValueError):
+        control_chat_id = 0
+    if (
+        not directive_id
+        or len(directive_id) > 128
+        or not prompt
+        or len(prompt.encode("utf-8")) > 64 * 1024
+        or control_chat_id == 0
+    ):
+        return {"accepted": False, "status": "invalid_request"}
+
+    control = session_manager.get_coco_control_topic(control_chat_id)
+    if control is None or control.thread_id != GENERAL_TOPIC_THREAD_ID:
+        return {"accepted": False, "status": "control_unavailable"}
+
+    window_id = session_manager.get_window_for_thread(
+        control.user_id,
+        control.thread_id,
+        chat_id=control.chat_id,
+    )
+    if window_id is None:
+        return {"accepted": False, "status": "control_unavailable"}
+    topic_ownership = capture_topic_ownership(
+        control.user_id,
+        control.thread_id,
+        control.chat_id,
+    )
+    if topic_ownership is None:
+        return {"accepted": False, "status": "control_unavailable"}
+
+    if await _is_window_in_progress(
+        control.user_id,
+        control.thread_id,
+        window_id,
+        chat_id=control.chat_id,
+    ):
+        return {"accepted": False, "status": "busy", "retry_after": 30}
+
+    dispatch_state = TopicSendDispatchState()
+    success, send_msg = await session_manager.send_topic_text_to_window(
+        user_id=control.user_id,
+        thread_id=control.thread_id,
+        chat_id=control.chat_id,
+        window_id=window_id,
+        text=prompt,
+        force_new_turn=True,
+        dispatch_state=dispatch_state,
+        topic_ownership=topic_ownership,
+    )
+    if success:
+        note_run_started(
+            user_id=control.user_id,
+            thread_id=control.thread_id,
+            chat_id=control.chat_id,
+            window_id=window_id,
+            source="chief_of_staff",
+            pending_text=prompt,
+            expect_response=True,
+        )
+        emit_telemetry(
+            "chief_of_staff.directive_started",
+            directive_id=directive_id,
+            chat_id=control.chat_id,
+            window_id=window_id,
+        )
+        return {"accepted": True, "status": "started"}
+
+    uncertain = (
+        dispatch_state.transport_dispatch_started
+        or session_manager.is_codex_uncertain_send_result(send_msg)
+    )
+    if uncertain:
+        emit_telemetry(
+            "chief_of_staff.directive_uncertain",
+            directive_id=directive_id,
+            chat_id=control.chat_id,
+            window_id=window_id,
+        )
+        return {"accepted": True, "status": "uncertain"}
+
+    if session_manager.is_codex_active_writer_error(send_msg):
+        return {"accepted": False, "status": "busy", "retry_after": 30}
+    return {
+        "accepted": False,
+        "status": "retry",
+        "retry_after": 30,
+        "error": str(send_msg or "send_failed")[:500],
+    }
 
 
 # --- App lifecycle ---

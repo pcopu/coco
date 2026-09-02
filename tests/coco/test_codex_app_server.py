@@ -2118,6 +2118,39 @@ async def test_turn_interrupt_timeout_exposes_dispatched_outcome(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_request_dispatched", [None, True])
+async def test_request_normalizes_startup_failure_as_user_request_pre_dispatch(
+    monkeypatch,
+    startup_request_dispatched: bool | None,
+) -> None:
+    client = cas.CodexAppServerClient()
+    dispatched: list[str] = []
+
+    async def _ensure_started() -> None:
+        raise cas.CodexAppServerError(
+            "app-server startup failed",
+            request_dispatched=startup_request_dispatched,
+        )
+
+    async def _request_started(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("user request must not start after startup failure")
+
+    monkeypatch.setattr(client, "ensure_started", _ensure_started)
+    monkeypatch.setattr(client, "_request_started", _request_started)
+
+    with pytest.raises(cas.CodexAppServerError) as raised:
+        await client.request(
+            "turn/start",
+            {},
+            on_dispatch=lambda: dispatched.append("turn/start"),
+        )
+
+    assert str(raised.value) == "app-server startup failed"
+    assert raised.value.request_dispatched is False
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
 async def test_uncertain_turn_timeout_recovery_preserves_unrelated_active_turn(
     monkeypatch,
 ):

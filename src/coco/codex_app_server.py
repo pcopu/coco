@@ -1800,7 +1800,13 @@ class CodexAppServerClient:
             {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
         )
         stop_sequence = self._stop_sequence
-        await self.ensure_started()
+        try:
+            await self.ensure_started()
+        except CodexAppServerError as exc:
+            raise CodexAppServerError(
+                str(exc),
+                request_dispatched=False,
+            ) from exc
         generation = self._transport_generation
         reset_sequence = self._transport_reset_sequence
         try:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Chief of Staff GitHub reconciliation
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=coco-chief-of-staff-reconcile.service
+
+[Install]
+WantedBy=timers.target

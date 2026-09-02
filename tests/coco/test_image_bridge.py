@@ -30,6 +30,9 @@ def test_build_codex_image_resume_cmd():
         "session-123",
         Path("/tmp/image.png"),
         "Inspect this",
+        model_slug="gpt-5.6-luna",
+        reasoning_effort="max",
+        service_tier="fast",
     )
     assert cmd == [
         "/usr/bin/codex",
@@ -37,6 +40,12 @@ def test_build_codex_image_resume_cmd():
         "resume",
         "session-123",
         "--skip-git-repo-check",
+        "--model",
+        "gpt-5.6-luna",
+        "--config",
+        'model_reasoning_effort="max"',
+        "--config",
+        'service_tier="fast"',
         "-i",
         "/tmp/image.png",
         "Inspect this",
@@ -999,6 +1008,7 @@ def _install_ambiguous_photo_topic_bindings(
 
     monkeypatch.setattr(bot.session_manager, "topic_bindings_v2", {user_id: per_user})
     monkeypatch.setattr(bot.session_manager, "_save_state", lambda: None)
+    monkeypatch.setattr(bot, "_local_machine_identity", lambda: ("local-node", "Local"))
     monkeypatch.setattr(
         bot.session_manager,
         "_external_turn_active_by_window",
@@ -1051,12 +1061,22 @@ async def test_submit_image_app_server_restores_chat_scoped_topic_sync_mode(
         lambda _window_id: "",
     )
 
-    async def _send_inputs(*_args, **_kwargs):
+    async def _send_topic_inputs(**kwargs):
+        bot.session_manager.mark_topic_telegram_live(
+            user_id=kwargs["user_id"],
+            thread_id=kwargs["thread_id"],
+            chat_id=kwargs["chat_id"],
+            window_id=kwargs["window_id"],
+        )
         return True, ""
 
-    monkeypatch.setattr(bot.session_manager, "send_inputs_to_window", _send_inputs)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_inputs_to_window",
+        _send_topic_inputs,
+    )
 
-    ok, error = await bot._submit_image_to_codex_session(
+    ok, error, path_fallback_allowed = await bot._submit_image_to_codex_session(
         user_id=user_id,
         thread_id=thread_id,
         chat_id=target_chat_id,
@@ -1071,7 +1091,7 @@ async def test_submit_image_app_server_restores_chat_scoped_topic_sync_mode(
         ),
     )
 
-    assert (ok, error) == (True, "")
+    assert (ok, error, path_fallback_allowed) == (True, "", False)
     assert mark_chat_ids == [target_chat_id]
     assert bindings[(target_chat_id, thread_id)].sync_mode == (
         bot.TOPIC_SYNC_MODE_TELEGRAM_LIVE
@@ -1079,6 +1099,132 @@ async def test_submit_image_app_server_restores_chat_scoped_topic_sync_mode(
     assert bindings[(other_chat_id, thread_id)].sync_mode == (
         bot.TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL
     )
+
+
+@pytest.mark.asyncio
+async def test_submit_image_rejects_remote_topic_before_local_cli_fallback(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    user_id = 100
+    thread_id = 1
+    target_chat_id, other_chat_id = (-100707, -100808)
+    bindings = _install_ambiguous_photo_topic_bindings(
+        monkeypatch,
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_ids=(target_chat_id, other_chat_id),
+    )
+    target_binding = bindings[(target_chat_id, thread_id)]
+    target_binding.machine_id = "remote-node"
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"PNGDATA")
+
+    monkeypatch.setattr(bot.config, "session_provider", "codex")
+    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: False)
+    monkeypatch.setattr(bot, "_local_machine_identity", lambda: ("local-node", "Local"))
+    monkeypatch.setattr(
+        bot,
+        "_resolve_codex_exec_binary",
+        lambda: pytest.fail("remote image reached controller-local CLI fallback"),
+    )
+
+    ok, error, path_fallback_allowed = await bot._submit_image_to_codex_session(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=target_chat_id,
+        window_id=target_binding.window_id,
+        image_path=image_path,
+        prompt="Inspect this image",
+        topic_ownership=bot.TopicOwnership(
+            window_id=target_binding.window_id,
+            codex_thread_id=target_binding.codex_thread_id,
+            machine_id=target_binding.machine_id,
+            cwd=target_binding.cwd,
+        ),
+    )
+
+    assert (ok, error, path_fallback_allowed) == (
+        False,
+        _REMOTE_ATTACHMENT_REJECTION_TEXT,
+        False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dispatch_started", "send_error"),
+    [
+        (
+            False,
+            "The topic binding and window cache disagree about the Codex thread.",
+        ),
+        (
+            False,
+            "App-server send failed: topic binding changed during recovery",
+        ),
+        (
+            True,
+            "The topic's canonical Codex binding changed while its fresh recovery "
+            "turn was in flight.",
+        ),
+    ],
+)
+async def test_submit_image_does_not_cli_retry_topic_safety_failures(
+    monkeypatch,
+    tmp_path,
+    dispatch_started: bool,
+    send_error: str,
+):
+    """Unsafe targets and possible prior dispatches must never reach CLI resume."""
+    user_id = 100
+    thread_id = 1
+    chat_id = -100505
+    bindings = _install_ambiguous_photo_topic_bindings(
+        monkeypatch,
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_ids=(chat_id, -100606),
+    )
+    target_binding = bindings[(chat_id, thread_id)]
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"PNGDATA")
+
+    monkeypatch.setattr(bot.config, "session_provider", "codex")
+    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
+
+    async def _send_topic_inputs(**kwargs):
+        if dispatch_started:
+            kwargs["dispatch_state"].mark_transport_dispatch_started()
+        return False, send_error
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_inputs_to_window",
+        _send_topic_inputs,
+    )
+    monkeypatch.setattr(
+        bot,
+        "_resolve_codex_exec_binary",
+        lambda: pytest.fail("unsafe image failure reached CLI fallback"),
+    )
+
+    ok, error, path_fallback_allowed = await bot._submit_image_to_codex_session(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=chat_id,
+        window_id=target_binding.window_id,
+        image_path=image_path,
+        prompt="Inspect this image",
+        topic_ownership=bot.TopicOwnership(
+            window_id=target_binding.window_id,
+            codex_thread_id=target_binding.codex_thread_id,
+            machine_id=target_binding.machine_id,
+            cwd=target_binding.cwd,
+        ),
+    )
+
+    assert (ok, error, path_fallback_allowed) == (False, send_error, False)
 
 
 @pytest.mark.asyncio
@@ -1097,12 +1243,37 @@ async def test_submit_image_cli_resume_restores_chat_scoped_topic_sync_mode(
         chat_ids=(target_chat_id, other_chat_id),
     )
     target_binding = bindings[(target_chat_id, thread_id)]
+    target_binding.model_slug = "gpt-5.6-luna"
+    target_binding.reasoning_effort = "max"
+    target_binding.service_tier = "fast"
     image_path = tmp_path / "photo.png"
     image_path.write_bytes(b"PNGDATA")
 
     monkeypatch.setattr(bot.config, "session_provider", "codex")
-    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: False)
+    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
     monkeypatch.setattr(bot, "_resolve_codex_exec_binary", lambda: "/usr/bin/codex")
+
+    async def _app_server_unavailable(**_kwargs):
+        raise bot.CodexAppServerError(
+            "app-server unavailable",
+            request_dispatched=False,
+        )
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_inputs_to_window",
+        _app_server_unavailable,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _window_id: "",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_thread_id",
+        lambda _window_id: "",
+    )
     mark_chat_ids: list[int | None] = []
     original_mark_topic_telegram_live = bot.session_manager.mark_topic_telegram_live
 
@@ -1117,7 +1288,7 @@ async def test_submit_image_cli_resume_restores_chat_scoped_topic_sync_mode(
     )
 
     async def _resolve_session(_window_id):
-        return SimpleNamespace(session_id="session-photo")
+        return SimpleNamespace(session_id=target_binding.codex_thread_id)
 
     monkeypatch.setattr(bot.session_manager, "resolve_session_for_window", _resolve_session)
     monkeypatch.setattr(
@@ -1137,12 +1308,15 @@ async def test_submit_image_cli_resume_restores_chat_scoped_topic_sync_mode(
         async def communicate(self):
             return b"", b""
 
-    async def _create_subprocess_exec(*_args, **_kwargs):
+    subprocess_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def _create_subprocess_exec(*args, **kwargs):
+        subprocess_calls.append((args, kwargs))
         return _CompletedProcess()
 
     monkeypatch.setattr(bot.asyncio, "create_subprocess_exec", _create_subprocess_exec)
 
-    ok, error = await bot._submit_image_to_codex_session(
+    ok, error, path_fallback_allowed = await bot._submit_image_to_codex_session(
         user_id=user_id,
         thread_id=thread_id,
         chat_id=target_chat_id,
@@ -1157,11 +1331,108 @@ async def test_submit_image_cli_resume_restores_chat_scoped_topic_sync_mode(
         ),
     )
 
-    assert (ok, error) == (True, "")
+    assert (ok, error, path_fallback_allowed) == (True, "", False)
+    assert subprocess_calls == [
+        (
+            (
+                "/usr/bin/codex",
+                "exec",
+                "resume",
+                target_binding.codex_thread_id,
+                "--skip-git-repo-check",
+                "--model",
+                "gpt-5.6-luna",
+                "--config",
+                'model_reasoning_effort="max"',
+                "--config",
+                'service_tier="fast"',
+                "-i",
+                str(image_path),
+                "Inspect this image",
+            ),
+            {
+                "cwd": str(tmp_path),
+                "stdout": bot.asyncio.subprocess.PIPE,
+                "stderr": bot.asyncio.subprocess.PIPE,
+            },
+        )
+    ]
     assert mark_chat_ids == [target_chat_id]
     assert bindings[(target_chat_id, thread_id)].sync_mode == (
         bot.TOPIC_SYNC_MODE_TELEGRAM_LIVE
     )
     assert bindings[(other_chat_id, thread_id)].sync_mode == (
         bot.TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_dispatched", [None, True])
+async def test_submit_image_does_not_cli_retry_indeterminate_app_server_error(
+    monkeypatch,
+    tmp_path,
+    request_dispatched: bool | None,
+) -> None:
+    user_id = 100
+    thread_id = 1
+    target_chat_id, other_chat_id = (-100909, -1001001)
+    bindings = _install_ambiguous_photo_topic_bindings(
+        monkeypatch,
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_ids=(target_chat_id, other_chat_id),
+    )
+    target_binding = bindings[(target_chat_id, thread_id)]
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"PNGDATA")
+
+    monkeypatch.setattr(bot.config, "session_provider", "codex")
+    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
+
+    async def _indeterminate_failure(**_kwargs: object) -> tuple[bool, str]:
+        raise bot.CodexAppServerError(
+            "indeterminate app-server failure",
+            request_dispatched=request_dispatched,
+        )
+
+    monkeypatch.setattr(
+        bot.session_manager,
+        "send_topic_inputs_to_window",
+        _indeterminate_failure,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_active_turn_id",
+        lambda _window_id: "",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_window_codex_thread_id",
+        lambda _window_id: "",
+    )
+    monkeypatch.setattr(
+        bot,
+        "_resolve_codex_exec_binary",
+        lambda: pytest.fail("indeterminate image failure reached CLI fallback"),
+    )
+
+    ok, error, path_fallback_allowed = await bot._submit_image_to_codex_session(
+        user_id=user_id,
+        thread_id=thread_id,
+        chat_id=target_chat_id,
+        window_id=target_binding.window_id,
+        image_path=image_path,
+        prompt="Inspect this image",
+        topic_ownership=bot.TopicOwnership(
+            window_id=target_binding.window_id,
+            codex_thread_id=target_binding.codex_thread_id,
+            machine_id=target_binding.machine_id,
+            cwd=target_binding.cwd,
+        ),
+    )
+
+    assert (ok, error, path_fallback_allowed) == (
+        False,
+        "App-server send failed: indeterminate app-server failure",
+        False,
     )
