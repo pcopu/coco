@@ -22,6 +22,15 @@ def _make_update(text: str, *, thread_id: int = 77, user_id: int = 1147817421):
     )
 
 
+def test_codex_default_service_tier_ignores_legacy_flex(monkeypatch, tmp_path):
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text('service_tier = "flex"\n')
+    monkeypatch.setattr(bot.Path, "home", lambda: tmp_path)
+
+    assert bot._load_codex_default_service_tier() == "default"
+
+
 @pytest.mark.asyncio
 async def test_fast_command_reports_current_mode(monkeypatch):
     update = _make_update("/fast")
@@ -111,8 +120,8 @@ async def test_fast_command_sets_topic_service_tier_without_reset(monkeypatch):
 
     await bot.fast_command(update, SimpleNamespace(user_data={}))
 
-    assert set_calls == [(1147817421, 77, -100123, "flex")]
+    assert set_calls == [(1147817421, 77, -100123, "default")]
     assert reset_calls == []
     assert replies
     assert "Fast mode is now `OFF`" in replies[0]
-    assert "Future turns in this topic will use the `flex` service tier." in replies[0]
+    assert "Future turns in this topic will use the `default` service tier." in replies[0]

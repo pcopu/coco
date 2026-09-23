@@ -2521,9 +2521,9 @@ async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if action in {"on", "fast", "enable"}:
         desired_tier = "fast"
     elif action in {"off", "disable"}:
-        desired_tier = "flex"
+        desired_tier = "default"
     elif action in {"toggle", "flip"}:
-        desired_tier = "flex" if current_fast_mode else "fast"
+        desired_tier = "default" if current_fast_mode else "fast"
     else:
         await safe_reply(update.message, f"❌ Unknown mode `{action}`.\n{usage}")
         return

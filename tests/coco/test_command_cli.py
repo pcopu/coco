@@ -94,7 +94,7 @@ def test_command_cli_fast_off_updates_topic_service_tier(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert code == 0
-    assert set_calls == [(1147817421, 77, -100123, "flex")]
+    assert set_calls == [(1147817421, 77, -100123, "default")]
     assert "Fast mode is now `OFF`" in out
 
 

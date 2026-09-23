@@ -187,8 +187,8 @@ def _session_payload(*, target: app_cli.TopicTarget, binding: TopicBinding | Non
         "mention_only": mention_only,
         "model": model_slug or "unknown",
         "reasoning_effort": reasoning_effort or "unknown",
-        "service_tier": service_tier or "flex",
-        "fast_mode": (service_tier or "flex") == "fast",
+        "service_tier": service_tier or "default",
+        "fast_mode": service_tier == "fast",
         "codex_thread_id": codex_thread_id,
         "active_turn_id": active_turn_id,
     }

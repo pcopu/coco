@@ -171,7 +171,8 @@ TOPIC_BINDING_TRANSPORT_CODEX_THREAD = "codex_thread"
 TOPIC_SYNC_MODE_TELEGRAM_LIVE = "telegram_live"
 TOPIC_SYNC_MODE_HOST_FOLLOW_FINAL = "host_follow_final"
 EXPECTED_TRANSCRIPT_USER_ECHO_MAX_AGE_SECONDS = 120.0
-CODEX_SERVICE_TIERS = frozenset({"fast", "flex"})
+CODEX_SERVICE_TIERS = frozenset({"fast", "default"})
+DEFAULT_CODEX_SERVICE_TIER = "default"
 TRANSCRIPTION_PROFILES = frozenset({"compatible", "auto"})
 SESSION_START_REASONS = frozenset(
     {"fresh_start", "resume", "after_clear", "oversized_rollover"}
@@ -4873,12 +4874,16 @@ class SessionManager:
         """Return the persisted per-topic service tier selection."""
         binding = self.resolve_topic_binding(user_id, thread_id, chat_id=chat_id)
         if binding is None:
-            return ""
+            return DEFAULT_CODEX_SERVICE_TIER
         raw_service_tier = getattr(binding, "service_tier", "")
         if not isinstance(raw_service_tier, str):
-            return ""
+            return DEFAULT_CODEX_SERVICE_TIER
         normalized = raw_service_tier.strip().lower()
-        return normalized if normalized in CODEX_SERVICE_TIERS else ""
+        return (
+            normalized
+            if normalized in CODEX_SERVICE_TIERS
+            else DEFAULT_CODEX_SERVICE_TIER
+        )
 
     def get_window_topic_model_selection(self, window_id: str) -> tuple[str, str]:
         """Return one persisted model selection for a window-bound topic."""
@@ -4895,13 +4900,17 @@ class SessionManager:
         """Return one persisted service tier selection for a window-bound topic."""
         normalized_window_id = window_id.strip()
         if not normalized_window_id:
-            return ""
+            return DEFAULT_CODEX_SERVICE_TIER
         for _user_id, _chat_id, _thread_id, binding in self.iter_topic_bindings():
             if binding.window_id.strip() != normalized_window_id:
                 continue
             raw_service_tier = binding.service_tier.strip().lower()
-            return raw_service_tier if raw_service_tier in CODEX_SERVICE_TIERS else ""
-        return ""
+            return (
+                raw_service_tier
+                if raw_service_tier in CODEX_SERVICE_TIERS
+                else DEFAULT_CODEX_SERVICE_TIER
+            )
+        return DEFAULT_CODEX_SERVICE_TIER
 
     def get_window_topic_response_mode(self, window_id: str) -> str:
         """Return one persisted response mode for a window-bound topic."""

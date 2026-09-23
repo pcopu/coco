@@ -400,6 +400,21 @@ class TestTopicBindingsV2:
         assert binding.service_tier == "fast"
         assert mgr.get_topic_service_tier_selection(100, 1) == "fast"
 
+    def test_topic_service_tier_defaults_to_standard(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+
+        assert mgr.get_topic_service_tier_selection(100, 1) == "default"
+        assert mgr.get_window_topic_service_tier_selection("@1") == "default"
+
+    def test_legacy_flex_topic_uses_standard(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+        binding = mgr.resolve_topic_binding(100, 1)
+        assert binding is not None
+        binding.service_tier = "flex"
+
+        assert mgr.get_topic_service_tier_selection(100, 1) == "default"
+        assert mgr.get_window_topic_service_tier_selection("@1") == "default"
+
     def test_machine_transcription_profile_selection_roundtrip(
         self, mgr: SessionManager
     ) -> None:
@@ -4822,7 +4837,7 @@ async def test_send_inputs_via_app_server_passes_topic_service_tier(
 ):
     captured_service_tiers: list[str | None] = []
     mgr.bind_thread(100, 1, "@1", window_name="demo")
-    mgr.set_topic_service_tier_selection(100, 1, service_tier="flex")
+    mgr.set_topic_service_tier_selection(100, 1, service_tier="fast")
     mgr.set_window_codex_thread_id("@1", "thread-1")
     mgr.set_window_approval_mode("@1", "never")
 
@@ -4863,7 +4878,57 @@ async def test_send_inputs_via_app_server_passes_topic_service_tier(
     )
 
     assert ok is True
-    assert captured_service_tiers == ["flex"]
+    assert captured_service_tiers == ["fast"]
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_via_app_server_defaults_to_standard_service_tier(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    captured_service_tiers: list[str | None] = []
+    mgr.bind_thread(100, 1, "@1", window_name="demo")
+    mgr.set_window_codex_thread_id("@1", "thread-1")
+    mgr.set_window_approval_mode("@1", "never")
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        timeout: float = 90.0,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ):
+        _ = thread_id, inputs, approval_policy, timeout, model, effort
+        captured_service_tiers.append(service_tier)
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert captured_service_tiers == ["default"]
 
 
 @pytest.mark.asyncio

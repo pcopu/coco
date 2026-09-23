@@ -81,7 +81,7 @@ def test_topic_cli_renders_text_summary(monkeypatch, capsys):
     monkeypatch.setattr(
         topic_cli.session_manager,
         "get_topic_service_tier_selection",
-        lambda *_args, **_kwargs: "flex",
+        lambda *_args, **_kwargs: "",
     )
     monkeypatch.setattr(topic_cli, "get_looper_state", lambda **_kwargs: looper_state)
     monkeypatch.setattr(topic_cli, "get_autoresearch_state", lambda *_args, **_kwargs: None)
@@ -104,7 +104,7 @@ def test_topic_cli_renders_text_summary(monkeypatch, capsys):
     assert "Display: `fmw-x`" in out
     assert "Mention-only: `ON`" in out
     assert "Model: `gpt-5.4`" in out
-    assert "Fast mode: `OFF` (`flex`)" in out
+    assert "Fast mode: `OFF` (`default`)" in out
     assert "Enabled apps: `looper`" in out
     assert "- `looper`: enabled; actions: status, start, stop, enable, disable" in out
 

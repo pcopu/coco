@@ -8629,11 +8629,11 @@ def _load_codex_default_service_tier() -> str:
             raw_service_tier = cfg.get("service_tier", "")
             if isinstance(raw_service_tier, str):
                 normalized = raw_service_tier.strip().lower()
-                if normalized in {"fast", "flex"}:
+                if normalized == "fast":
                     return normalized
         except Exception as e:
             logger.debug("Failed reading Codex config %s: %s", config_path, e)
-    return "flex"
+    return "default"
 
 
 def _codex_config_path() -> Path:
