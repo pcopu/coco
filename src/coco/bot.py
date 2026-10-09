@@ -1905,6 +1905,37 @@ def _can_user_create_sessions(user_id: int | None) -> bool:
     return _get_user_scope(user_id) == SCOPE_CREATE_SESSIONS
 
 
+_SESSION_REBIND_DENIED_TEXT = "Single-session users cannot create/bind sessions."
+
+
+def _can_user_rebind_session(
+    *,
+    caller_user_id: int,
+    owner_user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    window_id: str,
+) -> bool:
+    """Revalidate current scope and the server-side topic binding before rebinding.
+
+    Picker contents and callback data are navigation state, never authorization.
+    Single-session grants permit operating the assigned conversation, not choosing
+    another thread or creating a fork, including on a remote machine.
+    """
+    return (
+        _can_user_create_sessions(caller_user_id)
+        and _can_coco_control_target(
+            caller_user_id=caller_user_id,
+            target_user_id=owner_user_id,
+            chat_id=chat_id,
+        )
+        and bool(window_id)
+        and session_manager.resolve_window_for_thread(
+            owner_user_id, thread_id, chat_id=chat_id
+        ) == window_id
+    )
+
+
 def _set_user_scope(user_id: int, scope: str) -> tuple[bool, str]:
     """Set per-user scope in metadata."""
     if scope not in {SCOPE_SINGLE_SESSION, SCOPE_CREATE_SESSIONS}:
@@ -7914,6 +7945,26 @@ async def _build_session_panel_payload(
     )
     display = session_manager.get_display_name(wid)
 
+    if not _can_user_create_sessions(user_id):
+        if context_user_data is not None:
+            context_user_data.pop(SESSION_PICKER_THREADS_KEY, None)
+        return True, "\n".join([
+            f"Session: `{display}`",
+            f"Current thread: `{current_thread_id or '<uninitialized>'}`",
+            f"Active turn: `{current_turn_id or '<none>'}`",
+            "",
+            (
+                "Single-session access: you can use this assigned conversation, "
+                "but cannot fork or resume other sessions."
+            ),
+        ]), InlineKeyboardMarkup([
+            [InlineKeyboardButton("Refresh", callback_data=CB_SESSION_REFRESH)],
+            [
+                InlineKeyboardButton("Rollback 1", callback_data=f"{CB_SESSION_ROLLBACK}1"),
+                InlineKeyboardButton("Rollback 3", callback_data=f"{CB_SESSION_ROLLBACK}3"),
+            ],
+        ])
+
     available_threads, list_error = await _list_all_session_threads(machine_id=machine_id)
 
     if current_thread_id and current_thread_id not in available_threads:
@@ -12682,6 +12733,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     callback_caller_user_id = int(user.id)
 
     data = query.data
+    # Check the actual caller before any owner aliasing, picker lookup, or RPC.
+    if (
+        data in {CB_SESSION_FORK, CB_SESSION_RESUME_LATEST}
+        or data.startswith(CB_SESSION_RESUME)
+    ) and not _can_user_create_sessions(callback_caller_user_id):
+        await query.answer(_SESSION_REBIND_DENIED_TEXT, show_alert=True)
+        return
     send_bot = getattr(context, "bot", None)
 
     # Capture group chat_id for supergroup forum topic routing.
@@ -14688,6 +14746,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 show_alert=True,
             )
             return
+        if not _can_user_rebind_session(
+            caller_user_id=callback_caller_user_id,
+            owner_user_id=user.id,
+            thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
+            window_id=wid,
+        ):
+            await query.answer(_SESSION_REBIND_DENIED_TEXT, show_alert=True)
+            return
         try:
             if machine_id and machine_id != local_machine_id:
                 result = await agent_rpc_client.fork_thread(
@@ -14823,6 +14890,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             cb_thread_id,
             chat_id=cb_chat_id,
         )
+        if not _can_user_rebind_session(
+            caller_user_id=callback_caller_user_id,
+            owner_user_id=user.id,
+            thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
+            window_id=wid,
+        ):
+            await query.answer(_SESSION_REBIND_DENIED_TEXT, show_alert=True)
+            return
         try:
             if machine_id and machine_id != local_machine_id:
                 result = await agent_rpc_client.resume_latest(
@@ -14936,6 +15012,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         target_thread_id = available_threads[idx]
+        if not _can_user_rebind_session(
+            caller_user_id=callback_caller_user_id,
+            owner_user_id=user.id,
+            thread_id=cb_thread_id,
+            chat_id=cb_chat_id,
+            window_id=wid,
+        ):
+            await query.answer(_SESSION_REBIND_DENIED_TEXT, show_alert=True)
+            return
         previous_model_selection = session_manager.get_topic_model_selection(
             user.id,
             cb_thread_id,

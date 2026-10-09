@@ -407,6 +407,11 @@ Telegram topics are the project switchboard.
 
 ### 5. Two-way resume using Codex's built-in resume
 
+Single-session guests can use and roll back their assigned conversation. Their
+`/resume` panel shows only that conversation; selecting another thread, resuming
+the latest session, and forking require create-sessions scope or admin access.
+These permissions are checked again when a button is used.
+
 CoCo binds topics to real Codex threads and leans on Codex's own resume model.
 That means you can move between Telegram and the host session without inventing a
 fake parallel memory system.

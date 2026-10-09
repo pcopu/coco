@@ -21,6 +21,7 @@ async def test_resume_command_refuses_reserved_general_before_transport(monkeypa
     update = _make_update(thread_id=1)
     replies: list[str] = []
     monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_user_create_sessions", lambda _uid: True)
     monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
     monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
     monkeypatch.setattr(
@@ -45,6 +46,7 @@ async def test_resume_command_with_text_args_shows_menu_only_notice(monkeypatch)
     replies: list[tuple[str, object | None]] = []
 
     monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_user_create_sessions", lambda _uid: True)
     monkeypatch.setattr(bot.config, "session_provider", "codex")
     monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
     monkeypatch.setattr(
@@ -88,6 +90,7 @@ async def test_resume_command_without_args_shows_interactive_panel(monkeypatch):
     replies: list[tuple[str, object | None]] = []
 
     monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_user_create_sessions", lambda _uid: True)
     monkeypatch.setattr(bot.config, "session_provider", "codex")
     monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
     monkeypatch.setattr(
@@ -128,6 +131,7 @@ async def test_resume_command_without_args_loads_all_threads_via_pagination(monk
     calls: list[tuple[str | None, int]] = []
 
     monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_user_create_sessions", lambda _uid: True)
     monkeypatch.setattr(bot.config, "session_provider", "codex")
     monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
     monkeypatch.setattr(
@@ -177,6 +181,7 @@ async def test_resume_command_uses_remote_machine_thread_listing(monkeypatch):
     replies: list[tuple[str, object | None]] = []
 
     monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot, "_can_user_create_sessions", lambda _uid: True)
     monkeypatch.setattr(bot.config, "session_provider", "codex")
     monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
     monkeypatch.setattr(
