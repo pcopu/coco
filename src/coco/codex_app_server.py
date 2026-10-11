@@ -42,6 +42,12 @@ APP_SERVER_NOTIFICATION_DROP_WHEN_FULL = frozenset(
         "thread/tokenUsage/updated",
     }
 )
+APP_SERVER_NOTIFICATION_IGNORE = frozenset(
+    {
+        "item/agentMessage/delta",
+        "item/reasoning/textDelta",
+    }
+)
 SAFE_TIMEOUT_RETRY_METHODS = frozenset({"account/rateLimits/read", "model/list"})
 SAFE_TIMEOUT_RECYCLE_METHODS = frozenset(
     {
@@ -53,6 +59,7 @@ SAFE_TIMEOUT_RECYCLE_METHODS = frozenset(
     }
 )
 APP_SERVER_MUTATION_TIMEOUT_SECONDS = 20.0
+APP_SERVER_WRITE_TIMEOUT_SECONDS = 10.0
 APP_SERVER_ENABLED_FEATURES = ("goals",)
 INTERNAL_TRANSPORT_CONTEXT_KEY = "__coco_transport"
 _APP_SERVER_START_FAILURE_FILE = coco_dir() / "app_server_start_failures.json"
@@ -1340,6 +1347,8 @@ class CodexAppServerClient:
         return False
 
     def _enqueue_notification(self, method: str, params: dict[str, Any]) -> bool:
+        if method in APP_SERVER_NOTIFICATION_IGNORE:
+            return False
         if self._notification_overflow:
             if method in APP_SERVER_NOTIFICATION_DROP_WHEN_FULL:
                 logger.warning(
@@ -1635,7 +1644,18 @@ class CodexAppServerClient:
             if on_dispatch is not None:
                 on_dispatch()
             self._mark_mutation_request_dispatched(payload.get("method"))
-            await proc.stdin.drain()
+            try:
+                await asyncio.wait_for(
+                    proc.stdin.drain(),
+                    timeout=APP_SERVER_WRITE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                self._transport_needs_restart = True
+                method = payload.get("method") or "response"
+                raise CodexAppServerError(
+                    f"Timed out writing app-server request: {method}",
+                    request_dispatched=True,
+                ) from exc
 
     async def _write_response(
         self,
@@ -1926,7 +1946,11 @@ class CodexAppServerClient:
     def _is_request_timeout(method: str, err: Exception) -> bool:
         if not isinstance(err, CodexAppServerError):
             return False
-        return f"Timed out waiting for app-server response: {method}" in str(err)
+        error_text = str(err)
+        return (
+            f"Timed out waiting for app-server response: {method}" in error_text
+            or f"Timed out writing app-server request: {method}" in error_text
+        )
 
     async def recover_uncertain_turn_timeout(
         self,

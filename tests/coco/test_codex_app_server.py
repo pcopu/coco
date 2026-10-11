@@ -928,6 +928,36 @@ async def test_write_jsonrpc_uses_jsonl_wire_format():
 
 
 @pytest.mark.asyncio
+async def test_write_jsonrpc_times_out_blocked_stdin_drain(monkeypatch):
+    class _BlockedStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            await asyncio.Event().wait()
+
+    client = cas.CodexAppServerClient()
+    client._proc = SimpleNamespace(
+        returncode=None,
+        stdin=_BlockedStdin(),
+    )
+    monkeypatch.setattr(cas, "APP_SERVER_WRITE_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(cas.CodexAppServerError, match="Timed out writing") as raised:
+        await client._write_jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "turn/start",
+                "params": {},
+            }
+        )
+
+    assert raised.value.request_dispatched is True
+    assert client._transport_needs_restart is True
+
+
+@pytest.mark.asyncio
 async def test_request_waiting_for_start_does_not_dispatch_after_stop(
     monkeypatch,
 ):
@@ -1297,6 +1327,45 @@ def test_notification_queue_drops_snapshot_when_full():
         "account/rateLimits/updated",
         {"rateLimits": {"remaining": 1}},
     )
+
+
+@pytest.mark.asyncio
+async def test_notification_burst_ignores_token_deltas_and_delivers_lifecycle():
+    client = cas.CodexAppServerClient()
+    client._notification_queue = asyncio.Queue(maxsize=1)
+    delivered: list[str] = []
+
+    async def _handler(method: str, _params: dict[str, object]) -> None:
+        delivered.append(method)
+
+    await client.set_handlers(notification_handler=_handler)
+    client._ensure_notification_worker()
+    client._enqueue_notification(
+        "turn/started",
+        {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+    )
+    for _ in range(1000):
+        client._enqueue_notification(
+            "item/agentMessage/delta",
+            {"threadId": "thread-1", "delta": "token"},
+        )
+        client._enqueue_notification(
+            "item/reasoning/textDelta",
+            {"threadId": "thread-1", "delta": "token"},
+        )
+    client._enqueue_notification(
+        "turn/completed",
+        {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}},
+    )
+
+    try:
+        for _ in range(50):
+            if len(delivered) == 2:
+                break
+            await asyncio.sleep(0)
+        assert delivered == ["turn/started", "turn/completed"]
+    finally:
+        await client.stop()
 
 
 def test_notification_queue_evicts_snapshot_for_turn_lifecycle_notification():

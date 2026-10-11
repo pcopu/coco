@@ -5678,7 +5678,9 @@ class SessionManager:
 
         if resolved_window_id:
             state = self.get_window_state(resolved_window_id)
-            state.codex_thread_id = normalized_codex_thread_id
+            if state.codex_thread_id != normalized_codex_thread_id:
+                state.codex_thread_id = normalized_codex_thread_id
+                state.codex_active_turn_id = ""
             if resolved_cwd and state.cwd != resolved_cwd:
                 state.cwd = resolved_cwd
             if resolved_display_name and state.window_name != resolved_display_name:

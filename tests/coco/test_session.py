@@ -231,6 +231,26 @@ class TestTopicBindingsV2:
         assert mgr.get_window_for_thread(100, 1) == "@1"
         assert mgr.find_users_for_codex_thread("thread-1") == [(100, None, "@1", 1)]
 
+    def test_rebinding_window_thread_clears_stale_active_turn(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-old",
+            window_id="@1",
+        )
+        mgr.set_window_codex_active_turn_id("@1", "turn-old")
+
+        mgr.bind_topic_to_codex_thread(
+            user_id=100,
+            thread_id=1,
+            codex_thread_id="thread-new",
+            window_id="@1",
+        )
+
+        assert mgr.get_window_codex_active_turn_id("@1") == ""
+
     def test_find_users_for_codex_thread_with_codex_only_binding(
         self, mgr: SessionManager
     ) -> None:
