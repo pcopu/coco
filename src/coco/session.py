@@ -6159,6 +6159,7 @@ class SessionManager:
         *,
         window_name: str = "",
         cwd: str = "",
+        persist: bool = True,
     ) -> None:
         """Record that user input was sent to a window.
 
@@ -6187,7 +6188,7 @@ class SessionManager:
             self.window_display_names[window_id] = window_name
             changed = True
 
-        if changed:
+        if changed and persist:
             self._save_state()
 
     @staticmethod
@@ -7226,8 +7227,13 @@ class SessionManager:
             state.window_name = window_name
         if pending_session_start_reason:
             self.consume_window_pending_session_start_reason(window_id)
+        self.note_window_input(
+            window_id,
+            window_name=window_name,
+            cwd=cwd,
+            persist=False,
+        )
         self._save_state()
-        self.note_window_input(window_id, window_name=window_name, cwd=cwd)
         expected_transcript_text = self._build_expected_transcript_user_text(turn_inputs)
         if expected_transcript_text:
             self.register_expected_transcript_user_echo(

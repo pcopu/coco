@@ -900,6 +900,56 @@ async def test_enqueue_progress_update_keeps_non_progress_tail():
 
 
 @pytest.mark.asyncio
+async def test_progress_coalescing_preserves_prefix_and_queue_join_accounting():
+    user_id = 213
+    thread_id = 214
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = lock
+
+    for index in range(64):
+        mq._put_queued_task(
+            user_id,
+            queue,
+            mq.MessageTask(
+                task_type="status_update",
+                text=f"status-{index}",
+                window_id="@prefix",
+                thread_id=thread_id,
+            ),
+        )
+
+    try:
+        await mq._enqueue_progress_update_coalesced(
+            queue,
+            lock,
+            user_id=user_id,
+            task=mq.MessageTask(
+                task_type="progress_update",
+                text="latest",
+                window_id="@prefix",
+                thread_id=thread_id,
+            ),
+        )
+
+        items = []
+        while not queue.empty():
+            items.append(queue.get_nowait())
+        assert [item.text for item in items] == [
+            *(f"status-{index}" for index in range(64)),
+            "latest",
+        ]
+        for _item in items:
+            queue.task_done()
+        await asyncio.wait_for(queue.join(), timeout=1)
+    finally:
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+
+
+@pytest.mark.asyncio
 async def test_progress_update_coalescing_keeps_pending_topic_index_single():
     user_id = 205
     thread_id = 206

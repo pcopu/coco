@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from pathlib import Path
 
@@ -39,14 +40,14 @@ async def _download_media_data(
     return media_type, response.content
 
 
-def _read_media_file(
+async def _read_media_file(
     file_path: str,
     *,
     expected_prefix: str,
     label: str,
 ) -> tuple[str, bytes]:
     media_type = _media_type_for_file(file_path, expected_prefix=expected_prefix, label=label)
-    return media_type, Path(file_path).read_bytes()
+    return media_type, await asyncio.to_thread(Path(file_path).read_bytes)
 
 
 async def send_message_to_topic(
@@ -99,7 +100,7 @@ async def send_message_to_topic(
 
     try:
         if image_file:
-            media_type, raw_bytes = _read_media_file(
+            media_type, raw_bytes = await _read_media_file(
                 image_file,
                 expected_prefix="image/",
                 label="image",
@@ -125,7 +126,7 @@ async def send_message_to_topic(
                 message_thread_id=thread_id,
             )
         elif video_file:
-            media_type, raw_bytes = _read_media_file(
+            media_type, raw_bytes = await _read_media_file(
                 video_file,
                 expected_prefix="video/",
                 label="video",

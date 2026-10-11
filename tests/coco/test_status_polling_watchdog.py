@@ -1251,6 +1251,73 @@ async def test_status_poll_loop_skips_only_busy_topic_not_all_user_topics(monkey
 
 
 @pytest.mark.asyncio
+async def test_status_binding_processing_runs_topics_concurrently(monkeypatch):
+    slow_started = asyncio.Event()
+    fast_started = asyncio.Event()
+    alias_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    slow_calls = 0
+
+    async def _emit_watchdog(_bot, *, window_id: str, **_kwargs):
+        nonlocal slow_calls
+        if window_id == "@slow":
+            slow_calls += 1
+            if slow_calls == 1:
+                slow_started.set()
+                await release_slow.wait()
+            else:
+                alias_started.set()
+        else:
+            fast_started.set()
+
+    async def _emit_background(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(status_polling, "_emit_due_run_watchdog_checks", _emit_watchdog)
+    monkeypatch.setattr(status_polling, "_emit_due_looper_prompt", _emit_background)
+    monkeypatch.setattr(status_polling, "_emit_due_personality_delivery", _emit_background)
+    monkeypatch.setattr(status_polling, "_emit_due_autoresearch_delivery", _emit_background)
+
+    semaphore = asyncio.Semaphore(2)
+    window_locks: dict[str, asyncio.Lock] = {}
+    slow_task = asyncio.create_task(
+        status_polling._process_status_binding(
+            SimpleNamespace(),
+            (1, None, 10, "@slow"),
+            pending_delivery_topics={},
+            semaphore=semaphore,
+            window_locks=window_locks,
+        )
+    )
+    fast_task = asyncio.create_task(
+        status_polling._process_status_binding(
+            SimpleNamespace(),
+            (1, None, 11, "@fast"),
+            pending_delivery_topics={},
+            semaphore=semaphore,
+            window_locks=window_locks,
+        )
+    )
+
+    await asyncio.wait_for(slow_started.wait(), timeout=1)
+    await asyncio.wait_for(fast_started.wait(), timeout=1)
+    alias_task = asyncio.create_task(
+        status_polling._process_status_binding(
+            SimpleNamespace(),
+            (1, None, 12, "@slow"),
+            pending_delivery_topics={},
+            semaphore=semaphore,
+            window_locks=window_locks,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not alias_started.is_set()
+    release_slow.set()
+    await asyncio.gather(slow_task, fast_task, alias_task)
+    assert alias_started.is_set()
+
+
+@pytest.mark.asyncio
 async def test_status_poll_loop_checks_transport_interruption_for_busy_topic(
     monkeypatch,
     isolated_run_watchdog,

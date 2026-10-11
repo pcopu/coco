@@ -942,23 +942,26 @@ async def _enqueue_progress_update_coalesced(
     pressure during token-level app-server bursts.
     """
     async with lock:
-        items = _inspect_queue(queue)
-        retained: list[MessageTask] = items
         collapsed: list[MessageTask] = []
 
-        while retained and _can_coalesce_progress_task(retained[-1], task):
-            collapsed.append(retained.pop())
+        queue_items = getattr(queue, "_queue", None)
+        if queue_items is None:
+            items = _inspect_queue(queue)
+            retained: list[MessageTask] = items
+            while retained and _can_coalesce_progress_task(retained[-1], task):
+                collapsed.append(retained.pop())
+            for item in retained:
+                queue.put_nowait(item)
+                queue.task_done()
+        else:
+            while queue_items and _can_coalesce_progress_task(queue_items[-1], task):
+                collapsed.append(queue_items.pop())
 
         merged_text = ""
         for pending in reversed(collapsed):
             merged_text = _merge_progress_text(merged_text, pending.text or "")
         merged_text = _merge_progress_text(merged_text, task.text or "")
         task.text = merged_text
-
-        # Requeue retained items and neutralize new put() counter increments.
-        for item in retained:
-            queue.put_nowait(item)
-            queue.task_done()
 
         # Dropped pending progress tasks were already counted as unfinished; mark
         # them as done now so queue.join() cannot deadlock.

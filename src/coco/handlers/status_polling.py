@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
 QUOTA_CHECK_INTERVAL = 60 * 60.0
+STATUS_BINDING_CONCURRENCY = 8
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
@@ -1135,6 +1136,103 @@ async def _probe_topic_bindings(
             )
 
 
+async def _process_status_binding(
+    bot: Bot,
+    binding: tuple[int, int | None, int, str],
+    *,
+    pending_delivery_topics: dict[tuple[int, int], set[int]],
+    semaphore: asyncio.Semaphore,
+    window_locks: dict[str, asyncio.Lock],
+) -> None:
+    user_id, chat_id, thread_id, window_id = binding
+    window_lock = window_locks.setdefault(window_id, asyncio.Lock())
+    async with window_lock:
+        async with semaphore:
+            try:
+                pending_delivery = (thread_id or 0) in pending_delivery_topics.get(
+                    (user_id, chat_id or 0),
+                    set(),
+                )
+                if pending_delivery:
+                    retry_candidate = get_immediate_auto_retry_candidate(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        window_id=window_id,
+                    )
+                    if (
+                        retry_candidate is None
+                        or retry_candidate.auto_retry_reason != "transport_uncertain"
+                    ):
+                        return
+
+                if chat_id is None:
+                    await _emit_due_run_watchdog_checks(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                    )
+                    if pending_delivery:
+                        return
+                    await _emit_due_looper_prompt(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                    )
+                    await _emit_due_personality_delivery(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                    )
+                    await _emit_due_autoresearch_delivery(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                    )
+                else:
+                    await _emit_due_run_watchdog_checks(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                        chat_id=chat_id,
+                    )
+                    if pending_delivery:
+                        return
+                    await _emit_due_looper_prompt(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                        chat_id=chat_id,
+                    )
+                    await _emit_due_personality_delivery(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                        chat_id=chat_id,
+                    )
+                    await _emit_due_autoresearch_delivery(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=window_id,
+                        chat_id=chat_id,
+                    )
+            except Exception as error:
+                logger.debug(
+                    "Status update error for user %s thread %s: %s",
+                    user_id,
+                    thread_id,
+                    error,
+                )
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
@@ -1198,88 +1296,20 @@ async def status_poll_loop(bot: Bot) -> None:
                 last_topic_check = now
                 await _probe_topic_bindings(bot, bindings, now=now)
 
-            for user_id, chat_id, thread_id, wid in bindings:
-                try:
-                    pending_delivery = (thread_id or 0) in pending_delivery_topics.get(
-                        (user_id, chat_id or 0),
-                        set(),
+            binding_semaphore = asyncio.Semaphore(STATUS_BINDING_CONCURRENCY)
+            binding_window_locks: dict[str, asyncio.Lock] = {}
+            await asyncio.gather(
+                *(
+                    _process_status_binding(
+                        bot,
+                        binding,
+                        pending_delivery_topics=pending_delivery_topics,
+                        semaphore=binding_semaphore,
+                        window_locks=binding_window_locks,
                     )
-                    if pending_delivery:
-                        retry_candidate = get_immediate_auto_retry_candidate(
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            chat_id=chat_id,
-                            window_id=wid,
-                        )
-                        if (
-                            retry_candidate is None
-                            or retry_candidate.auto_retry_reason != "transport_uncertain"
-                        ):
-                            continue
-
-                    if chat_id is None:
-                        await _emit_due_run_watchdog_checks(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                        )
-                        if pending_delivery:
-                            continue
-                        await _emit_due_looper_prompt(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                        )
-                        await _emit_due_personality_delivery(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                        )
-                        await _emit_due_autoresearch_delivery(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                        )
-                    else:
-                        await _emit_due_run_watchdog_checks(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                            chat_id=chat_id,
-                        )
-                        if pending_delivery:
-                            continue
-                        await _emit_due_looper_prompt(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                            chat_id=chat_id,
-                        )
-                        await _emit_due_personality_delivery(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                            chat_id=chat_id,
-                        )
-                        await _emit_due_autoresearch_delivery(
-                            bot,
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            window_id=wid,
-                            chat_id=chat_id,
-                        )
-                except Exception as e:
-                    logger.debug(
-                        f"Status update error for user {user_id} "
-                        f"thread {thread_id}: {e}"
-                    )
+                    for binding in bindings
+                )
+            )
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

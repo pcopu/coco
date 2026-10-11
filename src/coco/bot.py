@@ -5649,7 +5649,8 @@ async def _extract_telegram_attachments_for_window(
     machine_id = session_manager.get_window_machine_id(window_id)
     local_machine_id, _local_machine_name = _local_machine_identity()
     if not machine_id or machine_id == local_machine_id:
-        return _extract_telegram_attachments(
+        return await asyncio.to_thread(
+            _extract_telegram_attachments,
             text,
             workspace_dir=workspace_dir,
         )

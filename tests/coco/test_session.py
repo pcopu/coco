@@ -4797,6 +4797,52 @@ async def test_send_inputs_via_app_server_prepends_runtime_capability_hint(
 
 
 @pytest.mark.asyncio
+async def test_send_inputs_via_app_server_persists_window_state_once(
+    mgr: SessionManager,
+    monkeypatch,
+):
+    mgr.set_window_codex_thread_id("@1", "thread-1")
+    save_calls: list[None] = []
+
+    async def _turn_start(
+        *,
+        thread_id: str,
+        inputs: list[dict[str, object]],
+        approval_policy: str | None = None,
+        service_tier: str | None = None,
+        timeout: float = 90.0,
+    ):
+        _ = thread_id, inputs, approval_policy, service_tier, timeout
+        return {"turn": {"id": "turn-1"}}
+
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.turn_start",
+        _turn_start,
+    )
+    monkeypatch.setattr(
+        "coco.session.codex_app_server_client.get_active_turn_id",
+        lambda _thread_id: None,
+    )
+    monkeypatch.setattr(
+        SessionManager,
+        "_runtime_write_state",
+        staticmethod(lambda _cwd: ("/tmp/demo", True)),
+    )
+    monkeypatch.setattr(mgr, "_save_state", lambda: save_calls.append(None))
+
+    ok, _msg = await mgr._send_inputs_via_codex_app_server(
+        window_id="@1",
+        inputs=[{"type": "text", "text": "hello"}],
+        steer=False,
+        window_name="demo",
+        cwd="/tmp/demo",
+    )
+
+    assert ok is True
+    assert len(save_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_send_inputs_via_app_server_includes_one_shot_session_start_reason(
     mgr: SessionManager,
     monkeypatch,

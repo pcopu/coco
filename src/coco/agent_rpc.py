@@ -805,7 +805,8 @@ class AgentRpcServer:
             **_codex_transport_response_fields(),
         }
 
-    async def _read_attachments(self, params: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _read_attachments_sync(params: dict[str, Any]) -> dict[str, Any]:
         workspace_dir = str(params.get("workspace_dir", "")).strip()
         raw_paths = params.get("paths", [])
         if not isinstance(raw_paths, list):
@@ -856,6 +857,9 @@ class AgentRpcServer:
                 }
             )
         return {"documents": documents, "images": images, "videos": videos}
+
+    async def _read_attachments(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._read_attachments_sync, params)
 
     async def _read_documents(self, params: dict[str, Any]) -> dict[str, Any]:
         result = await self._read_attachments(params)
