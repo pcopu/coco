@@ -9100,6 +9100,80 @@ def _load_codex_model_catalog() -> dict[str, object]:
     return catalog
 
 
+async def _refresh_codex_model_catalog() -> dict[str, object]:
+    """Refresh selectable models from app-server, with local-cache fallback."""
+    catalog = _load_codex_model_catalog()
+    if not _codex_app_server_preferred():
+        return catalog
+
+    try:
+        payload = await codex_app_server_client.request(
+            "model/list",
+            {"includeHidden": False},
+            timeout=20.0,
+        )
+    except Exception as exc:
+        logger.warning("Failed to refresh Codex model catalog: %s", exc)
+        emit_telemetry(
+            "codex.model_catalog_refresh_failed",
+            error=str(exc),
+        )
+        return catalog
+
+    raw_models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        logger.warning("Codex model/list returned an invalid catalog payload")
+        emit_telemetry(
+            "codex.model_catalog_refresh_failed",
+            error="invalid model/list response",
+        )
+        return catalog
+
+    reasoning_values: list[str] = []
+    normalized_models: list[dict[str, object]] = []
+    for model in raw_models:
+        if not isinstance(model, dict) or bool(model.get("hidden")):
+            continue
+        slug = str(model.get("model") or model.get("id") or "").strip()
+        if not slug:
+            continue
+        supported = model.get("supportedReasoningEfforts") or []
+        supported_efforts: list[str] = []
+        if isinstance(supported, list):
+            for item in supported:
+                if not isinstance(item, dict):
+                    continue
+                effort = str(item.get("reasoningEffort") or "").strip()
+                if not effort:
+                    continue
+                supported_efforts.append(effort)
+                if effort not in reasoning_values:
+                    reasoning_values.append(effort)
+        normalized_models.append(
+            {
+                "slug": slug,
+                "default_effort": str(
+                    model.get("defaultReasoningEffort") or "unknown"
+                ),
+                "levels": _ordered_reasoning_levels(supported_efforts),
+            }
+        )
+
+    if not normalized_models:
+        logger.warning("Codex model/list returned no selectable models")
+        emit_telemetry(
+            "codex.model_catalog_refresh_failed",
+            error="empty model/list response",
+        )
+        return catalog
+
+    refreshed = dict(catalog)
+    refreshed["models"] = normalized_models
+    refreshed["reasoning_options"] = _ordered_reasoning_levels(reasoning_values)
+    refreshed["cache_error"] = None
+    return refreshed
+
+
 def _get_model_entry(catalog: dict[str, object], slug: str) -> dict[str, object] | None:
     """Return a model entry from catalog by slug."""
     models = catalog.get("models")
@@ -9163,6 +9237,26 @@ def _resolve_topic_model_catalog(
 ) -> dict[str, object]:
     """Load the shared model catalog and overlay the current topic selection."""
     catalog = _load_codex_model_catalog()
+    selected_model, selected_effort = session_manager.get_topic_model_selection(
+        user_id,
+        thread_id,
+        chat_id=chat_id,
+    )
+    return _catalog_with_topic_selection(
+        catalog,
+        current_model=selected_model or str(catalog.get("current_model", "unknown")),
+        current_effort=selected_effort or str(catalog.get("current_effort", "unknown")),
+    )
+
+
+async def _resolve_topic_model_catalog_live(
+    *,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None = None,
+) -> dict[str, object]:
+    """Refresh the catalog and overlay the current topic selection."""
+    catalog = await _refresh_codex_model_catalog()
     selected_model, selected_effort = session_manager.get_topic_model_selection(
         user_id,
         thread_id,
@@ -14139,7 +14233,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             cb_thread_id,
             chat_id=cb_chat_id,
         )
-        catalog = _resolve_topic_model_catalog(
+        catalog = await _resolve_topic_model_catalog_live(
             user_id=callback_topic_user_id,
             thread_id=cb_thread_id,
             chat_id=cb_chat_id,

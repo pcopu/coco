@@ -1,10 +1,12 @@
 """Tests for /model info rendering."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 import coco.bot as bot
+from coco.handlers import commands as command_handlers
 from coco.session import SessionManager
 from coco.handlers.callback_data import (
     CB_MODEL_EFFORT_SET,
@@ -92,6 +94,223 @@ def test_build_model_info_text_reports_missing_cache(tmp_path, monkeypatch):
     assert "Topic model: `gpt-5.3-codex`" in text
     assert "Topic reasoning: `high`" in text
     assert "Dry greeting sample." in text
+
+
+@pytest.mark.asyncio
+async def test_refresh_codex_model_catalog_uses_live_app_server(monkeypatch):
+    cached_catalog = {
+        "current_model": "gpt-6-astra",
+        "current_effort": "xhigh",
+        "models": [
+            {
+                "slug": "stale-model",
+                "default_effort": "medium",
+                "levels": ["medium"],
+            }
+        ],
+        "reasoning_options": ["medium"],
+        "cache_error": None,
+    }
+    calls: list[tuple[str, dict[str, object], float]] = []
+
+    async def _request(method, params, *, timeout, **_kwargs):
+        calls.append((method, params, timeout))
+        return {
+            "data": [
+                {
+                    "id": "gpt-6-orbit",
+                    "model": "gpt-6-orbit",
+                    "displayName": "GPT-6-Orbit",
+                    "hidden": False,
+                    "defaultReasoningEffort": "high",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "medium", "description": "Balanced"},
+                        {"reasoningEffort": "high", "description": "Deep"},
+                    ],
+                },
+                {
+                    "id": "gpt-reserve",
+                    "model": "gpt-reserve",
+                    "displayName": "GPT-Reserve",
+                    "hidden": True,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [],
+                },
+            ]
+        }
+
+    monkeypatch.setattr(bot, "_load_codex_model_catalog", lambda: cached_catalog)
+    monkeypatch.setattr(bot, "_codex_app_server_preferred", lambda: True)
+    monkeypatch.setattr(bot.codex_app_server_client, "request", _request)
+
+    catalog = await bot._refresh_codex_model_catalog()
+
+    assert calls == [("model/list", {"includeHidden": False}, 20.0)]
+    assert catalog["current_model"] == "gpt-6-astra"
+    assert catalog["current_effort"] == "xhigh"
+    assert catalog["models"] == [
+        {
+            "slug": "gpt-6-orbit",
+            "default_effort": "high",
+            "levels": ["medium", "high"],
+        }
+    ]
+    assert catalog["reasoning_options"] == ["medium", "high"]
+
+
+@pytest.mark.asyncio
+async def test_model_refresh_callback_uses_live_catalog(monkeypatch):
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    manager = SessionManager()
+    manager.bind_topic_to_codex_thread(
+        user_id=1147817421,
+        thread_id=77,
+        chat_id=-100123,
+        codex_thread_id="thread-1",
+        window_id="@1",
+        cwd="/tmp/proj",
+        display_name="proj",
+    )
+    live_catalog = {
+        "current_model": "gpt-6-orbit",
+        "current_effort": "high",
+        "models": [
+            {
+                "slug": "gpt-6-orbit",
+                "default_effort": "high",
+                "levels": ["medium", "high"],
+            }
+        ],
+        "reasoning_options": ["medium", "high"],
+    }
+    refresh_calls: list[tuple[int, int | None, int | None]] = []
+    edits: list[object] = []
+
+    async def _resolve_live(*, user_id, thread_id, chat_id=None):
+        refresh_calls.append((user_id, thread_id, chat_id))
+        return live_catalog
+
+    class _FakeQuery:
+        data = CB_MODEL_REFRESH
+        message = type(
+            "Msg",
+            (),
+            {
+                "message_thread_id": 77,
+                "chat": type("Chat", (), {"type": "supergroup", "id": -100123})(),
+                "chat_id": -100123,
+            },
+        )()
+
+        def __init__(self) -> None:
+            self.answers: list[tuple[str | None, bool]] = []
+
+        async def answer(self, text: str | None = None, show_alert: bool = False):
+            self.answers.append((text, show_alert))
+
+    query = _FakeQuery()
+    update = type(
+        "Update",
+        (),
+        {
+            "callback_query": query,
+            "effective_user": type("User", (), {"id": 1147817421})(),
+            "effective_chat": query.message.chat,
+            "effective_message": query.message,
+        },
+    )()
+
+    async def _safe_edit(_query, _text, **kwargs):
+        edits.append(kwargs["reply_markup"])
+
+    monkeypatch.setattr(bot, "session_manager", manager)
+    monkeypatch.setattr(bot, "_is_chat_allowed", lambda _chat: True)
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(
+        bot,
+        "_resolve_topic_model_catalog_live",
+        _resolve_live,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot,
+        "_resolve_topic_model_catalog",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("stale cache used")),
+    )
+    monkeypatch.setattr(bot, "safe_edit", _safe_edit)
+
+    await bot.callback_handler(update, type("Context", (), {"user_data": {}})())
+
+    assert refresh_calls == [(1147817421, 77, -100123)]
+    buttons = [button for row in edits[-1].inline_keyboard for button in row]
+    assert f"{CB_MODEL_SET}gpt-6-orbit" in {button.callback_data for button in buttons}
+    assert query.answers == [("Refreshed", False)]
+
+
+@pytest.mark.asyncio
+async def test_model_command_uses_cached_catalog(monkeypatch):
+    catalog = {
+        "current_model": "gpt-6-sol",
+        "current_effort": "low",
+        "models": [
+            {
+                "slug": "gpt-6-sol",
+                "default_effort": "medium",
+                "levels": ["low", "medium", "high"],
+            }
+        ],
+        "reasoning_options": ["low", "medium", "high"],
+    }
+    cached_calls: list[tuple[int, int | None, int | None]] = []
+    replies: list[object] = []
+
+    def _resolve_cached(*, user_id, thread_id, chat_id=None):
+        cached_calls.append((user_id, thread_id, chat_id))
+        return catalog
+
+    async def _resolve_live(**_kwargs):
+        raise AssertionError("/model must not wait for a live catalog request")
+
+    async def _allowed(_update):
+        return True
+
+    async def _safe_reply(_message, _text, **kwargs):
+        replies.append(kwargs["reply_markup"])
+
+    session_manager = SimpleNamespace(ensure_topic_binding=lambda *_args, **_kwargs: None)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1147817421),
+        effective_chat=SimpleNamespace(type="supergroup", id=-100123),
+        message=SimpleNamespace(text="/model"),
+    )
+
+    monkeypatch.setattr(command_handlers, "_sync_bot_globals", lambda: None)
+    monkeypatch.setattr(command_handlers, "is_user_allowed", lambda _uid: True, raising=False)
+    monkeypatch.setattr(command_handlers, "_ensure_chat_allowed", _allowed)
+    monkeypatch.setattr(command_handlers, "_get_thread_id", lambda _update: 81114, raising=False)
+    monkeypatch.setattr(command_handlers, "_group_chat_id", lambda _chat: -100123, raising=False)
+    monkeypatch.setattr(command_handlers, "session_manager", session_manager, raising=False)
+    monkeypatch.setattr(
+        command_handlers,
+        "_resolve_topic_model_catalog",
+        _resolve_cached,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_handlers,
+        "_resolve_topic_model_catalog_live",
+        _resolve_live,
+        raising=False,
+    )
+    monkeypatch.setattr(command_handlers, "_build_model_info_text", lambda _catalog: "models", raising=False)
+    monkeypatch.setattr(command_handlers, "_build_model_keyboard", lambda value: value, raising=False)
+    monkeypatch.setattr(command_handlers, "safe_reply", _safe_reply, raising=False)
+
+    await command_handlers.model_command(update, SimpleNamespace())
+
+    assert cached_calls == [(1147817421, 81114, -100123)]
+    assert replies == [catalog]
 
 
 @pytest.mark.asyncio

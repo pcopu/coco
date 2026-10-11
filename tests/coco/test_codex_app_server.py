@@ -1492,7 +1492,11 @@ async def test_ensure_started_recycles_when_transport_marked_unhealthy(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_request_recycles_and_retries_once_for_safe_read_timeout(monkeypatch):
+@pytest.mark.parametrize("method", ["account/rateLimits/read", "model/list"])
+async def test_request_recycles_and_retries_once_for_safe_read_timeout(
+    monkeypatch,
+    method,
+):
     client = cas.CodexAppServerClient()
 
     ensure_calls: list[str] = []
@@ -1529,12 +1533,12 @@ async def test_request_recycles_and_retries_once_for_safe_read_timeout(monkeypat
     monkeypatch.setattr(client, "_stop_locked", _fake_stop)
     monkeypatch.setattr(client, "_request_started", _fake_request_started)
 
-    result = await client.request("account/rateLimits/read", {}, timeout=90.0)
+    result = await client.request(method, {}, timeout=90.0)
 
     assert result == {"turn": {"id": "turn-1"}}
     assert request_calls == [
-        "account/rateLimits/read",
-        "account/rateLimits/read",
+        method,
+        method,
     ]
     assert stop_calls == ["stop"]
     # One initial start + one restart before retry.

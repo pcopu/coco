@@ -1,9 +1,10 @@
 """Memory-log hooks in safe Telegram send/edit helpers."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
-from telegram.error import BadRequest, NetworkError
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 import coco.handlers.message_sender as message_sender
 
@@ -133,11 +134,14 @@ async def test_send_with_fallback_uses_plain_text_after_bad_request():
 
 
 @pytest.mark.asyncio
-async def test_send_photo_does_not_fallback_after_network_error():
+async def test_send_photo_does_not_retry_ambiguous_network_error():
+    photo_attempts = 0
     document_attempts = 0
 
     class _Bot:
         async def send_photo(self, **_kwargs):
+            nonlocal photo_attempts
+            photo_attempts += 1
             raise NetworkError("connection lost")
 
         async def send_document(self, **_kwargs):
@@ -149,7 +153,117 @@ async def test_send_photo_does_not_fallback_after_network_error():
             _Bot(), chat_id=-1009, image_data=[("image/png", b"PNG")]
         )
 
+    assert photo_attempts == 1
     assert document_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_send_video_retries_with_extended_media_timeout(monkeypatch):
+    attempts: list[dict[str, object]] = []
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    class _Bot:
+        async def send_video(self, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise TimedOut("Timed out")
+            return SimpleNamespace(message_id=444)
+
+    await message_sender.send_video(
+        _Bot(),
+        chat_id=-1009,
+        media_type="video/mp4",
+        raw_bytes=b"VIDEO",
+        message_thread_id=77,
+    )
+
+    assert len(attempts) == 2
+    assert all(attempt["write_timeout"] == 120.0 for attempt in attempts)
+    assert all(attempt["video"].getvalue() == b"VIDEO" for attempt in attempts)
+
+
+@pytest.mark.asyncio
+async def test_send_photo_routes_gif_through_animation_upload():
+    animation_sends: list[dict[str, object]] = []
+
+    class _Bot:
+        async def send_photo(self, **_kwargs):
+            raise AssertionError("GIF must not use send_photo")
+
+        async def send_animation(self, **kwargs):
+            animation_sends.append(kwargs)
+            return SimpleNamespace(message_id=445)
+
+    await message_sender.send_photo(
+        _Bot(),
+        chat_id=-1009,
+        image_data=[("image/gif", b"GIF89a")],
+        message_thread_id=77,
+    )
+
+    assert len(animation_sends) == 1
+    assert animation_sends[0]["write_timeout"] == 120.0
+    assert animation_sends[0]["animation"].getvalue() == b"GIF89a"
+
+
+@pytest.mark.asyncio
+async def test_send_photo_routes_mixed_gif_without_media_group():
+    sends: list[tuple[str, bytes]] = []
+
+    class _Bot:
+        async def send_media_group(self, **_kwargs):
+            raise AssertionError("Mixed GIF attachments must not use a photo group")
+
+        async def send_photo(self, **kwargs):
+            sends.append(("photo", kwargs["photo"].getvalue()))
+            return SimpleNamespace(message_id=446)
+
+        async def send_animation(self, **kwargs):
+            sends.append(("animation", kwargs["animation"].getvalue()))
+            return SimpleNamespace(message_id=447)
+
+    await message_sender.send_photo(
+        _Bot(),
+        chat_id=-1009,
+        image_data=[("image/png", b"PNG"), ("image/gif", b"GIF89a")],
+    )
+
+    assert sends == [("photo", b"PNG"), ("animation", b"GIF89a")]
+
+
+@pytest.mark.asyncio
+async def test_send_photo_falls_back_to_document_for_rejected_gif():
+    animation_attempts = 0
+    document_sends: list[dict[str, object]] = []
+
+    class _Bot:
+        async def send_photo(self, **_kwargs):
+            raise AssertionError("GIF must not use send_photo")
+
+        async def send_animation(self, **_kwargs):
+            nonlocal animation_attempts
+            animation_attempts += 1
+            raise BadRequest("animation rejected")
+
+        async def send_document(self, **kwargs):
+            document_sends.append(kwargs)
+            return SimpleNamespace(message_id=448)
+
+    await message_sender.send_photo(
+        _Bot(),
+        chat_id=-1009,
+        image_data=[("image/gif", b"GIF89a")],
+    )
+
+    assert animation_attempts == 1
+    assert len(document_sends) == 1
+    assert document_sends[0]["filename"] == "image-1.gif"
+    assert document_sends[0]["write_timeout"] == 120.0
+    assert document_sends[0]["document"].getvalue() == b"GIF89a"
 
 
 @pytest.mark.asyncio

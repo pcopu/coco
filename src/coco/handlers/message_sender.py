@@ -15,17 +15,19 @@ Rate limiting is handled globally by AIORateLimiter on the Application.
 RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
 """
 
+import asyncio
 import io
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import BadRequest, NetworkError, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from ..markdown_v2 import convert_markdown
 from ..telegram_memory import log_outgoing_edit, log_outgoing_send
+from ..telemetry import emit_telemetry
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,9 @@ _VOICE_EXTENSION_BY_MEDIA_TYPE = {
 }
 _RICH_TEXT_FORMATS = {"html", "markdown"}
 _GENERAL_TOPIC_THREAD_ID = 1
+_MEDIA_UPLOAD_ATTEMPTS = 2
+_MEDIA_UPLOAD_RETRY_DELAY_SECONDS = 1.0
+_MEDIA_UPLOAD_WRITE_TIMEOUT_SECONDS = 120.0
 
 
 def _thread_id_from_kwargs(kwargs: dict[str, Any]) -> int | None:
@@ -81,6 +86,122 @@ def _omit_general_topic_for_telegram(kwargs: dict[str, Any]) -> None:
     """Send forum General as topic-less while retaining internal topic key 1."""
     if kwargs.get("message_thread_id") == _GENERAL_TOPIC_THREAD_ID:
         kwargs.pop("message_thread_id", None)
+
+
+async def _send_media_with_retry(
+    send: Callable[[], Awaitable[Any]],
+    *,
+    chat_id: int,
+    media_kind: str,
+    thread_id: int | None,
+) -> Any:
+    """Retry transient Telegram media upload failures once."""
+    for attempt in range(1, _MEDIA_UPLOAD_ATTEMPTS + 1):
+        try:
+            return await send()
+        except (RetryAfter, BadRequest):
+            raise
+        except TimedOut as exc:
+            if attempt >= _MEDIA_UPLOAD_ATTEMPTS:
+                emit_telemetry(
+                    "telegram.media_upload_failed",
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    media_kind=media_kind,
+                    attempts=attempt,
+                    error=str(exc),
+                )
+                raise
+            emit_telemetry(
+                "telegram.media_upload_retry",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                media_kind=media_kind,
+                attempt=attempt,
+                max_attempts=_MEDIA_UPLOAD_ATTEMPTS,
+                error=str(exc),
+            )
+            logger.warning(
+                "Telegram %s upload failed for %d; retrying (%d/%d): %s",
+                media_kind,
+                chat_id,
+                attempt,
+                _MEDIA_UPLOAD_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(_MEDIA_UPLOAD_RETRY_DELAY_SECONDS)
+    raise RuntimeError("unreachable media upload retry state")
+
+
+async def _send_single_image(
+    bot: Bot,
+    *,
+    chat_id: int,
+    media_type: str,
+    raw_bytes: bytes,
+    index: int,
+    thread_id: int | None,
+    delivery_is_current: Callable[[], bool] | None,
+    kwargs: dict[str, Any],
+) -> bool:
+    if delivery_is_current is not None and not delivery_is_current():
+        return False
+
+    normalized_media_type = media_type.lower()
+    try:
+        if normalized_media_type == "image/gif":
+            await _send_media_with_retry(
+                lambda: bot.send_animation(
+                    chat_id=chat_id,
+                    animation=io.BytesIO(raw_bytes),
+                    **kwargs,
+                ),
+                chat_id=chat_id,
+                media_kind="animation",
+                thread_id=thread_id,
+            )
+        else:
+            await _send_media_with_retry(
+                lambda: bot.send_photo(
+                    chat_id=chat_id,
+                    photo=io.BytesIO(raw_bytes),
+                    **kwargs,
+                ),
+                chat_id=chat_id,
+                media_kind="photo",
+                thread_id=thread_id,
+            )
+        return True
+    except RetryAfter:
+        raise
+    except Exception as exc:
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            raise
+        logger.warning(
+            "Image send failed for %d; falling back to document: %s", chat_id, exc
+        )
+
+    if delivery_is_current is not None and not delivery_is_current():
+        return False
+    extension = _IMAGE_EXTENSION_BY_MEDIA_TYPE.get(normalized_media_type, ".bin")
+    try:
+        await _send_media_with_retry(
+            lambda: bot.send_document(
+                chat_id=chat_id,
+                document=io.BytesIO(raw_bytes),
+                filename=f"image-{index}{extension}",
+                **kwargs,
+            ),
+            chat_id=chat_id,
+            media_kind="image_document_fallback",
+            thread_id=thread_id,
+        )
+        return True
+    except (RetryAfter, NetworkError):
+        raise
+    except Exception as exc:
+        logger.error("Failed to send image fallback document to %d: %s", chat_id, exc)
+        raise
 
 
 def _build_rich_message(
@@ -251,25 +372,41 @@ async def send_photo(
     """
     if not image_data:
         return
+    thread_id = _thread_id_from_kwargs(kwargs)
     _omit_general_topic_for_telegram(kwargs)
+    kwargs.setdefault("write_timeout", _MEDIA_UPLOAD_WRITE_TIMEOUT_SECONDS)
+    if len(image_data) == 1 or any(
+        media_type.lower() == "image/gif" for media_type, _raw_bytes in image_data
+    ):
+        for index, (media_type, raw_bytes) in enumerate(image_data, start=1):
+            sent = await _send_single_image(
+                bot,
+                chat_id=chat_id,
+                media_type=media_type,
+                raw_bytes=raw_bytes,
+                index=index,
+                thread_id=thread_id,
+                delivery_is_current=delivery_is_current,
+                kwargs=kwargs,
+            )
+            if not sent:
+                return
+        return
+
     try:
-        if len(image_data) == 1:
-            _media_type, raw_bytes = image_data[0]
-            await bot.send_photo(
+        await _send_media_with_retry(
+            lambda: bot.send_media_group(
                 chat_id=chat_id,
-                photo=io.BytesIO(raw_bytes),
+                media=[
+                    InputMediaPhoto(media=io.BytesIO(raw_bytes))
+                    for _media_type, raw_bytes in image_data
+                ],
                 **kwargs,
-            )
-        else:
-            media = [
-                InputMediaPhoto(media=io.BytesIO(raw_bytes))
-                for _media_type, raw_bytes in image_data
-            ]
-            await bot.send_media_group(
-                chat_id=chat_id,
-                media=media,
-                **kwargs,
-            )
+            ),
+            chat_id=chat_id,
+            media_kind="photo_group",
+            thread_id=thread_id,
+        )
     except RetryAfter:
         raise
     except Exception as e:
@@ -281,11 +418,16 @@ async def send_photo(
                 if delivery_is_current is not None and not delivery_is_current():
                     return
                 extension = _IMAGE_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
-                await bot.send_document(
+                await _send_media_with_retry(
+                    lambda: bot.send_document(
+                        chat_id=chat_id,
+                        document=io.BytesIO(raw_bytes),
+                        filename=f"image-{index}{extension}",
+                        **kwargs,
+                    ),
                     chat_id=chat_id,
-                    document=io.BytesIO(raw_bytes),
-                    filename=f"image-{index}{extension}",
-                    **kwargs,
+                    media_kind="image_document_fallback",
+                    thread_id=thread_id,
                 )
         except (RetryAfter, NetworkError):
             raise
@@ -302,12 +444,19 @@ async def send_video(
     **kwargs: Any,
 ) -> None:
     """Send one video to chat with document fallback."""
+    thread_id = _thread_id_from_kwargs(kwargs)
     _omit_general_topic_for_telegram(kwargs)
+    kwargs.setdefault("write_timeout", _MEDIA_UPLOAD_WRITE_TIMEOUT_SECONDS)
     try:
-        await bot.send_video(
+        await _send_media_with_retry(
+            lambda: bot.send_video(
+                chat_id=chat_id,
+                video=io.BytesIO(raw_bytes),
+                **kwargs,
+            ),
             chat_id=chat_id,
-            video=io.BytesIO(raw_bytes),
-            **kwargs,
+            media_kind="video",
+            thread_id=thread_id,
         )
     except RetryAfter:
         raise
@@ -317,11 +466,16 @@ async def send_video(
         logger.warning("Video send failed for %d; falling back to document: %s", chat_id, exc)
         extension = _VIDEO_EXTENSION_BY_MEDIA_TYPE.get(media_type.lower(), ".bin")
         try:
-            await bot.send_document(
+            await _send_media_with_retry(
+                lambda: bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(raw_bytes),
+                    filename=f"video{extension}",
+                    **kwargs,
+                ),
                 chat_id=chat_id,
-                document=io.BytesIO(raw_bytes),
-                filename=f"video{extension}",
-                **kwargs,
+                media_kind="video_document_fallback",
+                thread_id=thread_id,
             )
         except (RetryAfter, NetworkError):
             raise
@@ -339,14 +493,21 @@ async def send_documents(
     """Send one or more documents to chat."""
     if not document_data:
         return
+    thread_id = _thread_id_from_kwargs(kwargs)
     _omit_general_topic_for_telegram(kwargs)
+    kwargs.setdefault("write_timeout", _MEDIA_UPLOAD_WRITE_TIMEOUT_SECONDS)
     try:
         for filename, raw_bytes in document_data:
-            await bot.send_document(
+            await _send_media_with_retry(
+                lambda: bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(raw_bytes),
+                    filename=filename,
+                    **kwargs,
+                ),
                 chat_id=chat_id,
-                document=io.BytesIO(raw_bytes),
-                filename=filename,
-                **kwargs,
+                media_kind="document",
+                thread_id=thread_id,
             )
     except (RetryAfter, NetworkError):
         raise

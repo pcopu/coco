@@ -217,9 +217,12 @@ async def test_create_worktree_inherits_approval_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "_pick_worktree_path", lambda _root, _slug: wt_path)
     monkeypatch.setattr(bot, "_run_git", lambda *_args, **_kwargs: (True, "", ""))
 
-    async def _ensure_codex_thread_for_window(*, window_id: str, cwd: str):
+    async def _ensure_codex_thread_for_window(
+        *, window_id: str, cwd: str, service_tier: str = ""
+    ):
         assert window_id == "@new"
         assert cwd == str(wt_path)
+        assert service_tier == "default"
         return "thread-new", ""
 
     monkeypatch.setattr(

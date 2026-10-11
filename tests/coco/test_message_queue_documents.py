@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from telegram.error import TimedOut
 
 import coco.handlers.message_queue as mq
 
@@ -98,3 +99,46 @@ async def test_process_content_task_sends_video_attachments(monkeypatch):
     assert video_sends == [
         (-100123, "video/mp4", b"MP4DATA", {"message_thread_id": 77})
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_content_task_reports_video_attachment_failure(monkeypatch):
+    text_sends: list[tuple[int, str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        mq.session_manager,
+        "resolve_chat_id",
+        lambda _user_id, _thread_id: -100123,
+    )
+
+    async def _send_with_fallback(_bot, chat_id, text, **kwargs):
+        text_sends.append((chat_id, text, kwargs))
+        return SimpleNamespace(message_id=321 + len(text_sends))
+
+    async def _send_video(*_args, **_kwargs):
+        raise TimedOut("Timed out")
+
+    async def _check_status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mq, "send_with_fallback", _send_with_fallback)
+    monkeypatch.setattr(mq, "send_video", _send_video)
+    monkeypatch.setattr(mq, "_check_and_send_status", _check_status)
+
+    task = mq.MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["Video attached"],
+        content_type="text",
+        thread_id=77,
+        topic_ownership=mq.TopicOwnership("@1", "thread-77", "machine", "/tmp"),
+        video_data=[("video/mp4", b"MP4DATA")],
+    )
+
+    await mq._process_content_task(object(), 1, task)
+
+    assert text_sends[0] == (-100123, "Video attached", {"message_thread_id": 77})
+    assert text_sends[1][0] == -100123
+    assert text_sends[1][2] == {"message_thread_id": 77}
+    assert "Attachment upload failed" in text_sends[1][1]
+    assert "retry" in text_sends[1][1].lower()

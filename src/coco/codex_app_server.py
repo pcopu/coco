@@ -42,10 +42,11 @@ APP_SERVER_NOTIFICATION_DROP_WHEN_FULL = frozenset(
         "thread/tokenUsage/updated",
     }
 )
-SAFE_TIMEOUT_RETRY_METHODS = frozenset({"account/rateLimits/read"})
+SAFE_TIMEOUT_RETRY_METHODS = frozenset({"account/rateLimits/read", "model/list"})
 SAFE_TIMEOUT_RECYCLE_METHODS = frozenset(
     {
         "account/rateLimits/read",
+        "model/list",
         "thread/goal/get",
         "thread/list",
         "thread/read",

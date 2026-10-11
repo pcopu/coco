@@ -31,6 +31,7 @@ from telegram.error import RetryAfter
 from ..markdown_v2 import convert_markdown
 from ..session import TopicOwnership, session_manager
 from ..telegram_memory import log_outgoing_edit
+from ..telemetry import emit_telemetry
 from ..transcript_parser import TranscriptParser
 from .message_sender import (
     NO_LINK_PREVIEW,
@@ -906,12 +907,24 @@ def _send_kwargs(thread_id: int | None) -> dict[str, int]:
 
 def _can_coalesce_progress_task(base: MessageTask, candidate: MessageTask) -> bool:
     """Return whether pending progress tasks belong to the same topic/window."""
-    return (
-        base.task_type == "progress_update"
-        and candidate.task_type == "progress_update"
-        and base.window_id == candidate.window_id
-        and (base.thread_id or 0) == (candidate.thread_id or 0)
-        and (base.chat_id or 0) == (candidate.chat_id or 0)
+    if (
+        base.task_type != "progress_update"
+        or candidate.task_type != "progress_update"
+        or base.window_id != candidate.window_id
+        or (base.thread_id or 0) != (candidate.thread_id or 0)
+        or (base.chat_id or 0) != (candidate.chat_id or 0)
+    ):
+        return False
+    if (
+        base.delivery_generation is not None
+        and candidate.delivery_generation is not None
+        and base.delivery_generation != candidate.delivery_generation
+    ):
+        return False
+    return not (
+        base.topic_ownership is not None
+        and candidate.topic_ownership is not None
+        and base.topic_ownership != candidate.topic_ownership
     )
 
 
@@ -1015,13 +1028,25 @@ async def _send_task_images(
         len(task.image_data),
         task.thread_id,
     )
-    await send_photo(
-        bot,
-        chat_id,
-        task.image_data,
-        delivery_is_current=lambda: is_task_delivery_current(user_id, task),
-        **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
-    )
+    try:
+        await send_photo(
+            bot,
+            chat_id,
+            task.image_data,
+            delivery_is_current=lambda: is_task_delivery_current(user_id, task),
+            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
+    except RetryAfter:
+        raise
+    except Exception as exc:
+        await _report_attachment_delivery_failure(
+            bot,
+            chat_id,
+            task,
+            user_id=user_id,
+            attachment_kind="image",
+            error=exc,
+        )
 
 
 async def _send_task_documents(
@@ -1038,12 +1063,25 @@ async def _send_task_documents(
     for document in task.document_data:
         if not is_task_delivery_current(user_id, task):
             return
-        await send_documents(
-            bot,
-            chat_id,
-            [document],
-            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
-        )
+        try:
+            await send_documents(
+                bot,
+                chat_id,
+                [document],
+                **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            )
+        except RetryAfter:
+            raise
+        except Exception as exc:
+            await _report_attachment_delivery_failure(
+                bot,
+                chat_id,
+                task,
+                user_id=user_id,
+                attachment_kind="document",
+                error=exc,
+            )
+            return
 
 
 async def _send_task_videos(
@@ -1060,12 +1098,70 @@ async def _send_task_videos(
     for media_type, raw_bytes in task.video_data:
         if not is_task_delivery_current(user_id, task):
             return
-        await send_video(
+        try:
+            await send_video(
+                bot,
+                chat_id,
+                media_type,
+                raw_bytes,
+                **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            )
+        except RetryAfter:
+            raise
+        except Exception as exc:
+            await _report_attachment_delivery_failure(
+                bot,
+                chat_id,
+                task,
+                user_id=user_id,
+                attachment_kind="video",
+                error=exc,
+            )
+            return
+
+
+async def _report_attachment_delivery_failure(
+    bot: Bot,
+    chat_id: int,
+    task: MessageTask,
+    *,
+    user_id: int,
+    attachment_kind: str,
+    error: Exception,
+) -> None:
+    """Surface an exhausted attachment upload without duplicating task text."""
+    emit_telemetry(
+        "telegram.attachment_delivery_failed",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=task.thread_id,
+        window_id=task.window_id or "",
+        attachment_kind=attachment_kind,
+        error=str(error),
+    )
+    logger.error(
+        "Failed to deliver %s attachment for user %d in thread %s: %s",
+        attachment_kind,
+        user_id,
+        task.thread_id,
+        error,
+    )
+    if not is_task_delivery_current(user_id, task):
+        return
+    try:
+        await send_with_fallback(
             bot,
             chat_id,
-            media_type,
-            raw_bytes,
+            "⚠️ Attachment upload failed after retrying. "
+            "Ask me to retry or create a smaller file.",
             **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
+    except Exception as notice_exc:
+        logger.error(
+            "Failed to report attachment delivery error for user %d in thread %s: %s",
+            user_id,
+            task.thread_id,
+            notice_exc,
         )
 
 
@@ -1884,10 +1980,13 @@ async def enqueue_status_update(
     if status_text and flood_end > time.monotonic():
         return
 
-    tid = thread_id or 0
-
-    # Suppress terminal status updates while an in-progress message is active.
-    if (user_id, tid) in _progress_msg_info:
+    # Suppress terminal status updates while an in-progress message is active
+    # or already queued. The cache covers the interval before the worker has
+    # created the Telegram process message.
+    progress_key = _topic_key(user_id, thread_id, chat_id)
+    if status_text and (
+        progress_key in _progress_msg_info or progress_key in _progress_text_cache
+    ):
         return
 
     # Deduplicate: skip if text matches what's already displayed
@@ -1947,6 +2046,7 @@ async def enqueue_progress_update(
     queue = get_or_create_queue(bot, user_id)
     lock = _queue_locks[user_id]
     topic_ownership = capture_topic_ownership(user_id, thread_id, chat_id)
+    topic_key = _topic_key(user_id, thread_id, chat_id)
     task = MessageTask(
         task_type="progress_update",
         text=progress_text,
@@ -1954,6 +2054,7 @@ async def enqueue_progress_update(
         thread_id=thread_id,
         chat_id=chat_id,
         topic_ownership=topic_ownership,
+        delivery_generation=_topic_delivery_generations.get(topic_key, 0),
     )
     await _enqueue_progress_update_coalesced(queue, lock, user_id=user_id, task=task)
 

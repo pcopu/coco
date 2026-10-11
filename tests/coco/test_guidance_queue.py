@@ -772,6 +772,85 @@ async def test_enqueue_progress_update_coalesces_trailing_pending_updates():
 
 
 @pytest.mark.asyncio
+async def test_progress_coalescing_keeps_delivery_fences():
+    user_id = 209
+    thread_id = 210
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    lock = asyncio.Lock()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = lock
+    old_owner = mq.TopicOwnership("@old", "old-thread", "machine", "/old")
+    new_owner = mq.TopicOwnership("@new", "new-thread", "machine", "/new")
+    mq._topic_delivery_generations[(user_id, 0, thread_id)] = 1
+    old = mq.MessageTask(
+        task_type="progress_update",
+        text="old output",
+        window_id="@old",
+        thread_id=thread_id,
+        delivery_generation=0,
+        topic_ownership=old_owner,
+    )
+    mq._put_queued_task(user_id, queue, old)
+
+    try:
+        await mq._enqueue_progress_update_coalesced(
+            queue,
+            lock,
+            user_id=user_id,
+            task=mq.MessageTask(
+                task_type="progress_update",
+                text="new output",
+                window_id="@new",
+                thread_id=thread_id,
+                delivery_generation=1,
+                topic_ownership=new_owner,
+            ),
+        )
+
+        items = []
+        while not queue.empty():
+            items.append(queue.get_nowait())
+        assert [item.text for item in items] == ["old output", "new output"]
+        assert items[0].delivery_generation == 0
+        assert items[1].delivery_generation == 1
+        assert items[0].topic_ownership == old_owner
+        assert items[1].topic_ownership == new_owner
+    finally:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+        mq._queued_delivery_topic_counts.pop(user_id, None)
+        mq._topic_delivery_generations.pop((user_id, 0, thread_id), None)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_status_update_skips_active_progress_topic():
+    user_id = 211
+    thread_id = 212
+    queue: asyncio.Queue[mq.MessageTask] = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    key = mq._topic_key(user_id, thread_id)
+    mq._progress_msg_info[key] = (123, "@211", "working")
+
+    try:
+        await mq.enqueue_status_update(
+            bot=object(),  # type: ignore[arg-type]
+            user_id=user_id,
+            window_id="@211",
+            status_text="Esc to interrupt",
+            thread_id=thread_id,
+        )
+        assert queue.empty()
+    finally:
+        mq._progress_msg_info.pop(key, None)
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+
+
+@pytest.mark.asyncio
 async def test_enqueue_progress_update_keeps_non_progress_tail():
     user_id = 203
     thread_id = 204
