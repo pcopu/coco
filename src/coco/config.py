@@ -128,6 +128,15 @@ class Config:
         if self.telegram_enabled and not self.telegram_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
+        # Opt in to a self-hosted Bot API (also useful for isolated protocol tests).
+        # These are PTB base URLs: the bot token is appended by the client.
+        self.telegram_base_url = env_alias(
+            "COCO_TELEGRAM_BASE_URL", default="https://api.telegram.org/bot"
+        )
+        self.telegram_base_file_url = env_alias(
+            "COCO_TELEGRAM_BASE_FILE_URL", default="https://api.telegram.org/file/bot"
+        )
+
         allowed_users_str = env.ALLOWED_USERS
         if self.telegram_enabled and self.auth_env_file is not None:
             if not self.auth_env_file.is_file():

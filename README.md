@@ -577,3 +577,21 @@ Still intentionally not done:
 - automatic controller failover/failback
 - generic cross-machine monitor jobs
 - project folder sync / handoff
+
+## Tests
+
+The existing 1,556 tests remain in place. A separate deterministic E2E suite
+starts real CoCo controllers and agents, drives Telegram HTTP and Codex JSON-RPC
+boundary peers, and checks delivered messages, file bytes, persisted state and
+temporary Git updates.
+
+```bash
+.venv/bin/python scripts/run_tests.py e2e -q
+.venv/bin/python scripts/run_tests.py legacy -q
+```
+
+These commands use disposable homes/configuration and preserve logs under the
+printed artifact directory. They require Linux with Landlock ABI 4 or newer and
+GCC; unsupported isolation fails closed. No production credentials are needed.
+See [E2E coverage and remaining gaps](doc/e2e-coverage.md) and
+[contributor test guidance](CONTRIBUTING.md).

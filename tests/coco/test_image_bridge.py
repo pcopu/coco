@@ -952,6 +952,9 @@ async def test_photo_handler_drops_image_fallback_after_topic_rebind_during_down
         lambda *_args, **_kwargs: owner_a,
     )
     monkeypatch.setattr(bot, "capture_topic_ownership", _capture_topic_ownership)
+    # This race starts with a local photo download; remote ingress is rejected
+    # before downloading. Keep the original stale-owner assertions below.
+    monkeypatch.setattr(bot, "_local_machine_identity", lambda: ("machine-a", "Local"))
     monkeypatch.setattr(bot, "clear_status_msg_info", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(bot, "_set_eyes_reaction", _set_reaction)
     monkeypatch.setattr(

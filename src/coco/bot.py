@@ -56,6 +56,7 @@ from .controller_rpc import (
     ControllerRpcServer,
     REMOTE_CODEX_MACHINE_CONTEXT_KEY,
 )
+from .mobile_access import handle_mobile_access_enqueue as _handle_mobile_access_enqueue
 from .agent_rpc import (
     RemoteCodexMutationDeferredError,
     RemoteCodexMutationUncertainError,
@@ -8730,8 +8731,8 @@ def _discover_cached_codex_plugins() -> list[dict[str, object]]:
 
         if not isinstance(payload, dict):
             continue
-        market = plugin_json.parents[2].name
-        plugin_name = str(payload.get("name", plugin_json.parents[1].name)).strip()
+        market = plugin_json.parents[3].name
+        plugin_name = str(payload.get("name", plugin_json.parents[2].name)).strip()
         plugin_id = f"{plugin_name}@{market}"
         interface = payload.get("interface")
         display_name = plugin_name
@@ -10822,13 +10823,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "❌ The topic binding changed before this image could be accepted. Retry it.",
             )
             return
-    remote_attachment_error = (
-        _remote_attachment_ingress_error(
-            topic_ownership,
-            attachment_type="photo",
-        )
-        if is_general_control
-        else None
+    remote_attachment_error = _remote_attachment_ingress_error(
+        topic_ownership,
+        attachment_type="photo",
     )
     if remote_attachment_error:
         await safe_reply(update.message, remote_attachment_error)
@@ -10999,13 +10996,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if pending_steer_target is not None
         else capture_topic_ownership(session_user_id, thread_id, chat_id)
     )
-    remote_attachment_error = (
-        _remote_attachment_ingress_error(
-            topic_ownership,
-            attachment_type="archive" if is_archive else "document",
-        )
-        if is_general_control
-        else None
+    remote_attachment_error = _remote_attachment_ingress_error(
+        topic_ownership,
+        attachment_type="archive" if is_archive else "document",
     )
     if remote_attachment_error:
         await safe_reply(message, remote_attachment_error)
@@ -11238,13 +11231,9 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if pending_steer_target is not None
         else capture_topic_ownership(session_user_id, thread_id, chat_id)
     )
-    remote_attachment_error = (
-        _remote_attachment_ingress_error(
-            topic_ownership,
-            attachment_type="video",
-        )
-        if is_general_control
-        else None
+    remote_attachment_error = _remote_attachment_ingress_error(
+        topic_ownership,
+        attachment_type="video",
     )
     if remote_attachment_error:
         await safe_reply(message, remote_attachment_error)
@@ -18219,6 +18208,7 @@ async def _handle_codex_app_server_notification(
             "cancelled",
             "canceled",
         }
+        fallback_destinations: set[tuple[int, int]] = set()
         for (
             user_id,
             bound_chat_id,
@@ -18349,7 +18339,14 @@ async def _handle_codex_app_server_notification(
                     topic_ownership,
                 ):
                     continue
-                if missing_final_text:
+                destination = (
+                    session_manager.resolve_chat_id(
+                        user_id, bound_thread_id, chat_id=bound_chat_id
+                    ),
+                    bound_thread_id,
+                )
+                if missing_final_text and destination not in fallback_destinations:
+                    fallback_destinations.add(destination)
                     fallback_note = ""
                     fallback_final_text = get_progress_text(
                         user_id=user_id,
@@ -18571,6 +18568,7 @@ async def handle_new_message(
         logger.info(f"No active users for session {msg.session_id}")
         return
 
+    delivered_destinations: set[tuple[int, int]] = set()
     for user_id, chat_id, wid, thread_id in active_users:
         topic_ownership = capture_topic_ownership(
             user_id,
@@ -18613,11 +18611,22 @@ async def handle_new_message(
                 source=f"assistant_{msg.content_type}",
             )
 
+        # Several members can use the same session in one Telegram topic.
+        destination = (
+            session_manager.resolve_chat_id(user_id, thread_id, chat_id=chat_id),
+            thread_id,
+        )
+        should_deliver = destination not in delivered_destinations
         delivery_text = msg.text
         attachment_image_data: list[tuple[str, bytes]] | None = None
         document_data: list[tuple[str, bytes]] | None = None
         video_data: list[tuple[str, bytes]] | None = None
-        if msg.role == "assistant" and msg.is_complete and msg.content_type == "text":
+        if (
+            should_deliver
+            and msg.role == "assistant"
+            and msg.is_complete
+            and msg.content_type == "text"
+        ):
             workspace_dir = _resolve_workspace_dir_for_window(
                 user_id=user_id,
                 thread_id=thread_id,
@@ -18694,7 +18703,8 @@ async def handle_new_message(
 
             if is_progress_update:
                 progress_text = "".join(parts)
-                if progress_text.strip():
+                if should_deliver and progress_text.strip():
+                    delivered_destinations.add(destination)
                     await enqueue_progress_update(
                         bot=bot,
                         user_id=user_id,
@@ -18736,25 +18746,27 @@ async def handle_new_message(
                             chat_id=chat_id,
                         )
 
-            # Enqueue content message task
-            # Note: tool_result editing is handled inside _process_content_task
-            # to ensure sequential processing with tool_use message sending
-                await enqueue_content_message(
-                    bot=bot,
-                    user_id=user_id,
-                    window_id=wid,
-                    parts=parts,
-                    tool_use_id=msg.tool_use_id,
-                    content_type=msg.content_type,
-                    text=delivery_text,
-                    thread_id=thread_id,
-                    chat_id=chat_id,
-                    image_data=combined_image_data,
-                    document_data=document_data,
-                    video_data=video_data,
-                    response_mode_override=response_mode_override,
-                    topic_ownership=topic_ownership,
-                )
+                # The queue edits tool results in order with their tool messages.
+                if should_deliver and is_topic_ownership_current(
+                    user_id, thread_id, chat_id, topic_ownership
+                ):
+                    delivered_destinations.add(destination)
+                    await enqueue_content_message(
+                        bot=bot,
+                        user_id=user_id,
+                        window_id=wid,
+                        parts=parts,
+                        tool_use_id=msg.tool_use_id,
+                        content_type=msg.content_type,
+                        text=delivery_text,
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        image_data=combined_image_data,
+                        document_data=document_data,
+                        video_data=video_data,
+                        response_mode_override=response_mode_override,
+                        topic_ownership=topic_ownership,
+                    )
                 if looper_completed_state is not None:
                     await safe_send(
                         bot,
@@ -19004,6 +19016,12 @@ async def _handle_controller_rpc_request(
 
     if method == "chief_of_staff/enqueue":
         return await _handle_chief_of_staff_enqueue(inner_params, bot=bot)
+
+    if method == "mobile_access/enqueue":
+        return await _handle_mobile_access_enqueue(
+            inner_params,
+            runtime=sys.modules[__name__],
+        )
 
     if "transport" in rpc_params:
         transport = rpc_params.get("transport")
@@ -19613,6 +19631,8 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
+        .base_url(config.telegram_base_url)
+        .base_file_url(config.telegram_base_file_url)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)

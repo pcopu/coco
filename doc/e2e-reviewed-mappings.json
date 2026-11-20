@@ -1,0 +1,202 @@
+{
+  "tests/coco/test_agent_rpc.py::test_agent_rpc_coco_update_ignores_untracked_files": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_updates.py::test_updater_preserves_untracked_and_blocks_tracked_or_incoming_collisions"
+    ],
+    "evidence": "Real agent RPC updater advances a temporary Git clone with untracked artifacts preserved; collision case exercises git pull --ff-only.",
+    "remaining_gap": "Exact success-message wording is not asserted."
+  },
+  "tests/coco/test_update_command.py::test_collect_coco_update_snapshot_ignores_untracked_files": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_updates.py::test_updater_preserves_untracked_and_blocks_tracked_or_incoming_collisions"
+    ],
+    "evidence": "Real controller /update advances HEAD when only untracked artifacts exist.",
+    "remaining_gap": "Internal snapshot fields are not independently asserted."
+  },
+  "tests/coco/test_update_command.py::test_collect_coco_update_snapshot_blocks_tracked_changes": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_updates.py::test_updater_preserves_untracked_and_blocks_tracked_or_incoming_collisions"
+    ],
+    "evidence": "Controller and agent reject tracked modifications; local bytes and HEAD remain intact.",
+    "remaining_gap": "Staged-only changes are not separately parameterized."
+  },
+  "tests/coco/test_plugins_command.py::test_plugins_command_rejects_non_admin": {
+    "status": "covered",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_plugin_inventory_and_admin_toggle_are_persisted_without_dispatch"
+    ],
+    "evidence": "Nonadmin receives an admin-only denial, creates no config, and dispatches no turn.",
+    "remaining_gap": ""
+  },
+  "tests/coco/test_document_ingress.py::test_document_handler_downloads_pdf_and_forwards_topic_text": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_attachments.py::test_incoming_attachment_reaches_bound_codex_with_local_bytes"
+    ],
+    "evidence": "PDF bytes cross Telegram download and local storage; caption reaches the bound Codex thread and reply reaches Telegram.",
+    "remaining_gap": "Exact typing-action sequence and lack of intermediate replies are not asserted."
+  },
+  "tests/coco/test_document_ingress.py::test_document_handler_forwards_image_document": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_attachments.py::test_incoming_attachment_reaches_bound_codex_with_local_bytes"
+    ],
+    "evidence": "Image document bytes, caption, image marker and actual local path reach Codex.",
+    "remaining_gap": "Exact lack of intermediate replies is not asserted."
+  },
+  "tests/coco/test_document_ingress.py::test_document_handler_forwards_audio_document_as_file_path": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_attachments.py::test_incoming_attachment_reaches_bound_codex_with_local_bytes"
+    ],
+    "evidence": "Audio document is downloaded intact and dispatched with caption.",
+    "remaining_gap": "Speech decoding is not exercised by this file-document route."
+  },
+  "tests/coco/test_document_ingress.py::test_video_handler_downloads_video_and_forwards_topic_text": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_attachments.py::test_incoming_attachment_reaches_bound_codex_with_local_bytes"
+    ],
+    "evidence": "Video bytes and caption reach the bound topic's Codex request.",
+    "remaining_gap": "Exact typing-action sequence and lack of intermediate replies are not asserted."
+  },
+  "tests/coco/test_goal_command.py::test_goal_command_treats_direct_goal_text_as_set": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_lifecycle.py::test_topic_settings_and_binding_survive_controller_restart"
+    ],
+    "evidence": "/goal objective crosses JSON-RPC, remains visible and survives controller restart.",
+    "remaining_gap": "Exact active-goal formatting is not asserted."
+  },
+  "tests/coco/test_guidance_queue.py::test_queued_topic_input_fifo_and_count": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_queue_transport.py::test_queued_inputs_dispatch_fifo_once_after_completion"
+    ],
+    "evidence": "Three actual inputs dispatch once in order, only after prior completion, to the same thread.",
+    "remaining_gap": "Internal queue-count return values are not asserted."
+  },
+  "tests/coco/test_guidance_queue.py::test_queued_topic_input_is_not_dispatched_after_explicit_rebind": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_queue_transport.py::test_unbinding_discards_queued_input_and_late_output"
+    ],
+    "evidence": "Unbind and fresh bind discard old queued input and late output.",
+    "remaining_gap": "Direct rebind without unbind and exact warning wording remain uncovered."
+  },
+  "tests/coco/test_skills_command.py::test_apps_command_enable_updates_topic_state": {
+    "status": "covered",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_enabled_apps_and_native_skills_are_scoped_and_persisted"
+    ],
+    "evidence": "Visible app enablement persists across restart and injects its SKILL.md path into only the target topic.",
+    "remaining_gap": ""
+  },
+  "tests/coco/test_skills_command.py::test_skills_command_enable_updates_topic_state": {
+    "status": "covered",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_enabled_apps_and_native_skills_are_scoped_and_persisted"
+    ],
+    "evidence": "Visible native skill enablement persists and appears as a typed skill input in only the target topic.",
+    "remaining_gap": ""
+  },
+  "tests/coco/test_voice_command.py::test_voice_command_turns_voice_on": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_voice.py::test_voice_mode_delivers_opus_or_visible_text_fallback"
+    ],
+    "evidence": "Voice mode ON produces decodable 48kHz Opus through the real speech HTTP and media pipeline for /q input.",
+    "remaining_gap": "Default F2 voice label formatting from the legacy fixture is not asserted."
+  },
+  "tests/coco/test_voice_command.py::test_voice_command_turns_voice_off": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_lifecycle.py::test_topic_settings_and_binding_survive_controller_restart"
+    ],
+    "evidence": "/voice off is visible and subsequent reply is text.",
+    "remaining_gap": "Exact complete response text is not asserted."
+  },
+  "tests/coco/test_tts.py::test_prepare_voice_note_audio_reencodes_to_opus": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_voice.py::test_voice_mode_delivers_opus_or_visible_text_fallback"
+    ],
+    "evidence": "A real 24kHz WAV is resampled/encoded; uploaded bytes are decoded as 48kHz Opus.",
+    "remaining_gap": "44.1kHz resampling and silence-trimming edge cases are not covered."
+  },
+  "tests/coco/test_tts.py::test_synthesize_voice_note_uses_supertone_openai_endpoint": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_voice.py::test_voice_mode_delivers_opus_or_visible_text_fallback"
+    ],
+    "evidence": "Real POST /v1/audio/speech receives exact answer text; success uploads Opus once.",
+    "remaining_gap": "Full payload defaults and speech model correctness are not asserted."
+  },
+  "tests/coco/test_tts.py::test_synthesize_voice_note_raises_tts_error_on_http_failure": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_voice.py::test_voice_mode_delivers_opus_or_visible_text_fallback"
+    ],
+    "evidence": "HTTP 503 becomes a visible text fallback with no voice upload or repeated Codex turn.",
+    "remaining_gap": "Internal exception type is not asserted."
+  },
+  "tests/coco/test_chief_of_staff_bot.py::test_controller_rpc_routes_chief_of_staff_without_transport_metadata": {
+    "status": "covered",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_chief_of_staff_ingress_auth_busy_and_explicit_retry"
+    ],
+    "evidence": "Authenticated controller/request routes Chief of Staff ingress without Codex transport metadata.",
+    "remaining_gap": ""
+  },
+  "tests/coco/test_chief_of_staff_bot.py::test_chief_of_staff_enqueue_returns_busy_without_side_effect": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_chief_of_staff_ingress_auth_busy_and_explicit_retry"
+    ],
+    "evidence": "Busy General returns busy and creates no additional turn.",
+    "remaining_gap": "Exact retry_after value is not asserted."
+  },
+  "tests/coco/test_chief_of_staff_bot.py::test_chief_of_staff_enqueue_dispatches_idle_control_topic": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_chief_of_staff_ingress_auth_busy_and_explicit_retry"
+    ],
+    "evidence": "Idle ingress sends one prompt to General; final appears only in General; explicit later directive succeeds.",
+    "remaining_gap": "Internal watchdog source and ownership-object identity are not asserted."
+  },
+  "tests/coco/test_model_info.py::test_model_command_uses_cached_catalog": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_model_reasoning_selection_controls_next_turn_and_status"
+    ],
+    "evidence": "External models cache drives Telegram model/effort choices; next wire turn contains chosen values.",
+    "remaining_gap": "Every cache fallback/rendering branch is not covered."
+  },
+  "tests/coco/test_model_info.py::test_model_effort_callback_preserves_thread_on_change": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_model_reasoning_selection_controls_next_turn_and_status"
+    ],
+    "evidence": "Chosen high reasoning is used by the next turn.",
+    "remaining_gap": "Changing effort during an active turn is not tested."
+  },
+  "tests/coco/test_apps_autoresearch_flow.py::test_autoresearch_outcome_text_capture_updates_panel": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_autoresearch_outcome_is_consumed_as_configuration_not_a_turn"
+    ],
+    "evidence": "Guided outcome text updates visible panel, survives restart, and does not become a Codex turn.",
+    "remaining_gap": "Exact internal flow-state reset is not asserted."
+  },
+  "tests/coco/test_apps_looper_callbacks.py::test_looper_start_callback_uses_panel_config": {
+    "status": "partial",
+    "e2e_scenarios": [
+      "tests/e2e/test_runtime_features.py::test_guided_looper_configuration_starts_and_stops_only_this_topic"
+    ],
+    "evidence": "Delivered app menus select plan and start/stop the loop with visible state.",
+    "remaining_gap": "Custom interval, limit and instructions are not parameterized; scheduled nudges are not awaited."
+  }
+}

@@ -1,0 +1,36 @@
+name: CoCo tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [legacy, e2e]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e '.[dev]'
+      - name: Run isolated suite
+        run: .venv/bin/python scripts/run_tests.py ${{ matrix.suite }} --artifacts /tmp/coco-ci-tests -q
+      - name: Retain protocol traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-traces
+          path: /tmp/coco-ci-tests
+          retention-days: 7

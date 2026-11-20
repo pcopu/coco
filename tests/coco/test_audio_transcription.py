@@ -537,6 +537,9 @@ async def test_authorized_admin_general_voice_uses_canonical_control_owner(
         lambda _path, *, profile="": "canonical control transcript",
         raising=False,
     )
+    # This test isolates routing with a supplied transcript. First-download
+    # notices have dedicated tests and must not depend on the operator's cache.
+    monkeypatch.setattr(bot, "begin_transcription_bootstrap", lambda profile="": None)
 
     async def _safe_reply(_message, text: str, **_kwargs):
         replies.append(text)
