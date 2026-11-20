@@ -2501,17 +2501,30 @@ async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_id=chat_id,
     )
     current_tier = selected_tier or _load_codex_default_service_tier()
-    current_fast_mode = current_tier == "fast"
+    current_fast_mode = current_tier in {"fast", "ultrafast"}
     raw_args = _extract_command_args(update.message.text or "").strip().lower()
-    usage = "Usage: `/fast` or `/fast on|off|toggle`"
+    usage = "Usage: `/fast` or `/fast on|off|toggle` (or `/fast ultrafast`)"
 
     if not raw_args:
-        state_label = "ON" if current_fast_mode else "OFF"
+        state_label = (
+            "ULTRAFAST"
+            if current_tier == "ultrafast"
+            else "ON"
+            if current_fast_mode
+            else "OFF"
+        )
+        availability_note = (
+            "\nUltrafast availability depends on the selected Codex model and account."
+            if current_tier == "ultrafast"
+            else ""
+        )
         await safe_reply(
             update.message,
             (
                 f"Fast mode: `{state_label}`\n"
-                f"Future turns in this topic use the `{current_tier}` service tier.\n\n"
+                f"Future turns in this topic {'request' if current_tier == 'ultrafast' else 'use'} "
+                f"the `{current_tier}` service tier."
+                f"{availability_note}\n\n"
                 f"{usage}"
             ),
         )
@@ -2520,6 +2533,8 @@ async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     action = raw_args.split(maxsplit=1)[0].strip().lower()
     if action in {"on", "fast", "enable"}:
         desired_tier = "fast"
+    elif action == "ultrafast":
+        desired_tier = "ultrafast"
     elif action in {"off", "disable"}:
         desired_tier = "default"
     elif action in {"toggle", "flip"}:
@@ -2534,12 +2549,25 @@ async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_id=chat_id,
         service_tier=desired_tier,
     )
-    state_label = "ON" if desired_tier == "fast" else "OFF"
+    state_label = (
+        "ULTRAFAST"
+        if desired_tier == "ultrafast"
+        else "ON"
+        if desired_tier == "fast"
+        else "OFF"
+    )
+    availability_note = (
+        "\nUltrafast availability depends on the selected Codex model and account."
+        if desired_tier == "ultrafast"
+        else ""
+    )
     await safe_reply(
         update.message,
         (
             f"✅ Fast mode is now `{state_label}`.\n"
-            f"Future turns in this topic will use the `{desired_tier}` service tier."
+            f"Future turns in this topic will {'request' if desired_tier == 'ultrafast' else 'use'} "
+            f"the `{desired_tier}` service tier."
+            f"{availability_note}"
         ),
     )
 

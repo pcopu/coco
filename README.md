@@ -489,7 +489,11 @@ By default under `~/.coco`, with Codex session state continuing to live in
 | `/q <text>` | Queue the next prompt behind the active run |
 | `/status` | Show machine/session state |
 | `/model` | Pick per-topic model and reasoning level |
+| `/fast` | Use `on`, `off`, `toggle`, or `ultrafast` for the topic's service tier |
 | `/approvals` | Change approval mode for the bound session |
+
+`/fast ultrafast` is stored per topic and passed to Codex for future turns.
+Availability still depends on the selected Codex model and account.
 
 In Telegram forum groups, General is permanently reserved as CoCo's control
 plane. Its internal workspace is managed automatically per group and machine;

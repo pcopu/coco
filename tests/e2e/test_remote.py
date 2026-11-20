@@ -46,6 +46,20 @@ def test_remote_heartbeat_folder_bind_turn_and_reply_cross_both_processes(cluste
     assert agent.wait_codex("thread/goal/set")["params"]["objective"] == "remote objective"
 
 
+def test_remote_ultrafast_topic_setting_reaches_agent_turn(cluster):
+    controller, agent = cluster
+    binding = bind_remote(controller)
+    controller.peer.message("/fast ultrafast")
+    controller.wait_request("sendMessage", text="Fast mode is now")
+    assert controller.binding(topic=10)["service_tier"] == "ultrafast"
+
+    controller.peer.message("run ultrafast on the remote machine")
+    turn = agent.wait_codex("turn/start")
+    controller.wait_request("sendMessage", topic=10, text="E2E answer")
+    assert turn["params"]["threadId"] == binding["codex_thread_id"]
+    assert turn["params"]["serviceTier"] == "ultrafast"
+
+
 def test_cluster_rejects_bad_auth_malformed_frames_and_stale_transport(cluster):
     controller, agent = cluster
     binding = bind_remote(controller)

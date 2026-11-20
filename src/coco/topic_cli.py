@@ -188,7 +188,7 @@ def _session_payload(*, target: app_cli.TopicTarget, binding: TopicBinding | Non
         "model": model_slug or "unknown",
         "reasoning_effort": reasoning_effort or "unknown",
         "service_tier": service_tier or "default",
-        "fast_mode": service_tier == "fast",
+        "fast_mode": service_tier in {"fast", "ultrafast"},
         "codex_thread_id": codex_thread_id,
         "active_turn_id": active_turn_id,
     }
@@ -332,6 +332,13 @@ def _render_text(payload: dict[str, Any]) -> str:
         lines.append(f"Display: `{topic['display_name']}`")
     if topic.get("window_id"):
         lines.append(f"Window: `{topic['window_id']}`")
+    fast_mode_label = (
+        "ULTRAFAST"
+        if session["service_tier"] == "ultrafast"
+        else "ON"
+        if session["fast_mode"]
+        else "OFF"
+    )
     lines.extend(
         [
             f"Session bound: `{'yes' if session['bound'] else 'no'}`",
@@ -339,7 +346,7 @@ def _render_text(payload: dict[str, Any]) -> str:
             f"Model: `{session['model']}`",
             f"Reasoning: `{session['reasoning_effort']}`",
             (
-                f"Fast mode: `{'ON' if session['fast_mode'] else 'OFF'}` "
+                f"Fast mode: `{fast_mode_label}` "
                 f"(`{session['service_tier']}`)"
             ),
             (

@@ -46,6 +46,27 @@ def test_topic_settings_and_binding_survive_controller_restart(controller):
     controller.wait_request("sendMessage", since=mark, topic=10, text="ship the tested behavior")
 
 
+def test_ultrafast_topic_setting_survives_restart_and_reaches_turn(controller):
+    original = controller.bind()
+    controller.peer.message("/fast ultrafast")
+    controller.wait_request("sendMessage", text="Fast mode is now")
+    assert controller.binding(topic=10)["service_tier"] == "ultrafast"
+
+    controller.peer.message("use ultrafast locally")
+    first = controller.wait_codex("turn/start")
+    controller.wait_request("sendMessage", text="E2E answer")
+    assert first["params"]["threadId"] == original["codex_thread_id"]
+    assert first["params"]["serviceTier"] == "ultrafast"
+
+    controller.stop()
+    controller.start()
+    controller.peer.message("use ultrafast after restart")
+    second = controller.wait_codex("turn/start", count=2)
+    controller.wait_request("sendMessage", text="E2E answer")
+    assert second["params"]["threadId"] == original["codex_thread_id"]
+    assert second["params"]["serviceTier"] == "ultrafast"
+
+
 def test_fork_rollback_and_unbind_change_only_target_topic(controller):
     first = controller.bind(topic=10)
     second = controller.bind(topic=20)

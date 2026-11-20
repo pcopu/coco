@@ -224,6 +224,8 @@ from .handlers.run_watchdog import (
 )
 from .handlers.status_polling import emit_looper_tick, status_poll_loop
 from .session import (
+    CODEX_SERVICE_TIERS,
+    DEFAULT_CODEX_SERVICE_TIER,
     GENERAL_TOPIC_THREAD_ID,
     CocoControlMigration,
     CocoControlTopic,
@@ -8682,7 +8684,7 @@ def _load_codex_default_service_tier() -> str:
             raw_service_tier = cfg.get("service_tier", "")
             if isinstance(raw_service_tier, str):
                 normalized = raw_service_tier.strip().lower()
-                if normalized == "fast":
+                if normalized in CODEX_SERVICE_TIERS - {DEFAULT_CODEX_SERVICE_TIER}:
                     return normalized
         except Exception as e:
             logger.debug("Failed reading Codex config %s: %s", config_path, e)

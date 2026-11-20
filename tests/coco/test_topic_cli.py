@@ -267,6 +267,85 @@ def test_topic_cli_json_includes_capabilities_and_state(monkeypatch, capsys):
     assert apps["personality"]["enabled"] is False
 
 
+def test_topic_cli_labels_ultrafast_service_tier(monkeypatch, capsys):
+    binding = TopicBinding(
+        chat_id=-100123,
+        thread_id=77,
+        window_id="@77",
+        cwd="/repo/project",
+        service_tier="ultrafast",
+    )
+
+    monkeypatch.setattr(
+        topic_cli.app_cli,
+        "_resolve_topic_target",
+        lambda **_kwargs: topic_cli.app_cli.TopicTarget(
+            user_id=1147817421,
+            chat_id=-100123,
+            thread_id=77,
+            binding=binding,
+        ),
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager, "discover_skill_catalog", lambda: {}
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "resolve_thread_skills",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "resolve_topic_binding",
+        lambda *_args, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager, "get_window_state", lambda _wid: WindowState()
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager, "get_window_mention_only", lambda _wid: False
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "get_topic_model_selection",
+        lambda *_args, **_kwargs: ("", ""),
+    )
+    monkeypatch.setattr(
+        topic_cli.session_manager,
+        "get_topic_service_tier_selection",
+        lambda *_args, **_kwargs: "ultrafast",
+    )
+    monkeypatch.setattr(
+        topic_cli,
+        "get_transcription_runtime_summary",
+        lambda profile="compatible": {
+            "mode": "compatible",
+            "device": "cpu",
+            "compute_type": "int8",
+            "model_name": "base",
+        },
+    )
+    monkeypatch.setattr(
+        topic_cli, "get_tts_runtime_summary", lambda: {"available": False}
+    )
+    monkeypatch.setattr(topic_cli, "get_looper_state", lambda **_kwargs: None)
+    monkeypatch.setattr(topic_cli, "get_autoresearch_state", lambda *_args, **_kwargs: None)
+
+    code = topic_cli.main(
+        [
+            "--user-id",
+            "1147817421",
+            "--chat-id",
+            "-100123",
+            "--thread-id",
+            "77",
+        ]
+    )
+
+    assert code == 0
+    assert "Fast mode: `ULTRAFAST` (`ultrafast`)" in capsys.readouterr().out
+
+
 def test_topic_cli_renders_tts_summary(monkeypatch, capsys):
     binding = TopicBinding(
         chat_id=-100123,

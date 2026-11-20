@@ -31,6 +31,15 @@ def test_codex_default_service_tier_ignores_legacy_flex(monkeypatch, tmp_path):
     assert bot._load_codex_default_service_tier() == "default"
 
 
+def test_codex_default_service_tier_accepts_ultrafast(monkeypatch, tmp_path):
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text('service_tier = "ultrafast"\n')
+    monkeypatch.setattr(bot.Path, "home", lambda: tmp_path)
+
+    assert bot._load_codex_default_service_tier() == "ultrafast"
+
+
 @pytest.mark.asyncio
 async def test_fast_command_reports_current_mode(monkeypatch):
     update = _make_update("/fast")
@@ -125,3 +134,81 @@ async def test_fast_command_sets_topic_service_tier_without_reset(monkeypatch):
     assert replies
     assert "Fast mode is now `OFF`" in replies[0]
     assert "Future turns in this topic will use the `default` service tier." in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_fast_command_sets_ultrafast_topic_service_tier(monkeypatch):
+    update = _make_update("/fast ultrafast")
+    replies: list[str] = []
+    set_calls: list[str] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "ensure_topic_binding",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_topic_service_tier_selection",
+        lambda *_args, **_kwargs: "fast",
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_topic_service_tier_selection",
+        lambda *_args, service_tier="", **_kwargs: set_calls.append(service_tier)
+        or True,
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.fast_command(update, SimpleNamespace(user_data={}))
+
+    assert set_calls == ["ultrafast"]
+    assert replies
+    assert "Fast mode is now `ULTRAFAST`" in replies[0]
+    assert "Future turns in this topic will request the `ultrafast` service tier." in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_fast_command_reports_ultrafast_without_calling_it_off(monkeypatch):
+    update = _make_update("/fast")
+    replies: list[str] = []
+
+    monkeypatch.setattr(bot, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(bot.config, "is_group_allowed", lambda _chat_id: True)
+    monkeypatch.setattr(
+        bot.session_manager,
+        "set_group_chat_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "ensure_topic_binding",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        bot.session_manager,
+        "get_topic_service_tier_selection",
+        lambda *_args, **_kwargs: "ultrafast",
+    )
+
+    async def _safe_reply(_message, text: str, **_kwargs):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "safe_reply", _safe_reply)
+
+    await bot.fast_command(update, SimpleNamespace(user_data={}))
+
+    assert replies
+    assert "Fast mode: `ULTRAFAST`" in replies[0]
+    assert "Future turns in this topic request the `ultrafast` service tier." in replies[0]
