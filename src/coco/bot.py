@@ -18006,6 +18006,14 @@ async def _handle_codex_app_server_notification(
             lines.append(f"Path: {path.strip()}")
         if isinstance(details, str) and details.strip():
             lines.append(f"Details: {details.strip()}")
+        if isinstance(summary, str) and summary.startswith(
+            "`[features].multi_agent` is deprecated."
+        ):
+            lines.append(
+                "If this host already uses multi_agent_v2 = true, remove the "
+                "legacy multi_agent entry from the Codex config and restart "
+                "CoCo. Keep the legacy entry if you rely on the V1 fallback."
+            )
         text = "\n".join(lines)
 
         for chat_id, thread_id in _notification_targets():
